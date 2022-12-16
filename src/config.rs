@@ -1,6 +1,6 @@
 use crate::connection::RedisAddr;
 use anyhow::{Context, Result};
-use config::{Config, File};
+use config::{Config, File, FileFormat};
 use serde::Deserialize;
 use std::{collections::HashMap, convert::AsRef, env, option::Option, path::Path};
 
@@ -21,7 +21,7 @@ pub fn default_config_file() -> String {
 impl ConfigFile {
     fn from_toml_file<P: AsRef<str>>(path: P) -> Result<HashMap<String, ConfigEntry>> {
         let s = Config::builder()
-            .add_source(File::with_name(path.as_ref()))
+            .add_source(File::new(path.as_ref(), FileFormat::Toml))
             .build()
             .context("TODO:  Error handling")?;
 

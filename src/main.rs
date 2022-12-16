@@ -3,8 +3,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use connection::RedisAddr;
 use futures::stream::*;
+use lazy_static::lazy_static;
+use redis::FromRedisValue;
+use regex::Regex;
 use std::convert::AsRef;
-use std::str::FromStr;
 
 mod config;
 mod connection;
