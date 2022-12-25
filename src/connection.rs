@@ -19,11 +19,11 @@ pub trait GetPort {
     fn get_port(&self) -> Option<u16>;
 }
 
-#[derive(Debug, Eq)]
-struct ClusterNode {
-    id: String,
-    addr: RedisAddr,
-    replicas: HashSet<ClusterNode>,
+#[derive(Debug, Eq, Clone)]
+pub struct ClusterNode {
+    pub id: String,
+    pub addr: RedisAddr,
+    pub replicas: HashSet<ClusterNode>,
 }
 
 #[derive(Debug)]
@@ -258,6 +258,10 @@ impl Cluster {
         }
 
         Ok(primaries)
+    }
+
+    pub fn get_primary_nodes(&self) -> Vec<ClusterNode> {
+        self.0.iter().map(|node| node.clone()).collect()
     }
 
     pub fn get_primaries(&self) -> Vec<RedisAddr> {

@@ -1,10 +1,10 @@
 use crate::{
-    config::ConfigEntry,
-    config::ConfigFile,
+    config::{ConfigEntry, ConfigFile, DisplayColor},
     connection::{Cluster, GetHost, GetPort},
 };
 use anyhow::{Context, Result};
 use clap::Parser;
+use colored::{Color, Colorize};
 use connection::RedisAddr;
 use futures::stream::*;
 use std::{
@@ -26,6 +26,9 @@ struct Options {
     #[arg(long)]
     config_file: Option<String>,
 
+    #[arg(long)]
+    no_color: bool,
+
     pub instances: Vec<String>,
 }
 
@@ -37,11 +40,10 @@ struct MonitoredInstance {
     // The address itself
     addr: RedisAddr,
 
-    // Is it a redis cluster
-    cluster: bool,
-
     // Format string (defaults to {host}:{port}
     fmt: String,
+
+    color: Color,
 }
 
 impl MonitoredInstance {
@@ -60,37 +62,52 @@ impl MonitoredInstance {
         fmt
     }
 
-    fn new(name: Option<String>, addr: RedisAddr, cluster: bool, fmt: Option<String>) -> Self {
+    fn new(name: Option<String>, addr: RedisAddr, color: Color, fmt: Option<String>) -> Self {
         let fmt =
             Self::make_fmt_string(&name, &addr, &fmt.unwrap_or_else(|| "{host}:{port}".into()));
 
         Self {
             name,
             addr,
-            cluster,
+            color,
             fmt,
         }
     }
 
     fn from_config_entry(name: &str, entry: &ConfigEntry) -> Vec<Self> {
-        entry
-            .addresses
-            .iter()
-            .map(|addr| {
-                Self::new(
-                    Some(name.to_owned()),
-                    addr.to_owned(),
-                    entry.cluster,
-                    entry.format.clone(),
-                )
-            })
-            .collect()
+        if entry.cluster {
+            let c = Cluster::from_seeds(&entry.addresses).expect("Can't get cluster nodes");
+            c.get_primary_nodes()
+                .iter()
+                .map(|primary| {
+                    Self::new(
+                        Some(name.to_owned()),
+                        primary.addr.to_owned(),
+                        entry.get_color(),
+                        entry.format.clone(),
+                    )
+                })
+                .collect()
+        } else {
+            entry
+                .addresses
+                .iter()
+                .map(|addr| {
+                    Self::new(
+                        Some(name.to_owned()),
+                        addr.to_owned(),
+                        entry.get_color(),
+                        entry.format.clone(),
+                    )
+                })
+                .collect()
+        }
     }
 }
 
 impl From<RedisAddr> for MonitoredInstance {
     fn from(addr: RedisAddr) -> Self {
-        Self::new(None, addr, false, Some("{host}:{port}".to_owned()))
+        Self::new(None, addr, Color::Black, Some("{host}:{port}".to_owned()))
     }
 }
 
@@ -142,8 +159,6 @@ async fn main() -> Result<()> {
     let opt: Options = Options::parse();
     let cfg = ConfigFile::load(opt.config_file);
 
-    println!("{cfg:#?}");
-
     if opt.instances.is_empty() {
         eprintln!("Must pass at least one redis instance (either host/port or named instance)");
         std::process::exit(1);
@@ -158,7 +173,13 @@ async fn main() -> Result<()> {
     }));
 
     while let Some((instance, msg)) = streams.next().await {
-        println!("[{}] {msg}", instance.fmt);
+        if !opt.no_color {
+            let msg = msg.color(instance.color);
+            let hdr = instance.fmt.bold();
+            println!("[{hdr}] {msg}");
+        } else {
+            println!("[{}] {msg}", instance.fmt);
+        }
     }
 
     Ok(())
