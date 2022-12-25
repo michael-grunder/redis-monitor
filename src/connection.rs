@@ -11,6 +11,14 @@ pub enum RedisAddr {
     Unix(String),
 }
 
+pub trait GetHost {
+    fn get_host(&self) -> String;
+}
+
+pub trait GetPort {
+    fn get_port(&self) -> Option<u16>;
+}
+
 #[derive(Debug, Eq)]
 struct ClusterNode {
     id: String,
@@ -70,6 +78,24 @@ impl std::fmt::Display for RedisAddr {
         match self {
             Self::Tcp(host, port) => write!(f, "{host}:{port}"),
             Self::Unix(path) => write!(f, "{path}"),
+        }
+    }
+}
+
+impl GetHost for RedisAddr {
+    fn get_host(&self) -> String {
+        match self {
+            Self::Tcp(host, _) => format!("{host}"),
+            Self::Unix(path) => path.into(),
+        }
+    }
+}
+
+impl GetPort for RedisAddr {
+    fn get_port(&self) -> Option<u16> {
+        match self {
+            Self::Tcp(_, port) => Some(*port),
+            _ => None,
         }
     }
 }

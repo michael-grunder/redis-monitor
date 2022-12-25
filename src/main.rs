@@ -1,4 +1,8 @@
-use crate::{config::ConfigEntry, config::ConfigFile, connection::Cluster};
+use crate::{
+    config::ConfigEntry,
+    config::ConfigFile,
+    connection::{Cluster, GetHost, GetPort},
+};
 use anyhow::{Context, Result};
 use clap::Parser;
 use connection::RedisAddr;
@@ -41,12 +45,30 @@ struct MonitoredInstance {
 }
 
 impl MonitoredInstance {
+    fn make_fmt_string(name: &Option<String>, addr: &RedisAddr, fmt: &str) -> String {
+        let fmt = fmt.to_owned();
+        let mut fmt = fmt.replace("{host}", &addr.get_host());
+
+        if let Some(name) = name {
+            fmt = fmt.replace("{name}", name);
+        };
+
+        if let Some(port) = addr.get_port() {
+            fmt = fmt.replace("{port}", &format!("{port}"));
+        }
+
+        fmt
+    }
+
     fn new(name: Option<String>, addr: RedisAddr, cluster: bool, fmt: Option<String>) -> Self {
+        let fmt =
+            Self::make_fmt_string(&name, &addr, &fmt.unwrap_or_else(|| "{host}:{port}".into()));
+
         Self {
             name,
             addr,
             cluster,
-            fmt: fmt.unwrap_or("{host}:{port}".into()),
+            fmt,
         }
     }
 
@@ -59,7 +81,7 @@ impl MonitoredInstance {
                     Some(name.to_owned()),
                     addr.to_owned(),
                     entry.cluster,
-                    entry.fmt.clone(),
+                    entry.format.clone(),
                 )
             })
             .collect()
@@ -79,24 +101,6 @@ async fn get_monitor<T: AsRef<str>>(url: T) -> Result<redis::aio::Monitor> {
     Ok(mon)
 }
 
-async fn get_connection_pairs(
-    addresses: Vec<RedisAddr>,
-) -> Result<Vec<(RedisAddr, redis::aio::Monitor)>> {
-    let mut res = vec![];
-
-    for addr in addresses {
-        let url = addr.get_url_string();
-        println!("MONITOR {url}");
-
-        let mon = get_monitor(&url)
-            .await
-            .with_context(|| format!("Failed to get connection for '{url}'"))?;
-        res.push((addr, mon));
-    }
-
-    Ok(res)
-}
-
 async fn get_monitor_pairs(
     instances: Vec<MonitoredInstance>,
 ) -> Result<Vec<(MonitoredInstance, redis::aio::Monitor)>> {
@@ -104,7 +108,7 @@ async fn get_monitor_pairs(
 
     for instance in instances {
         let url = instance.addr.get_url_string();
-        println!("MONITOR {url}");
+        println!("MONITOR {url} {}", instance.fmt);
 
         let mon = get_monitor(&url)
             .await
@@ -153,8 +157,8 @@ async fn main() -> Result<()> {
             .map(move |c| (info.clone(), c))
     }));
 
-    while let Some((uri, msg)) = streams.next().await {
-        println!("[{}] {msg}", uri.addr);
+    while let Some((instance, msg)) = streams.next().await {
+        println!("[{}] {msg}", instance.fmt);
     }
 
     Ok(())

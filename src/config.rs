@@ -27,7 +27,7 @@ pub struct ConfigEntry {
     #[serde(default)]
     pub cluster: bool,
 
-    pub fmt: Option<String>,
+    pub format: Option<String>,
 }
 
 impl ConfigFile {
