@@ -8,10 +8,8 @@ use clap::Parser;
 use colored::{Color, Colorize};
 use connection::RedisAddr;
 use futures::stream::*;
-use lazy_static::lazy_static;
 use regex::Regex;
 use serde::{de, Deserialize, Deserializer};
-use std::sync::Mutex;
 use std::{
     collections::HashSet,
     convert::{AsRef, From},
@@ -22,11 +20,7 @@ mod config;
 mod connection;
 mod stats;
 
-lazy_static! {
-    static ref CMD_FILTER: Mutex<CommandFilter> = Mutex::new(CommandFilter::new());
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct CommandFilter(HashSet<String>);
 
 #[derive(Parser, Debug)]
@@ -107,6 +101,14 @@ impl CommandFilter {
         for cmd in src.0 {
             self.add_command(&cmd);
         }
+    }
+
+    fn filter(&self, cmd: &str) -> bool {
+        if self.0.is_empty() {
+            return false;
+        }
+
+        !self.0.contains(cmd)
     }
 }
 
@@ -229,10 +231,6 @@ async fn main() -> Result<()> {
     let opt: Options = Options::parse();
     let cfg = ConfigFile::load(opt.config_file);
 
-    if let Some(filter) = opt.filter {
-        *CMD_FILTER.lock().unwrap() = filter;
-    }
-
     if opt.instances.is_empty() {
         eprintln!("Must pass at least one redis instance (either host/port or named instance)");
         std::process::exit(1);
@@ -240,6 +238,7 @@ async fn main() -> Result<()> {
 
     let seeds = process_instances(&cfg, &opt.instances);
     let pairs = get_monitor_pairs(seeds).await.unwrap();
+    let filter = opt.filter.unwrap_or_default();
 
     let mut streams = futures::stream::select_all(pairs.into_iter().map(move |(info, c)| {
         c.into_on_message::<String>()
@@ -255,7 +254,13 @@ async fn main() -> Result<()> {
     while let Some((instance, msg)) = streams.next().await {
         let captures = re.captures(&msg);
 
-        println!("{captures:#?}");
+        //println!("{captures:#?}");
+
+        let cmd = &captures.unwrap()["command"];
+
+        if filter.filter(cmd) {
+            continue;
+        }
 
         if !opt.no_color {
             let msg = if let Some(color) = instance.color {
