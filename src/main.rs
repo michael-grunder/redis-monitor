@@ -18,6 +18,7 @@ use std::{
 
 mod config;
 mod connection;
+mod filter;
 mod stats;
 
 #[derive(Debug, Clone, Default)]

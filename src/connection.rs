@@ -85,7 +85,7 @@ impl std::fmt::Display for RedisAddr {
 impl GetHost for RedisAddr {
     fn get_host(&self) -> String {
         match self {
-            Self::Tcp(host, _) => format!("{host}"),
+            Self::Tcp(host, _) => host.to_string(),
             Self::Unix(path) => path.into(),
         }
     }
