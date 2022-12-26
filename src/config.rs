@@ -128,11 +128,11 @@ impl ConfigFile {
 }
 
 impl ConfigEntry {
-    pub fn get_color(&self) -> Color {
+    pub fn get_color(&self) -> Option<Color> {
         if let Some(c) = &self.color {
-            c.0
+            Some(c.0)
         } else {
-            Color::Black
+            None
         }
     }
 }

@@ -1,19 +1,33 @@
 use crate::{
-    config::{ConfigEntry, ConfigFile, DisplayColor},
+    config::{ConfigEntry, ConfigFile},
     connection::{Cluster, GetHost, GetPort},
+    stats::CommandStats,
 };
 use anyhow::{Context, Result};
 use clap::Parser;
 use colored::{Color, Colorize};
 use connection::RedisAddr;
 use futures::stream::*;
+use lazy_static::lazy_static;
+use regex::Regex;
+use serde::{de, Deserialize, Deserializer};
+use std::sync::Mutex;
 use std::{
+    collections::HashSet,
     convert::{AsRef, From},
     str::FromStr,
 };
 
 mod config;
 mod connection;
+mod stats;
+
+lazy_static! {
+    static ref CMD_FILTER: Mutex<CommandFilter> = Mutex::new(CommandFilter::new());
+}
+
+#[derive(Debug, Clone)]
+struct CommandFilter(HashSet<String>);
 
 #[derive(Parser, Debug)]
 struct Options {
@@ -29,6 +43,9 @@ struct Options {
     #[arg(long)]
     no_color: bool,
 
+    #[arg(long)]
+    filter: Option<CommandFilter>,
+
     pub instances: Vec<String>,
 }
 
@@ -43,7 +60,54 @@ struct MonitoredInstance {
     // Format string (defaults to {host}:{port}
     fmt: String,
 
-    color: Color,
+    color: Option<Color>,
+
+    stats: CommandStats,
+}
+
+impl FromStr for CommandFilter {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let set: HashSet<String> = s
+            .split(',')
+            .filter_map(|s| {
+                if !s.is_empty() {
+                    Some(s.trim().to_uppercase())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        Ok(Self { 0: set })
+    }
+}
+
+impl<'de> Deserialize<'de> for CommandFilter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        FromStr::from_str(&s).map_err(de::Error::custom)
+    }
+}
+
+impl CommandFilter {
+    fn new() -> Self {
+        Self(HashSet::new())
+    }
+
+    fn add_command(&mut self, cmd: &str) {
+        self.0.insert(cmd.to_owned());
+    }
+
+    fn add_commands(&mut self, src: CommandFilter) {
+        for cmd in src.0 {
+            self.add_command(&cmd);
+        }
+    }
 }
 
 impl MonitoredInstance {
@@ -62,7 +126,12 @@ impl MonitoredInstance {
         fmt
     }
 
-    fn new(name: Option<String>, addr: RedisAddr, color: Color, fmt: Option<String>) -> Self {
+    fn new(
+        name: Option<String>,
+        addr: RedisAddr,
+        color: Option<Color>,
+        fmt: Option<String>,
+    ) -> Self {
         let fmt =
             Self::make_fmt_string(&name, &addr, &fmt.unwrap_or_else(|| "{host}:{port}".into()));
 
@@ -70,6 +139,7 @@ impl MonitoredInstance {
             name,
             addr,
             color,
+            stats: CommandStats::new(),
             fmt,
         }
     }
@@ -107,7 +177,7 @@ impl MonitoredInstance {
 
 impl From<RedisAddr> for MonitoredInstance {
     fn from(addr: RedisAddr) -> Self {
-        Self::new(None, addr, Color::Black, Some("{host}:{port}".to_owned()))
+        Self::new(None, addr, None, Some("{host}:{port}".to_owned()))
     }
 }
 
@@ -159,6 +229,10 @@ async fn main() -> Result<()> {
     let opt: Options = Options::parse();
     let cfg = ConfigFile::load(opt.config_file);
 
+    if let Some(filter) = opt.filter {
+        *CMD_FILTER.lock().unwrap() = filter;
+    }
+
     if opt.instances.is_empty() {
         eprintln!("Must pass at least one redis instance (either host/port or named instance)");
         std::process::exit(1);
@@ -172,9 +246,24 @@ async fn main() -> Result<()> {
             .map(move |c| (info.clone(), c))
     }));
 
+    //`1672008540.915665 [0 127.0.0.1:34336] "BLMPOP" "0.20000000000000001" "2" "{bl}1" "{bl}2" "LEFT"`
+    //let re = Regex::new(r##"\A(?P<timestamp>\d+\.\d+)\s+\[(?P<database>\d+)\s+(?P<client>\S+)\]\s+"(?P<command>\S+)"\s+(?P<duration>\S+)\s+(?P<keyspace_event>\S+)\s+(?P<key1>\S+)\s*(?P<key2>\S+)?\s*(?P<side>\S+)?"##).unwrap();
+
+    let re = Regex::new(r#"(?P<timestamp>\d+\.\d+)\s+\[(?P<database>\d+)\s+(?P<client>\S+)\]\s+"(?P<command>\S+)" (?P<args>.*)"#)
+        .unwrap();
+
     while let Some((instance, msg)) = streams.next().await {
+        let captures = re.captures(&msg);
+
+        println!("{captures:#?}");
+
         if !opt.no_color {
-            let msg = msg.color(instance.color);
+            let msg = if let Some(color) = instance.color {
+                msg.color(color).to_string()
+            } else {
+                msg
+            };
+
             let hdr = instance.fmt.bold();
             println!("[{hdr}] {msg}");
         } else {
