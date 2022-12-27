@@ -1,7 +1,7 @@
-use crate::Filter;
 use crate::{
     config::{ConfigEntry, ConfigFile, RedisAuth},
     connection::{Cluster, GetHost, GetPort},
+    filter::Filter,
     stats::CommandStats,
 };
 
@@ -237,7 +237,7 @@ async fn main() -> Result<()> {
 
     let seeds = process_instances(&cfg, &opt.instances);
     let pairs = get_monitor_pairs(seeds).await.unwrap();
-    let filter = crate::filter::Filter::from_args(
+    let filter = Filter::from_args(
         opt.include.unwrap_or_default().0,
         opt.exclude.unwrap_or_default().0,
     );
@@ -253,10 +253,12 @@ async fn main() -> Result<()> {
     let re = Regex::new(r#"(?P<timestamp>\d+\.\d+)\s+\[(?P<database>\d+)\s+(?P<client>\S+)\]\s+"(?P<command>\S+)" (?P<args>.*)"#)
         .unwrap();
 
-    while let Some((instance, msg)) = streams.next().await {
+    while let Some((mut instance, msg)) = streams.next().await {
         let captures = re.captures(&msg);
 
         let cmd = &captures.unwrap()["command"];
+
+        instance.stats.incr(cmd, msg.len());
 
         if filter.filter(cmd) {
             continue;
@@ -270,9 +272,9 @@ async fn main() -> Result<()> {
             };
 
             let hdr = instance.fmt.bold();
-            println!("[{hdr}] {msg}");
+            println!("{hdr} {msg}");
         } else {
-            println!("[{}] {msg}", instance.fmt);
+            println!("{} {msg}", instance.fmt);
         }
     }
 
