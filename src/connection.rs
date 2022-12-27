@@ -101,11 +101,11 @@ impl GetPort for RedisAddr {
 }
 
 impl RedisAddr {
-    fn from_tcp_addr<T: AsRef<str>>(host: T, port: u16) -> Self {
+    pub fn from_tcp_addr<T: AsRef<str>>(host: T, port: u16) -> Self {
         Self::Tcp(host.as_ref().to_string(), port)
     }
 
-    fn from_path<T: AsRef<str>>(path: T) -> Self {
+    pub fn from_path<T: AsRef<str>>(path: T) -> Self {
         Self::Unix(path.as_ref().to_string())
     }
 

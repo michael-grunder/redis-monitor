@@ -2,6 +2,9 @@ use crate::connection::RedisAddr;
 use anyhow::{Context, Result};
 use colored::Color;
 use config::{Config, File, FileFormat};
+use redis::cmd;
+use redis::Cmd;
+
 use serde::{de, Deserialize, Deserializer};
 use std::{
     collections::HashMap, convert::AsRef, env, iter::IntoIterator, option::Option, path::PathBuf,
@@ -17,6 +20,12 @@ pub struct ConfigFile(HashMap<String, ConfigEntry>);
 #[derive(Debug)]
 pub struct DisplayColor(Color);
 
+#[derive(Debug, Clone)]
+pub enum RedisAuth {
+    UserPass(String, String),
+    Pass(String),
+}
+
 impl<'a> IntoIterator for &'a ConfigFile {
     type Item = <&'a HashMap<String, ConfigEntry> as IntoIterator>::Item;
     type IntoIter = <&'a HashMap<String, ConfigEntry> as IntoIterator>::IntoIter;
@@ -28,7 +37,13 @@ impl<'a> IntoIterator for &'a ConfigFile {
 
 #[derive(Debug, Deserialize)]
 pub struct ConfigEntry {
-    pub addresses: Vec<RedisAddr>,
+    addresses: Option<Vec<RedisAddr>>,
+    path: Option<String>,
+    host: Option<String>,
+    port: Option<u16>,
+
+    user: Option<String>,
+    pass: Option<String>,
 
     #[serde(default)]
     pub cluster: bool,
@@ -57,6 +72,36 @@ impl<'de> Deserialize<'de> for DisplayColor {
     {
         let s = String::deserialize(deserializer)?;
         FromStr::from_str(&s).map_err(de::Error::custom)
+    }
+}
+
+impl RedisAuth {
+    fn from_pass(pass: &str) -> Self {
+        Self::Pass(pass.to_owned())
+    }
+
+    fn from_user_pass(user: &str, pass: &str) -> Self {
+        Self::UserPass(user.to_owned(), pass.to_owned())
+    }
+
+    pub fn get_command(&self) -> Cmd {
+        let mut command = cmd("AUTH");
+
+        match self {
+            Self::UserPass(user, pass) => {
+                command.arg(user).arg(pass);
+            }
+            Self::Pass(pass) => {
+                command.arg(pass);
+            }
+        }
+
+        command
+    }
+
+    pub async fn auth(&self, con: &mut redis::aio::Connection) -> bool {
+        let command = self.get_command();
+        matches!(command.query_async(con).await, Ok(redis::Value::Okay))
     }
 }
 
@@ -126,13 +171,36 @@ impl ConfigFile {
         }
     }
 }
-
+// self.color.as_ref().map(|c| c.0)
 impl ConfigEntry {
     pub fn get_color(&self) -> Option<Color> {
-        if let Some(c) = &self.color {
-            Some(c.0)
+        self.color.as_ref().map(|c| c.0)
+    }
+
+    fn host_port(&self) -> Option<(String, u16)> {
+        match (&self.host, &self.port) {
+            (Some(host), Some(port)) => Some((host.to_owned(), *port)),
+            _ => None,
+        }
+    }
+
+    pub fn get_auth(&self) -> Option<RedisAuth> {
+        match (&self.user, &self.pass) {
+            (Some(user), Some(pass)) => Some(RedisAuth::from_user_pass(user, pass)),
+            (None, Some(pass)) => Some(RedisAuth::from_pass(pass)),
+            _ => None,
+        }
+    }
+
+    pub fn get_addresses(&self) -> Vec<RedisAddr> {
+        if let Some((host, port)) = self.host_port() {
+            vec![RedisAddr::from_tcp_addr(host, port)]
+        } else if let Some(addresses) = &self.addresses {
+            addresses.to_owned()
+        } else if let Some(path) = &self.path {
+            vec![RedisAddr::from_path(path)]
         } else {
-            None
+            panic!("Could not determine one or more Redis addresses");
         }
     }
 }

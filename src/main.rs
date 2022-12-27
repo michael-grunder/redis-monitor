@@ -1,8 +1,10 @@
+use crate::Filter;
 use crate::{
-    config::{ConfigEntry, ConfigFile},
+    config::{ConfigEntry, ConfigFile, RedisAuth},
     connection::{Cluster, GetHost, GetPort},
     stats::CommandStats,
 };
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use colored::{Color, Colorize};
@@ -22,7 +24,7 @@ mod filter;
 mod stats;
 
 #[derive(Debug, Clone, Default)]
-struct CommandFilter(HashSet<String>);
+struct CsvArgument(Vec<String>);
 
 #[derive(Parser, Debug)]
 struct Options {
@@ -39,7 +41,10 @@ struct Options {
     no_color: bool,
 
     #[arg(long)]
-    filter: Option<CommandFilter>,
+    include: Option<CsvArgument>,
+
+    #[arg(long)]
+    exclude: Option<CsvArgument>,
 
     pub instances: Vec<String>,
 }
@@ -52,6 +57,8 @@ struct MonitoredInstance {
     // The address itself
     addr: RedisAddr,
 
+    auth: Option<RedisAuth>,
+
     // Format string (defaults to {host}:{port}
     fmt: String,
 
@@ -60,56 +67,32 @@ struct MonitoredInstance {
     stats: CommandStats,
 }
 
-impl FromStr for CommandFilter {
+impl FromStr for CsvArgument {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let set: HashSet<String> = s
+        let mut set: HashSet<String> = s
             .split(',')
             .filter_map(|s| {
                 if !s.is_empty() {
-                    Some(s.trim().to_uppercase())
+                    Some(s.trim().to_owned())
                 } else {
                     None
                 }
             })
             .collect();
 
-        Ok(Self { 0: set })
+        Ok(Self(set.drain().collect()))
     }
 }
 
-impl<'de> Deserialize<'de> for CommandFilter {
+impl<'de> Deserialize<'de> for CsvArgument {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
         FromStr::from_str(&s).map_err(de::Error::custom)
-    }
-}
-
-impl CommandFilter {
-    fn new() -> Self {
-        Self(HashSet::new())
-    }
-
-    fn add_command(&mut self, cmd: &str) {
-        self.0.insert(cmd.to_owned());
-    }
-
-    fn add_commands(&mut self, src: CommandFilter) {
-        for cmd in src.0 {
-            self.add_command(&cmd);
-        }
-    }
-
-    fn filter(&self, cmd: &str) -> bool {
-        if self.0.is_empty() {
-            return false;
-        }
-
-        !self.0.contains(cmd)
     }
 }
 
@@ -132,6 +115,7 @@ impl MonitoredInstance {
     fn new(
         name: Option<String>,
         addr: RedisAddr,
+        auth: Option<RedisAuth>,
         color: Option<Color>,
         fmt: Option<String>,
     ) -> Self {
@@ -141,6 +125,7 @@ impl MonitoredInstance {
         Self {
             name,
             addr,
+            auth,
             color,
             stats: CommandStats::new(),
             fmt,
@@ -149,13 +134,14 @@ impl MonitoredInstance {
 
     fn from_config_entry(name: &str, entry: &ConfigEntry) -> Vec<Self> {
         if entry.cluster {
-            let c = Cluster::from_seeds(&entry.addresses).expect("Can't get cluster nodes");
+            let c = Cluster::from_seeds(&entry.get_addresses()).expect("Can't get cluster nodes");
             c.get_primary_nodes()
                 .iter()
                 .map(|primary| {
                     Self::new(
                         Some(name.to_owned()),
                         primary.addr.to_owned(),
+                        entry.get_auth(),
                         entry.get_color(),
                         entry.format.clone(),
                     )
@@ -163,12 +149,13 @@ impl MonitoredInstance {
                 .collect()
         } else {
             entry
-                .addresses
+                .get_addresses()
                 .iter()
                 .map(|addr| {
                     Self::new(
                         Some(name.to_owned()),
                         addr.to_owned(),
+                        entry.get_auth(),
                         entry.get_color(),
                         entry.format.clone(),
                     )
@@ -180,13 +167,24 @@ impl MonitoredInstance {
 
 impl From<RedisAddr> for MonitoredInstance {
     fn from(addr: RedisAddr) -> Self {
-        Self::new(None, addr, None, Some("{host}:{port}".to_owned()))
+        Self::new(None, addr, None, None, Some("{host}:{port}".to_owned()))
     }
 }
 
-async fn get_monitor<T: AsRef<str>>(url: T) -> Result<redis::aio::Monitor> {
+async fn get_monitor<T: AsRef<str>>(
+    url: T,
+    auth: &Option<RedisAuth>,
+) -> Result<redis::aio::Monitor> {
     let cli = redis::Client::open(url.as_ref()).context("Failed to open connection to")?;
-    let mut mon = cli.get_async_connection().await?.into_monitor();
+    let mut con = cli.get_async_connection().await?;
+
+    if let Some(auth) = auth {
+        if !auth.auth(&mut con).await {
+            panic!("Failed to authenticate connection!");
+        }
+    }
+
+    let mut mon = con.into_monitor();
     mon.monitor().await?;
     Ok(mon)
 }
@@ -200,7 +198,7 @@ async fn get_monitor_pairs(
         let url = instance.addr.get_url_string();
         println!("MONITOR {url} {}", instance.fmt);
 
-        let mon = get_monitor(&url)
+        let mon = get_monitor(&url, &instance.auth)
             .await
             .with_context(|| format!("Failed to get connection for '{url}'"))?;
         res.push((instance, mon));
@@ -239,7 +237,10 @@ async fn main() -> Result<()> {
 
     let seeds = process_instances(&cfg, &opt.instances);
     let pairs = get_monitor_pairs(seeds).await.unwrap();
-    let filter = opt.filter.unwrap_or_default();
+    let filter = crate::filter::Filter::from_args(
+        opt.include.unwrap_or_default().0,
+        opt.exclude.unwrap_or_default().0,
+    );
 
     let mut streams = futures::stream::select_all(pairs.into_iter().map(move |(info, c)| {
         c.into_on_message::<String>()
@@ -254,8 +255,6 @@ async fn main() -> Result<()> {
 
     while let Some((instance, msg)) = streams.next().await {
         let captures = re.captures(&msg);
-
-        //println!("{captures:#?}");
 
         let cmd = &captures.unwrap()["command"];
 
