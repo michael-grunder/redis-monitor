@@ -1,16 +1,16 @@
 use crate::{
-    config::{ConfigEntry, ConfigFile, RedisAuth},
-    connection::{Cluster, GetHost, GetPort},
+    config::{ConfigFile, RedisAuth},
     filter::Filter,
+    monitor::MonitoredInstance,
     stats::CommandStats,
 };
 use tokio::io::AsyncBufReadExt;
-use tokio::io::{AsyncReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::task;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use colored::{Color, Colorize};
+use colored::Colorize;
 use connection::RedisAddr;
 use futures::stream::*;
 use regex::Regex;
@@ -18,12 +18,14 @@ use serde::{de, Deserialize, Deserializer};
 use std::{
     collections::HashSet,
     convert::{AsRef, From},
+    default::Default,
     str::FromStr,
 };
 
 mod config;
 mod connection;
 mod filter;
+mod monitor;
 mod stats;
 
 #[derive(Debug, Clone, Default)]
@@ -52,24 +54,6 @@ struct Options {
     pub instances: Vec<String>,
 }
 
-#[derive(Clone)]
-struct MonitoredInstance {
-    // The name this instance belongs to (if it's from our config.toml)
-    name: Option<String>,
-
-    // The address itself
-    addr: RedisAddr,
-
-    auth: Option<RedisAuth>,
-
-    // Format string (defaults to {host}:{port}
-    fmt: String,
-
-    color: Option<Color>,
-
-    stats: CommandStats,
-}
-
 impl FromStr for CsvArgument {
     type Err = anyhow::Error;
 
@@ -89,6 +73,12 @@ impl FromStr for CsvArgument {
     }
 }
 
+impl CsvArgument {
+    pub fn to_vec(&self) -> Vec<String> {
+        self.0.to_owned()
+    }
+}
+
 impl<'de> Deserialize<'de> for CsvArgument {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -96,81 +86,6 @@ impl<'de> Deserialize<'de> for CsvArgument {
     {
         let s = String::deserialize(deserializer)?;
         FromStr::from_str(&s).map_err(de::Error::custom)
-    }
-}
-
-impl MonitoredInstance {
-    fn make_fmt_string(name: &Option<String>, addr: &RedisAddr, fmt: &str) -> String {
-        let fmt = fmt.to_owned();
-        let mut fmt = fmt.replace("{host}", &addr.get_host());
-
-        if let Some(name) = name {
-            fmt = fmt.replace("{name}", name);
-        };
-
-        if let Some(port) = addr.get_port() {
-            fmt = fmt.replace("{port}", &format!("{port}"));
-        }
-
-        fmt
-    }
-
-    fn new(
-        name: Option<String>,
-        addr: RedisAddr,
-        auth: Option<RedisAuth>,
-        color: Option<Color>,
-        fmt: Option<String>,
-    ) -> Self {
-        let fmt =
-            Self::make_fmt_string(&name, &addr, &fmt.unwrap_or_else(|| "{host}:{port}".into()));
-
-        Self {
-            name,
-            addr,
-            auth,
-            color,
-            stats: CommandStats::new(),
-            fmt,
-        }
-    }
-
-    fn from_config_entry(name: &str, entry: &ConfigEntry) -> Vec<Self> {
-        if entry.cluster {
-            let c = Cluster::from_seeds(&entry.get_addresses()).expect("Can't get cluster nodes");
-            c.get_primary_nodes()
-                .iter()
-                .map(|primary| {
-                    Self::new(
-                        Some(name.to_owned()),
-                        primary.addr.to_owned(),
-                        entry.get_auth(),
-                        entry.get_color(),
-                        entry.format.clone(),
-                    )
-                })
-                .collect()
-        } else {
-            entry
-                .get_addresses()
-                .iter()
-                .map(|addr| {
-                    Self::new(
-                        Some(name.to_owned()),
-                        addr.to_owned(),
-                        entry.get_auth(),
-                        entry.get_color(),
-                        entry.format.clone(),
-                    )
-                })
-                .collect()
-        }
-    }
-}
-
-impl From<RedisAddr> for MonitoredInstance {
-    fn from(addr: RedisAddr) -> Self {
-        Self::new(None, addr, None, None, Some("{host}:{port}".to_owned()))
     }
 }
 
@@ -198,10 +113,10 @@ async fn get_monitor_pairs(
     let mut res = vec![];
 
     for instance in instances {
-        let url = instance.addr.get_url_string();
-        println!("MONITOR {url} {}", instance.fmt);
+        let url = instance.get_url_string();
+        println!("MONITOR {url} {}", instance.fmt_str());
 
-        let mon = get_monitor(&url, &instance.auth)
+        let mon = get_monitor(&url, instance.get_auth())
             .await
             .with_context(|| format!("Failed to get connection for '{url}'"))?;
         res.push((instance, mon));
@@ -241,8 +156,8 @@ async fn main() -> Result<()> {
     let seeds = process_instances(&cfg, &opt.instances);
     let pairs = get_monitor_pairs(seeds).await.unwrap();
     let filter = Filter::from_args(
-        opt.include.unwrap_or_default().0,
-        opt.exclude.unwrap_or_default().0,
+        opt.include.unwrap_or_default().to_vec(),
+        opt.exclude.unwrap_or_default().to_vec(),
     );
 
     let mut streams = futures::stream::select_all(pairs.into_iter().map(move |(info, c)| {
@@ -276,23 +191,23 @@ async fn main() -> Result<()> {
 
         let cmd = &captures.unwrap()["command"];
 
-        instance.stats.incr(cmd, msg.len());
+        instance.incr_stats(cmd, msg.len());
 
         if filter.filter(cmd) {
             continue;
         }
 
         if !opt.no_color {
-            let msg = if let Some(color) = instance.color {
+            let msg = if let Some(color) = instance.get_color() {
                 msg.color(color).to_string()
             } else {
                 msg
             };
 
-            let hdr = instance.fmt.bold();
+            let hdr = instance.fmt_str().bold();
             println!("{hdr} {msg}");
         } else {
-            println!("{} {msg}", instance.fmt);
+            println!("{} {msg}", instance.fmt_str());
         }
     }
 

@@ -22,13 +22,13 @@ pub struct CommandStats(HashMap<String, CommandStat>);
 
 impl CommandStats {
     pub fn new() -> Self {
-        Self { 0: HashMap::new() }
+        Self(HashMap::new())
     }
 
     pub fn incr(&mut self, cmd: &str, bytes: usize) {
         self.0
             .entry(cmd.to_string())
-            .or_insert(CommandStat::new())
+            .or_insert_with(CommandStat::new)
             .incr(bytes);
     }
 }

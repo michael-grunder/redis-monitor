@@ -176,9 +176,6 @@ where
     }
 }
 
-//impl<'a> GetConnection for &'a RedisAddr {
-//}
-
 impl Cluster {
     fn new(primaries: HashSet<ClusterNode>) -> Self {
         Self(primaries)
@@ -261,10 +258,10 @@ impl Cluster {
     }
 
     pub fn get_primary_nodes(&self) -> Vec<ClusterNode> {
-        self.0.iter().map(|node| node.clone()).collect()
+        self.0.iter().cloned().collect()
     }
 
-    pub fn get_primaries(&self) -> Vec<RedisAddr> {
-        self.0.iter().map(|node| node.addr.clone()).collect()
-    }
+    //pub fn get_primaries(&self) -> Vec<RedisAddr> {
+    //    self.0.iter().map(|node| node.addr.clone()).collect()
+    //}
 }
