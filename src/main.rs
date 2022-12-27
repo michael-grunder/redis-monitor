@@ -4,6 +4,9 @@ use crate::{
     filter::Filter,
     stats::CommandStats,
 };
+use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncReadExt, BufReader};
+use tokio::task;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -252,6 +255,21 @@ async fn main() -> Result<()> {
 
     let re = Regex::new(r#"(?P<timestamp>\d+\.\d+)\s+\[(?P<database>\d+)\s+(?P<client>\S+)\]\s+"(?P<command>\S+)" (?P<args>.*)"#)
         .unwrap();
+
+    // Spawn a task to read from stdin
+    let mut reader = BufReader::new(tokio::io::stdin());
+    task::spawn(async move {
+        // Read a line of input from the user
+        let mut input = String::new();
+        while reader.read_line(&mut input).await.is_ok() {
+            println!("Input: {input}");
+            if input.to_lowercase().starts_with("quit") {
+                println!("Quit detected, exiting.");
+                std::process::exit(0);
+            }
+            input.truncate(0);
+        }
+    });
 
     while let Some((mut instance, msg)) = streams.next().await {
         let captures = re.captures(&msg);
