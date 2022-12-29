@@ -14,6 +14,7 @@ colored = "2.0.0"
 config = { version = "0.13.3", features = ["toml"] }
 futures = "0.3.25"
 lazy_static = "1.4.0"
+nom = "7.1.1"
 prettytable-rs = "0.9.0"
 redis = { version = "0.22.1", features = ["tls", "tokio-native-tls-comp", "aio", "tokio-comp"] }
 regex = "1.7.0"

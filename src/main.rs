@@ -1,7 +1,7 @@
 use crate::{
     config::{ConfigFile, RedisAuth},
     filter::Filter,
-    monitor::MonitoredInstance,
+    monitor::{MonitorArgs, MonitoredInstance},
     stats::CommandStats,
 };
 use tokio::io::AsyncBufReadExt;
@@ -155,6 +155,7 @@ async fn main() -> Result<()> {
 
     let seeds = process_instances(&cfg, &opt.instances);
     let pairs = get_monitor_pairs(seeds).await.unwrap();
+
     let filter = Filter::from_args(
         opt.include.unwrap_or_default().to_vec(),
         opt.exclude.unwrap_or_default().to_vec(),
@@ -164,12 +165,6 @@ async fn main() -> Result<()> {
         c.into_on_message::<String>()
             .map(move |c| (info.clone(), c))
     }));
-
-    //`1672008540.915665 [0 127.0.0.1:34336] "BLMPOP" "0.20000000000000001" "2" "{bl}1" "{bl}2" "LEFT"`
-    //let re = Regex::new(r##"\A(?P<timestamp>\d+\.\d+)\s+\[(?P<database>\d+)\s+(?P<client>\S+)\]\s+"(?P<command>\S+)"\s+(?P<duration>\S+)\s+(?P<keyspace_event>\S+)\s+(?P<key1>\S+)\s*(?P<key2>\S+)?\s*(?P<side>\S+)?"##).unwrap();
-
-    let re = Regex::new(r#"(?P<timestamp>\d+\.\d+)\s+\[(?P<database>\d+)\s+(?P<client>\S+)\]\s+"(?P<command>\S+)" (?P<args>.*)"#)
-        .unwrap();
 
     // Spawn a task to read from stdin
     let mut reader = BufReader::new(tokio::io::stdin());
@@ -187,13 +182,11 @@ async fn main() -> Result<()> {
     });
 
     while let Some((mut instance, msg)) = streams.next().await {
-        let captures = re.captures(&msg);
+        let line = MonitorArgs::from_line(&msg).expect("Failed to parse line");
 
-        let cmd = &captures.unwrap()["command"];
+        instance.incr_stats(line.cmd, msg.len());
 
-        instance.incr_stats(cmd, msg.len());
-
-        if filter.filter(cmd) {
+        if filter.filter(line.cmd) {
             continue;
         }
 

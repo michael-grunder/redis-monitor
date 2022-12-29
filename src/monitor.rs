@@ -1,7 +1,74 @@
 use crate::config::{ConfigEntry, RedisAuth};
 use crate::connection::*;
 use crate::CommandStats;
+use anyhow::{anyhow, Result};
 use colored::Color;
+use nom::{
+    bytes::complete::{escaped, tag, take_until},
+    character::complete::{alpha1, digit1, none_of, one_of, space0},
+    combinator::{map_res, recognize},
+    multi::many1,
+    number::complete::double,
+    IResult,
+};
+
+#[derive(Debug, PartialEq)]
+pub struct MonitorArgs<'a> {
+    pub timestamp: f64,
+    pub db: u64,
+    pub client: &'a str,
+    pub cmd: &'a str,
+    pub args: Vec<&'a str>,
+}
+
+impl<'a> MonitorArgs<'a> {
+    fn parse_number<T: std::str::FromStr>(input: &str) -> IResult<&str, T> {
+        map_res(recognize(many1(digit1)), |s: &str| s.parse::<T>())(input)
+    }
+
+    fn parse_escaped_arg(input: &str) -> IResult<&str, &str> {
+        let (input, _) = space0(input)?;
+        let (input, _) = tag("\"")(input)?;
+        let (input, arg) = escaped(none_of(r#"\""#), '\\', one_of(r#"\"rxabn"#))(input)?;
+        let (input, _) = tag("\"")(input)?;
+        let (input, _) = space0(input)?;
+        Ok((input, arg))
+    }
+
+    fn parse_line(input: &str) -> IResult<&str, MonitorArgs> {
+        let (input, timestamp) = double(input)?;
+        let (input, _) = space0(input)?;
+        let (input, _) = tag("[")(input)?;
+        let (input, db) = Self::parse_number::<u64>(input)?;
+        let (input, _) = space0(input)?;
+        let (input, client) = take_until("]")(input)?;
+        let (input, _) = tag("]")(input)?;
+        let (input, _) = space0(input)?;
+        let (input, _) = tag("\"")(input)?;
+        let (input, cmd) = recognize(many1(alpha1))(input)?;
+        let (input, _) = tag("\"")(input)?;
+        let (input, arg) = many1(Self::parse_escaped_arg)(input)?;
+
+        Ok((
+            input,
+            MonitorArgs {
+                timestamp,
+                db: db as u64,
+                client,
+                cmd,
+                args: arg,
+            },
+        ))
+    }
+
+    pub fn from_line(input: &'a str) -> Result<Self> {
+        if let Ok(mline) = Self::parse_line(input) {
+            Ok(mline.1)
+        } else {
+            Err(anyhow!("Failure to parse"))
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct MonitoredInstance {
