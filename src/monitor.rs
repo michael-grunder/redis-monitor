@@ -7,7 +7,7 @@ use nom::{
     bytes::complete::{escaped, tag, take_until},
     character::complete::{alpha1, digit1, none_of, one_of, space0},
     combinator::{map_res, recognize},
-    multi::many1,
+    multi::{many0, many1},
     number::complete::double,
     IResult,
 };
@@ -47,7 +47,7 @@ impl<'a> MonitorArgs<'a> {
         let (input, _) = tag("\"")(input)?;
         let (input, cmd) = recognize(many1(alpha1))(input)?;
         let (input, _) = tag("\"")(input)?;
-        let (input, arg) = many1(Self::parse_escaped_arg)(input)?;
+        let (input, arg) = many0(Self::parse_escaped_arg)(input)?;
 
         Ok((
             input,
@@ -179,6 +179,11 @@ impl MonitoredInstance {
 
 impl From<RedisAddr> for MonitoredInstance {
     fn from(addr: RedisAddr) -> Self {
-        Self::new(None, addr, None, None, Some("{host}:{port}".to_owned()))
+        let fmt = match addr {
+            RedisAddr::Tcp(_, _) => "{host}:{port}",
+            _ => "{host}",
+        };
+
+        Self::new(None, addr, None, None, Some(fmt.to_owned()))
     }
 }
