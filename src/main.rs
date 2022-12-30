@@ -1,7 +1,7 @@
 use crate::{
     config::{ConfigFile, RedisAuth},
     filter::Filter,
-    monitor::{MonitorArgs, MonitoredInstance},
+    monitor::{MonitorLine, MonitoredInstance},
     stats::CommandStats,
 };
 use tokio::io::AsyncBufReadExt;
@@ -13,7 +13,6 @@ use clap::Parser;
 use colored::Colorize;
 use connection::RedisAddr;
 use futures::stream::*;
-use regex::Regex;
 use serde::{de, Deserialize, Deserializer};
 use std::{
     collections::HashSet,
@@ -182,7 +181,7 @@ async fn main() -> Result<()> {
     });
 
     while let Some((mut instance, msg)) = streams.next().await {
-        let line = MonitorArgs::from_line(&msg).expect("Failed to parse line");
+        let (_, line) = MonitorLine::from_line(&msg).expect("Failed to parse line");
 
         instance.incr_stats(line.cmd, msg.len());
 

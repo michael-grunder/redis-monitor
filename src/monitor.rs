@@ -1,28 +1,35 @@
 use crate::config::{ConfigEntry, RedisAuth};
 use crate::connection::*;
 use crate::CommandStats;
-use anyhow::{anyhow, Result};
 use colored::Color;
 use nom::{
     bytes::complete::{escaped, tag, take_until},
     character::complete::{alpha1, digit1, none_of, one_of, space0},
     combinator::{map_res, recognize},
+    error::{ErrorKind, ParseError},
     multi::{many0, many1},
     number::complete::double,
-    IResult,
+    Err, IResult,
 };
+use std::net::{IpAddr, Ipv4Addr};
 
-#[derive(Debug, PartialEq)]
-pub struct MonitorArgs<'a> {
+#[derive(Debug)]
+pub struct MonitorLine<'a> {
     pub timestamp: f64,
     pub db: u64,
-    pub client: &'a str,
+    pub addr: ClientAddr<'a>,
     pub cmd: &'a str,
     pub args: Vec<&'a str>,
 }
 
-impl<'a> MonitorArgs<'a> {
-    fn parse_number<T: std::str::FromStr>(input: &str) -> IResult<&str, T> {
+#[derive(Debug)]
+pub enum ClientAddr<'a> {
+    Path(&'a str),
+    Tcp((IpAddr, u16)),
+}
+
+impl<'a> MonitorLine<'a> {
+    fn parse_from_str<T: std::str::FromStr>(input: &str) -> IResult<&str, T> {
         map_res(recognize(many1(digit1)), |s: &str| s.parse::<T>())(input)
     }
 
@@ -35,38 +42,110 @@ impl<'a> MonitorArgs<'a> {
         Ok((input, arg))
     }
 
-    fn parse_line(input: &str) -> IResult<&str, MonitorArgs> {
+    // aaa.bbb.ccc.ddd (127.0.0.1)
+    pub fn parse_ipv4(input: &str) -> IResult<&str, (IpAddr, u16)> {
+        let (input, a) = Self::parse_from_str::<u8>(input)?;
+        let (input, _) = tag(".")(input)?;
+        let (input, b) = Self::parse_from_str::<u8>(input)?;
+        let (input, _) = tag(".")(input)?;
+        let (input, c) = Self::parse_from_str::<u8>(input)?;
+        let (input, _) = tag(".")(input)?;
+        let (input, d) = Self::parse_from_str::<u8>(input)?;
+
+        let (input, _) = tag(":")(input)?;
+        let (input, port) = Self::parse_from_str::<u16>(input)?;
+
+        let ip = IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+
+        Ok((input, (ip, port)))
+    }
+
+    // [0 [::1]:53374]
+    pub fn parse_ipv6(input: &str) -> IResult<&str, (IpAddr, u16)> {
+        let (input, _) = tag("[")(input)?;
+        let (input, ip) = take_until("]")(input)?;
+        let (input, _) = tag("]")(input)?;
+        let (input, _) = tag(":")(input)?;
+        let (input, port) = Self::parse_from_str::<u16>(input)?;
+
+        let ip = ip.parse().map_err(|_| {
+            Err::Error(ParseError::from_error_kind(
+                input,
+                nom::error::ErrorKind::Tag,
+            ))
+        })?;
+
+        Ok((input, (ip, port)))
+    }
+
+    pub fn parse_unix(input: &str) -> IResult<&str, &str> {
+        let (input, _) = tag("unix:")(input)?;
+        let (input, path) = take_until("]")(input)?;
+        Ok((input, path))
+    }
+
+    fn parse_client(input: &str) -> IResult<&str, ClientAddr> {
+        if let Ok((input, path)) = Self::parse_unix(input) {
+            Ok((input, ClientAddr::from_path(path)))
+        } else if let Ok((input, (addr, port))) = Self::parse_ipv4(input) {
+            Ok((input, ClientAddr::from_addr(addr, port)))
+        } else if let Ok((input, (addr, port))) = Self::parse_ipv6(input) {
+            Ok((input, ClientAddr::from_addr(addr, port)))
+        } else {
+            Err(Err::Error(ParseError::from_error_kind(
+                input,
+                ErrorKind::Tag,
+            )))
+        }
+    }
+
+    fn parse_source(input: &str) -> IResult<&str, (u64, ClientAddr)> {
+        let (input, _) = tag("[")(input)?;
+        let (input, db) = Self::parse_from_str::<u64>(input)?;
+        let (input, _) = space0(input)?;
+        let (input, addr) = Self::parse_client(input)?;
+        let (input, _) = tag("]")(input)?;
+        Ok((input, (db, addr)))
+    }
+
+    pub fn from_line(input: &'a str) -> IResult<&str, MonitorLine> {
         let (input, timestamp) = double(input)?;
         let (input, _) = space0(input)?;
-        let (input, _) = tag("[")(input)?;
-        let (input, db) = Self::parse_number::<u64>(input)?;
-        let (input, _) = space0(input)?;
-        let (input, client) = take_until("]")(input)?;
-        let (input, _) = tag("]")(input)?;
+        let (input, (db, addr)) = Self::parse_source(input)?;
+
         let (input, _) = space0(input)?;
         let (input, _) = tag("\"")(input)?;
         let (input, cmd) = recognize(many1(alpha1))(input)?;
         let (input, _) = tag("\"")(input)?;
-        let (input, arg) = many0(Self::parse_escaped_arg)(input)?;
+        let (input, args) = many0(Self::parse_escaped_arg)(input)?;
 
-        Ok((
-            input,
-            MonitorArgs {
-                timestamp,
-                db: db as u64,
-                client,
-                cmd,
-                args: arg,
-            },
-        ))
+        Ok((input, Self::new(timestamp, db, addr, cmd, args)))
     }
 
-    pub fn from_line(input: &'a str) -> Result<Self> {
-        if let Ok(mline) = Self::parse_line(input) {
-            Ok(mline.1)
-        } else {
-            Err(anyhow!("Failure to parse"))
+    pub fn new(
+        timestamp: f64,
+        db: u64,
+        addr: ClientAddr<'a>,
+        cmd: &'a str,
+        args: Vec<&'a str>,
+    ) -> Self {
+        Self {
+            timestamp,
+            db,
+            addr,
+            cmd,
+            args,
         }
+    }
+}
+
+impl<'a> ClientAddr<'a> {
+    pub fn from_path(path: &'a str) -> Self {
+        Self::Path(path)
+    }
+
+    pub fn from_addr(addr: IpAddr, port: u16) -> Self {
+        Self::Tcp((addr, port))
     }
 }
 
