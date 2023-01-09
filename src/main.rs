@@ -50,6 +50,9 @@ struct Options {
     #[arg(long)]
     exclude: Option<CsvArgument>,
 
+    #[arg(long)]
+    db: Option<u64>,
+
     pub instances: Vec<String>,
 }
 
@@ -147,6 +150,8 @@ async fn main() -> Result<()> {
     let opt: Options = Options::parse();
     let cfg = ConfigFile::load(opt.config_file);
 
+    let filter_db = opt.db.unwrap_or(u64::MAX);
+
     if opt.instances.is_empty() {
         eprintln!("Must pass at least one redis instance (either host/port or named instance)");
         std::process::exit(1);
@@ -184,6 +189,10 @@ async fn main() -> Result<()> {
         let (_, line) = MonitorLine::from_line(&msg).expect("Failed to parse line");
 
         instance.incr_stats(line.cmd, msg.len());
+
+        if filter_db != u64::MAX && filter_db != line.db {
+            continue;
+        }
 
         if filter.filter(line.cmd) {
             continue;
