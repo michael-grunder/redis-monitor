@@ -4,9 +4,7 @@ use crate::{
     monitor::{MonitorLine, MonitoredInstance},
     stats::CommandStats,
 };
-use tokio::io::AsyncBufReadExt;
-use tokio::io::BufReader;
-use tokio::task;
+use tokio::{io::AsyncBufReadExt, io::BufReader, task};
 
 use anyhow::{Context, Result};
 use clap::Parser;

@@ -1,17 +1,26 @@
-use crate::config::{ConfigEntry, RedisAuth};
-use crate::connection::*;
-use crate::CommandStats;
+use crate::{
+    config::{ConfigEntry, RedisAuth},
+    connection::*,
+    CommandStats,
+};
 use colored::Color;
+use std::net::{IpAddr, Ipv4Addr};
+
 use nom::{
-    bytes::complete::{escaped, tag, take_until},
-    character::complete::{alpha1, digit1, none_of, one_of, space0},
-    combinator::{map_res, recognize},
-    error::{ErrorKind, ParseError},
-    multi::{many0, many1},
+    branch::alt,
+    bytes::{
+        complete::{tag, take_until},
+        streaming::{is_not, take_while_m_n},
+    },
+    character::complete::{alpha1, digit1, space0},
+    character::streaming::char,
+    combinator::{map, map_opt, map_res, recognize, value, verify},
+    error::{ErrorKind, FromExternalError, ParseError},
+    multi::{fold_many0, many0, many1},
     number::complete::double,
+    sequence::preceded,
     Err, IResult,
 };
-use std::net::{IpAddr, Ipv4Addr};
 
 #[derive(Debug)]
 pub struct MonitorLine<'a> {
@@ -19,7 +28,7 @@ pub struct MonitorLine<'a> {
     pub db: u64,
     pub addr: ClientAddr<'a>,
     pub cmd: &'a str,
-    pub args: Vec<&'a str>,
+    pub args: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -28,18 +37,99 @@ pub enum ClientAddr<'a> {
     Tcp((IpAddr, u16)),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StringFragment<'a> {
+    Literal(&'a str),
+    EscapedChar(char),
+}
+
 impl<'a> MonitorLine<'a> {
-    fn parse_from_str<T: std::str::FromStr>(input: &str) -> IResult<&str, T> {
-        map_res(recognize(many1(digit1)), |s: &str| s.parse::<T>())(input)
+    fn parse_escaped_hex<E>(input: &'a str) -> IResult<&'a str, char, E>
+    where
+        E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+    {
+        let parse_hex = take_while_m_n(2, 2, |c: char| c.is_ascii_hexdigit());
+        let parse_u8 = map_res(parse_hex, move |hex| u8::from_str_radix(hex, 16));
+
+        map_opt(parse_u8, |value| std::char::from_u32(value as u32))(input)
     }
 
-    fn parse_escaped_arg(input: &str) -> IResult<&str, &str> {
-        let (input, _) = space0(input)?;
+    fn parse_escaped_char<E>(input: &'a str) -> IResult<&'a str, char, E>
+    where
+        E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+    {
+        preceded(
+            char('\\'),
+            alt((
+                Self::parse_escaped_hex,
+                value('\n', char('n')),
+                value('\r', char('r')),
+                value('\t', char('t')),
+                value('\x07', char('a')),
+                value('\u{08}', char('b')),
+                value('\u{0C}', char('f')),
+                value('\\', char('\\')),
+                value('/', char('/')),
+                value('"', char('"')),
+                value(' ', char(' ')),
+            )),
+        )(input)
+    }
+
+    /// Parse a non-empty block of text that doesn't include \ or "
+    fn parse_literal<E: ParseError<&'a str>>(input: &'a str) -> IResult<&'a str, &'a str, E> {
+        let not_quote_slash = is_not("\"\\");
+
+        verify(not_quote_slash, |s: &str| !s.is_empty())(input)
+    }
+
+    /// Combine parse_literal, parse_escaped_whitespace, and parse_escaped_char
+    /// into a StringFragment.
+    fn parse_fragment<E>(input: &'a str) -> IResult<&'a str, StringFragment<'a>, E>
+    where
+        E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+    {
+        alt((
+            // The `map` combinator runs a parser, then applies a function to the output
+            // of that parser.
+            map(Self::parse_literal, StringFragment::Literal),
+            map(Self::parse_escaped_char, StringFragment::EscapedChar),
+        ))(input)
+    }
+
+    /// Parse a string. Use a loop of parse_fragment and push all of the fragments
+    /// into an output string.
+    pub fn parse_escaped_string<E>(input: &'a str) -> IResult<&'a str, String, E>
+    where
+        E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+    {
+        // fold_many0 is the equivalent of iterator::fold. It runs a parser in a loop,
+        // and for each output value, calls a folding function on each output value.
+        let mut build_string = fold_many0(
+            // Our parser function– parses a single string fragment
+            Self::parse_fragment,
+            // Our init value, an empty string
+            String::new,
+            // Our folding function. For each fragment, append the fragment to the
+            // string.
+            |mut string, fragment| {
+                match fragment {
+                    StringFragment::Literal(s) => string.push_str(s),
+                    StringFragment::EscapedChar(c) => string.push(c),
+                }
+                string
+            },
+        );
+
         let (input, _) = tag("\"")(input)?;
-        let (input, arg) = escaped(none_of(r#"\""#), '\\', one_of(r#"\"rxabn"#))(input)?;
+        let (input, string) = build_string(input)?;
         let (input, _) = tag("\"")(input)?;
-        let (input, _) = space0(input)?;
-        Ok((input, arg))
+
+        Ok((input, string))
+    }
+
+    fn parse_from_str<T: std::str::FromStr>(input: &str) -> IResult<&str, T> {
+        map_res(recognize(many1(digit1)), |s: &str| s.parse::<T>())(input)
     }
 
     // aaa.bbb.ccc.ddd (127.0.0.1)
@@ -117,7 +207,7 @@ impl<'a> MonitorLine<'a> {
         let (input, _) = tag("\"")(input)?;
         let (input, cmd) = recognize(many1(alpha1))(input)?;
         let (input, _) = tag("\"")(input)?;
-        let (input, args) = many0(Self::parse_escaped_arg)(input)?;
+        let (input, args) = many0(Self::parse_escaped_string)(input)?;
 
         Ok((input, Self::new(timestamp, db, addr, cmd, args)))
     }
@@ -127,7 +217,7 @@ impl<'a> MonitorLine<'a> {
         db: u64,
         addr: ClientAddr<'a>,
         cmd: &'a str,
-        args: Vec<&'a str>,
+        args: Vec<String>,
     ) -> Self {
         Self {
             timestamp,
