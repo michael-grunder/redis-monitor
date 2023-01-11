@@ -1,4 +1,5 @@
 use crate::{
+    commands::Command,
     config::{ConfigFile, RedisAuth},
     filter::Filter,
     monitor::{MonitorLine, MonitoredInstance},
@@ -19,6 +20,7 @@ use std::{
     str::FromStr,
 };
 
+mod commands;
 mod config;
 mod connection;
 mod filter;
@@ -101,6 +103,8 @@ async fn get_monitor<T: AsRef<str>>(
             panic!("Failed to authenticate connection!");
         }
     }
+
+    let hset = Command::load(&mut con).await;
 
     let mut mon = con.into_monitor();
     mon.monitor().await?;
