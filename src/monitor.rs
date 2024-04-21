@@ -1,7 +1,7 @@
 use crate::{
-    config::{ConfigEntry, RedisAuth},
+    config::{Entry, RedisAuth},
     connection::{Cluster, GetHost, GetPort, RedisAddr},
-    CommandStats,
+    stats::Map as CommandStats,
 };
 use colored::Color;
 use std::net::{IpAddr, Ipv4Addr};
@@ -293,7 +293,7 @@ impl Instance {
         }
     }
 
-    pub fn from_config_entry(name: &str, entry: &ConfigEntry) -> Vec<Self> {
+    pub fn from_config_entry(name: &str, entry: &Entry) -> Vec<Self> {
         if entry.cluster {
             let c = Cluster::from_seeds(&entry.get_addresses()).expect("Can't get cluster nodes");
             c.get_primary_nodes()

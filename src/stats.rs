@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
-pub struct CommandStat {
+pub struct Stat {
     count: usize,
     bytes: usize,
 }
 
-impl CommandStat {
+impl Stat {
     pub const fn new() -> Self {
         Self { count: 0, bytes: 0 }
     }
@@ -18,9 +18,9 @@ impl CommandStat {
 }
 
 #[derive(Debug, Clone)]
-pub struct CommandStats(HashMap<String, CommandStat>);
+pub struct Map(HashMap<String, Stat>);
 
-impl CommandStats {
+impl Map {
     pub fn new() -> Self {
         Self(HashMap::new())
     }
@@ -28,7 +28,7 @@ impl CommandStats {
     pub fn incr(&mut self, cmd: &str, bytes: usize) {
         self.0
             .entry(cmd.to_string())
-            .or_insert_with(CommandStat::new)
+            .or_insert_with(Stat::new)
             .incr(bytes);
     }
 }

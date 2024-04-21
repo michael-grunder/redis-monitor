@@ -15,7 +15,7 @@ const DEFAULT_CFGFILE_NAMES: &[&str] = &[".redis-monitor", "redis-monitor"];
 const DEFAULT_CFGFILE_EXT: &[&str] = &["", "toml"];
 
 #[derive(Debug)]
-pub struct ConfigFile(HashMap<String, ConfigEntry>);
+pub struct Map(HashMap<String, Entry>);
 
 #[derive(Debug)]
 pub struct DisplayColor(Color);
@@ -26,9 +26,9 @@ pub enum RedisAuth {
     Pass(String),
 }
 
-impl<'a> IntoIterator for &'a ConfigFile {
-    type Item = <&'a HashMap<String, ConfigEntry> as IntoIterator>::Item;
-    type IntoIter = <&'a HashMap<String, ConfigEntry> as IntoIterator>::IntoIter;
+impl<'a> IntoIterator for &'a Map {
+    type Item = <&'a HashMap<String, Entry> as IntoIterator>::Item;
+    type IntoIter = <&'a HashMap<String, Entry> as IntoIterator>::IntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.iter()
@@ -36,7 +36,7 @@ impl<'a> IntoIterator for &'a ConfigFile {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ConfigEntry {
+pub struct Entry {
     addresses: Option<Vec<RedisAddr>>,
     path: Option<String>,
     host: Option<String>,
@@ -101,7 +101,7 @@ impl RedisAuth {
     }
 }
 
-impl ConfigFile {
+impl Map {
     fn find() -> Option<PathBuf> {
         let search_paths: Vec<PathBuf> = vec![
             env::current_dir().unwrap(),
@@ -130,7 +130,7 @@ impl ConfigFile {
         None
     }
 
-    fn from_toml_file<P: AsRef<str>>(path: P) -> Result<HashMap<String, ConfigEntry>> {
+    fn from_toml_file<P: AsRef<str>>(path: P) -> Result<HashMap<String, Entry>> {
         let s = Config::builder()
             .add_source(File::new(path.as_ref(), FileFormat::Toml))
             .build()
@@ -141,7 +141,7 @@ impl ConfigFile {
         Ok(s)
     }
 
-    fn from_default_toml_file() -> Option<HashMap<String, ConfigEntry>> {
+    fn from_default_toml_file() -> Option<HashMap<String, Entry>> {
         Self::find().map(|filename| {
             let str = filename.to_str().expect("TODO:  Can't unwrap filename");
             Self::from_toml_file(str).expect("Failed to load config file")
@@ -156,12 +156,12 @@ impl ConfigFile {
         Self(cfg.unwrap_or_default())
     }
 
-    pub fn get<'a>(&'a self, name: &str) -> Option<&'a ConfigEntry> {
+    pub fn get<'a>(&'a self, name: &str) -> Option<&'a Entry> {
         self.0.get(name)
     }
 }
 // self.color.as_ref().map(|c| c.0)
-impl ConfigEntry {
+impl Entry {
     pub fn get_color(&self) -> Option<Color> {
         self.color.as_ref().map(|c| c.0)
     }

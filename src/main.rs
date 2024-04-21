@@ -2,10 +2,9 @@
 //#![allow(clippy::non_ascii_literal)]
 //#![allow(clippy::must_use_candidate)]
 use crate::{
-    config::{ConfigFile, RedisAuth},
+    config::{Map, RedisAuth},
     filter::Filter,
     monitor::{Instance, Line},
-    stats::CommandStats,
 };
 use tokio::{io::AsyncBufReadExt, io::BufReader, task};
 
@@ -133,7 +132,7 @@ async fn get_monitor_pairs(
 // Take the array of instances provided on the command line and attempt to map them to one ore more
 // instances.  These can either be named instances like `mycluster` which were loaded from our
 // config file, or be in some parsable form like "host:port", or "redis://...".
-fn process_instances(cfg: &ConfigFile, instances: &[String]) -> Vec<Instance> {
+fn process_instances(cfg: &Map, instances: &[String]) -> Vec<Instance> {
     instances
         .iter()
         .flat_map(|instance| {
@@ -168,7 +167,7 @@ fn process_instances(cfg: &ConfigFile, instances: &[String]) -> Vec<Instance> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let opt: Options = Options::parse();
-    let cfg = ConfigFile::load(opt.config_file);
+    let cfg = Map::load(opt.config_file);
 
     let filter_db = opt.db.unwrap_or(u64::MAX);
 
