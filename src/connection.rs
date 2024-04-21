@@ -160,7 +160,7 @@ impl ClusterNode {
         }
     }
 
-    pub fn add_replica(&mut self, node: ClusterNode) {
+    pub fn add_replica(&mut self, node: Self) {
         if !self.replicas.contains(&node) {
             self.replicas.insert(node);
         }

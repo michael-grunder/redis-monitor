@@ -14,7 +14,7 @@ pub struct Command {
 }
 
 impl Command {
-    fn from_redis_values(values: &[redis::Value]) -> Option<Command> {
+    fn from_redis_values(values: &[redis::Value]) -> Option<Self> {
         let name = match &values[0] {
             redis::Value::Data(bytes) => String::from_utf8(bytes.clone()).ok()?,
             _ => return None,
@@ -64,7 +64,7 @@ impl Command {
             }
         };
 
-        Some(Command {
+        Some(Self {
             name,
             arity,
             flags,
@@ -75,7 +75,7 @@ impl Command {
         })
     }
 
-    pub async fn load(con: &mut Connection) -> Result<HashSet<Command>> {
+    pub async fn load(con: &mut Connection) -> Result<HashSet<Self>> {
         let commands: Vec<Vec<redis::Value>> = redis::cmd("COMMAND")
             .query_async(con)
             .await
@@ -89,12 +89,12 @@ impl Command {
 
         let mut command_set = HashSet::new();
 
-        for command_values in commands.iter() {
-            if let Some(command) = Command::from_redis_values(command_values) {
-                println!("Parsed Command: {:?}", command);
+        for command_values in &commands {
+            if let Some(command) = Self::from_redis_values(command_values) {
+                println!("Parsed Command: {command:?}");
                 command_set.insert(command);
             } else {
-                println!("Failed to parse command: {:?}", command_values);
+                println!("Failed to parse command: {command_values:?}");
             }
         }
 

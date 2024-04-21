@@ -1,6 +1,6 @@
 use crate::{
     config::{ConfigEntry, RedisAuth},
-    connection::*,
+    connection::{Cluster, GetHost, GetPort, RedisAddr},
     CommandStats,
 };
 use colored::Color;
@@ -51,7 +51,7 @@ impl<'a> MonitorLine<'a> {
         let parse_hex = take_while_m_n(2, 2, |c: char| c.is_ascii_hexdigit());
         let parse_u8 = map_res(parse_hex, move |hex| u8::from_str_radix(hex, 16));
 
-        map_opt(parse_u8, |value| std::char::from_u32(value as u32))(input)
+        map_opt(parse_u8, |value| std::char::from_u32(u32::from(value)))(input)
     }
 
     fn parse_escaped_char<E>(input: &'a str) -> IResult<&'a str, char, E>
@@ -83,8 +83,8 @@ impl<'a> MonitorLine<'a> {
         verify(not_quote_slash, |s: &str| !s.is_empty())(input)
     }
 
-    /// Combine parse_literal, parse_escaped_whitespace, and parse_escaped_char
-    /// into a StringFragment.
+    /// Combine `parse_literal`, `parse_escaped_whitespace`, and `parse_escaped_char`
+    /// into a `StringFragment`.
     fn parse_fragment<E>(input: &'a str) -> IResult<&'a str, StringFragment<'a>, E>
     where
         E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
@@ -97,7 +97,7 @@ impl<'a> MonitorLine<'a> {
         ))(input)
     }
 
-    /// Parse a string. Use a loop of parse_fragment and push all of the fragments
+    /// Parse a string. Use a loop of `parse_fragment` and push all of the fragments
     /// into an output string.
     pub fn parse_escaped_string<E>(input: &'a str) -> IResult<&'a str, String, E>
     where
@@ -301,7 +301,7 @@ impl MonitoredInstance {
                 .map(|primary| {
                     Self::new(
                         Some(name.to_owned()),
-                        primary.addr.to_owned(),
+                        primary.addr.clone(),
                         entry.get_auth(),
                         entry.get_color(),
                         entry.format.clone(),

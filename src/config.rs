@@ -116,7 +116,7 @@ impl ConfigFile {
             for file in DEFAULT_CFGFILE_NAMES {
                 for ext in DEFAULT_CFGFILE_EXT {
                     let filename = if ext.is_empty() {
-                        file.to_string()
+                        (*file).to_string()
                     } else {
                         format!("{file}.{ext}")
                     };

@@ -101,9 +101,7 @@ async fn get_monitor<T: AsRef<str>>(
     let mut con = cli.get_async_connection().await?;
 
     if let Some(auth) = auth {
-        if !auth.auth(&mut con).await {
-            panic!("Failed to authenticate connection!");
-        }
+        assert!((auth.auth(&mut con).await), "Failed to authenticate connection!");
     }
 
     let mut mon = con.into_monitor();
