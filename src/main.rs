@@ -1,5 +1,7 @@
+#![warn(clippy::all, clippy::nursery, clippy::pedantic)]
+//#![allow(clippy::non_ascii_literal)]
+//#![allow(clippy::must_use_candidate)]
 use crate::{
-    commands::Command,
     config::{ConfigFile, RedisAuth},
     filter::Filter,
     monitor::{MonitorLine, MonitoredInstance},
@@ -11,7 +13,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use colored::Colorize;
 use connection::RedisAddr;
-use futures::stream::*;
+use futures::stream::StreamExt;
 use serde::{de, Deserialize, Deserializer};
 use std::{
     collections::HashSet,
@@ -63,10 +65,10 @@ impl FromStr for CsvArgument {
         let mut set: HashSet<String> = s
             .split(',')
             .filter_map(|s| {
-                if !s.is_empty() {
-                    Some(s.trim().to_owned())
-                } else {
+                if s.is_empty() {
                     None
+                } else {
+                    Some(s.trim().to_owned())
                 }
             })
             .collect();
@@ -77,7 +79,7 @@ impl FromStr for CsvArgument {
 
 impl CsvArgument {
     pub fn to_vec(&self) -> Vec<String> {
-        self.0.to_owned()
+        self.0.clone()
     }
 }
 
@@ -103,8 +105,6 @@ async fn get_monitor<T: AsRef<str>>(
             panic!("Failed to authenticate connection!");
         }
     }
-
-    let hset = Command::load(&mut con).await;
 
     let mut mon = con.into_monitor();
     mon.monitor().await?;
@@ -136,13 +136,29 @@ fn process_instances(cfg: &ConfigFile, instances: &[String]) -> Vec<MonitoredIns
     instances
         .iter()
         .flat_map(|instance| {
-            if let Some(entry) = cfg.get(instance) {
-                MonitoredInstance::from_config_entry(instance, entry)
-            } else if let Ok(addr) = RedisAddr::from_str(instance) {
-                vec![addr.into()]
-            } else {
-                panic!("Unable to interpret '{instance}' as a redis address or named instance");
-            }
+            cfg.get(instance).map_or_else(
+                || {
+                    if let Ok(addr) = RedisAddr::from_str(instance) {
+                        vec![addr.into()]
+                    } else {
+                        panic!(
+                            "Unable to interpret '{instance}' as a redis address or named instance"
+                        );
+                    }
+                },
+                |entry| MonitoredInstance::from_config_entry(instance, entry),
+            )
+
+            //
+            //
+            //
+            //            if let Some(entry) = cfg.get(instance) {
+            //                MonitoredInstance::from_config_entry(instance, entry)
+            //            } else if let Ok(addr) = RedisAddr::from_str(instance) {
+            //                vec![addr.into()]
+            //            } else {
+            //                panic!("Unable to interpret '{instance}' as a redis address or named instance");
+            //            }
         })
         .collect()
 }
@@ -200,7 +216,9 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        if !opt.no_color {
+        if opt.no_color {
+            println!("{} {msg}", instance.fmt_str());
+        } else {
             let msg = if let Some(color) = instance.get_color() {
                 msg.color(color).to_string()
             } else {
@@ -209,8 +227,6 @@ async fn main() -> Result<()> {
 
             let hdr = instance.fmt_str().bold();
             println!("{hdr} {msg}");
-        } else {
-            println!("{} {msg}", instance.fmt_str());
         }
     }
 
