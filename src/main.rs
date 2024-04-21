@@ -149,17 +149,6 @@ fn process_instances(cfg: &Map, instances: &[String]) -> Vec<Instance> {
                 },
                 |entry| Instance::from_config_entry(instance, entry),
             )
-
-            //
-            //
-            //
-            //            if let Some(entry) = cfg.get(instance) {
-            //                MonitoredInstance::from_config_entry(instance, entry)
-            //            } else if let Ok(addr) = RedisAddr::from_str(instance) {
-            //                vec![addr.into()]
-            //            } else {
-            //                panic!("Unable to interpret '{instance}' as a redis address or named instance");
-            //            }
         })
         .collect()
 }
