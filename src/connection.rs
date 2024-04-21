@@ -41,11 +41,7 @@ impl<'de> Deserialize<'de> for RedisAddr {
 
 impl PartialEq for RedisAddr {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Tcp(ahost, aport), Self::Tcp(bhost, bport)) => ahost == bhost && aport == bport,
-            (Self::Unix(apath), Self::Unix(bpath)) => apath == bpath,
-            _ => false,
-        }
+        self.to_string() == other.to_string()
     }
 }
 
@@ -95,7 +91,7 @@ impl GetPort for RedisAddr {
     fn get_port(&self) -> Option<u16> {
         match self {
             Self::Tcp(_, port) => Some(*port),
-            _ => None,
+            Self::Unix(_) => None,
         }
     }
 }
