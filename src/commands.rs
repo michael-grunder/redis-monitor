@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use redis::{aio::Connection, Value};
+use redis::{RedisError, aio::Connection, Value};
 use serde::Deserialize;
 use std::{
     collections::HashSet,
@@ -13,79 +13,105 @@ pub struct KeyInfo {
     step: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Hash, Eq, PartialEq)]
 pub struct Command {
     name: String,
-    arity: u64,
-    keys: KeyInfo,
-}
-
-impl PartialEq for Command {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-    }
-}
-
-impl Hash for Command {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.name.hash(state);
-    }
+    arity: i64,
+    flags: Vec<String>,
+    first_key: i64,
+    last_key: i64,
+    step_count: i64,
+    categories: Vec<String>,
 }
 
 impl Command {
-    //fn get_name_and_arity(values: &Vec<Vec<redis::Value>>) -> (String, u64) {
-    //    let cmd = match &values[0] {
-    //        redis::Value::Data(bytes) => std::str::from_utf8(bytes).unwrap().to_string(),
-    //        _ => panic!("Command is not a string"),
-    //    };
+    fn from_redis_values(values: &Vec<redis::Value>) -> Option<Command> {
+        let name = match &values[0] {
+            redis::Value::Data(bytes) => String::from_utf8(bytes.clone()).ok()?,
+            _ => return None,
+        };
 
-    //    let arity = match &values[1] {
-    //        redis::Value::Int(n) => *n as u64,
-    //        _ => panic!("Arity is not a number?"),
-    //    };
+        let arity = match &values[1] {
+            redis::Value::Int(arity) => *arity,
+            _ => return None,
+        };
 
-    //    (cmd, arity)
-    //}
+        let flags = match &values[2] {
+            redis::Value::Bulk(values) => values
+                .iter()
+                .filter_map(|v| match v {
+                    redis::Value::Data(bytes) => String::from_utf8(bytes.clone()).ok(),
+                    _ => None,
+                })
+                .collect(),
+            _ => return None,
+        };
 
-    //pub fn from_value(v: Vec<Vec<redis::Value>>) -> Self {
-    //    let (name, arity) = Self::get_name_and_arity(&v);
+        let first_key = match &values[3] {
+            redis::Value::Int(num) => *num,
+            _ => return None,
+        };
 
-    //    Self {
-    //        name,
-    //        arity,
-    //        keys: KeyInfo {
-    //            first: 0,
-    //            last: 0,
-    //            step: 0,
-    //        },
-    //    }
-    //}
-    pub async fn load(con: &mut Connection) -> Result<HashSet<Command>> {
+        let last_key = match &values[4] {
+            redis::Value::Int(num) => *num,
+            _ => return None,
+        };
+
+        let step_count = match &values[5] {
+            redis::Value::Int(num) => *num,
+            _ => return None,
+        };
+
+        let categories = match &values[6] {
+            redis::Value::Bulk(values) => values.iter().filter_map(|v| {
+                match v {
+                    redis::Value::Status(status_string) => {
+                        Some(status_string.clone())
+                    },
+                    _ => {
+                        None
+                    }
+                }
+            }).collect(),
+            _ => {
+                return None;
+            }
+        };
+
+        Some(Command {
+            name,
+            arity,
+            flags,
+            first_key,
+            last_key,
+            step_count,
+            categories,
+        })
+    }
+
+    pub async fn load(con: &mut Connection) -> Result<HashSet<Command>, redis::RedisError> {
         let commands: Vec<Vec<redis::Value>> = redis::cmd("COMMAND")
             .query_async(con)
             .await
-            .context("Failed to execute COMMAND command")?;
+            .map_err(|err| {
+                RedisError::from((
+                    redis::ErrorKind::IoError,
+                    "Failed to execute COMMAND command",
+                    err.to_string(),
+                ))
+            })?;
 
-        for command in commands.iter() {
-            if let redis::Value::Data(s) = &command[0] {
-                println!("Command name: {s:?}");
+        let mut command_set = HashSet::new();
+
+        for command_values in commands.iter() {
+            if let Some(command) = Command::from_redis_values(command_values) {
+                println!("Parsed Command: {:?}", command);
+                command_set.insert(command);
+            } else {
+                println!("Failed to parse command: {:?}", command_values);
             }
-            println!("{command:#?}");
         }
 
-        Ok(HashSet::new())
+        Ok(command_set)
     }
 }
-
-//[
-//    string-data('"decrby"'),
-//    int(3),
-//    bulk(status("write"), status("denyoom"), status("fast")),
-//    int(1),
-//    int(1),
-//    int(1),
-//    bulk(status("@write"), status("@string"), status("@fast")),
-//    bulk(),
-//    bulk(bulk(string-data('"flags"'), bulk(status("RW"), status("access"), status("update")), string-data('"begin_search"'), bulk(string-data('"type"'), string-data('"index"'), string-data('"spec"'), bulk(string-data('"index"'), int(1))), string-data('"find_keys"'), bulk(string-data('"type"'), string-data('"range"'), string-data('"spec"'), bulk(string-data('"lastkey"'), int(0), string-data('"keystep"'), int(1), string-data('"limit"'), int(0))))),
-//    bulk(),
-//]
