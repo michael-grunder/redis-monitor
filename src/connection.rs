@@ -131,7 +131,9 @@ impl std::str::FromStr for RedisAddr {
         match addr.parse::<u16>() {
             Ok(port) => Ok(Self::from_tcp_addr("127.0.0.1", port)),
             _ => {
-                if !addr.contains('/') {
+                if addr.contains('/') {
+                    Ok(Self::from_path(addr))
+                } else {
                     let v: Vec<&str> = addr.split(':').collect();
                     if v.len() == 2 {
                         let port = v[1].parse::<u16>().unwrap();
@@ -139,8 +141,6 @@ impl std::str::FromStr for RedisAddr {
                     } else {
                         Err(anyhow!("Don't know how to parse address"))
                     }
-                } else {
-                    Ok(Self::from_path(addr))
                 }
             }
         }
