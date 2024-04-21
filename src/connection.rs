@@ -128,9 +128,8 @@ impl std::str::FromStr for RedisAddr {
     type Err = anyhow::Error;
 
     fn from_str(addr: &str) -> Result<Self, Self::Err> {
-        match addr.parse::<u16>() {
-            Ok(port) => Ok(Self::from_tcp_addr("127.0.0.1", port)),
-            _ => {
+        addr.parse::<u16>().map_or_else(
+            |_| {
                 if addr.contains('/') {
                     Ok(Self::from_path(addr))
                 } else {
@@ -142,8 +141,9 @@ impl std::str::FromStr for RedisAddr {
                         Err(anyhow!("Don't know how to parse address"))
                     }
                 }
-            }
-        }
+            },
+            |port| Ok(Self::from_tcp_addr("127.0.0.1", port)),
+        )
     }
 }
 
@@ -173,7 +173,7 @@ where
 }
 
 impl Cluster {
-    fn new(primaries: HashSet<ClusterNode>) -> Self {
+    const fn new(primaries: HashSet<ClusterNode>) -> Self {
         Self(primaries)
     }
 
@@ -181,7 +181,7 @@ impl Cluster {
         match (host, port, id) {
             (Value::Data(ref host), Value::Int(port), Value::Data(ref id)) => Some((
                 String::from_utf8_lossy(host).to_string(),
-                *port as u16,
+                u16::try_from(*port).expect("Failed to convert port to u16"),
                 String::from_utf8_lossy(id).to_string(),
             )),
             _ => None,

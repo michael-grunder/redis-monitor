@@ -142,27 +142,22 @@ impl ConfigFile {
     }
 
     fn from_default_toml_file() -> Option<HashMap<String, ConfigEntry>> {
-        Self::find().and_then(|filename| {
+        Self::find().map(|filename| {
             let str = filename.to_str().expect("TODO:  Can't unwrap filename");
-            Some(Self::from_toml_file(str).expect("Failed to load config file"))
+            Self::from_toml_file(str).expect("Failed to load config file")
         })
     }
 
     pub fn load(path: Option<impl AsRef<str>>) -> Self {
-        let cfg = if let Some(path) = path {
+        let cfg = path.map_or_else(Self::from_default_toml_file, |path| {
             Some(Self::from_toml_file(path).expect("Failed to load config file"))
-        } else {
-            Self::from_default_toml_file()
-        };
+        });
 
         Self(cfg.unwrap_or_default())
     }
 
     pub fn get<'a>(&'a self, name: &str) -> Option<&'a ConfigEntry> {
-        match self.0.get(name) {
-            Some(entry) => Some(entry),
-            _ => None,
-        }
+        self.0.get(name)
     }
 }
 // self.color.as_ref().map(|c| c.0)
