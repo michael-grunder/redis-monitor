@@ -23,7 +23,7 @@ use nom::{
 };
 
 #[derive(Debug)]
-pub struct MonitorLine<'a> {
+pub struct Line<'a> {
     pub timestamp: f64,
     pub db: u64,
     pub addr: ClientAddr<'a>,
@@ -43,7 +43,7 @@ enum StringFragment<'a> {
     EscapedChar(char),
 }
 
-impl<'a> MonitorLine<'a> {
+impl<'a> Line<'a> {
     fn parse_escaped_hex<E>(input: &'a str) -> IResult<&'a str, char, E>
     where
         E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
@@ -198,7 +198,7 @@ impl<'a> MonitorLine<'a> {
         Ok((input, (db, addr)))
     }
 
-    pub fn from_line(input: &'a str) -> IResult<&str, MonitorLine> {
+    pub fn from_line(input: &'a str) -> IResult<&str, Line> {
         let (input, timestamp) = double(input)?;
         let (input, _) = space0(input)?;
         let (input, (db, addr)) = Self::parse_source(input)?;
@@ -230,17 +230,17 @@ impl<'a> MonitorLine<'a> {
 }
 
 impl<'a> ClientAddr<'a> {
-    pub fn from_path(path: &'a str) -> Self {
+    pub const fn from_path(path: &'a str) -> Self {
         Self::Path(path)
     }
 
-    pub fn from_addr(addr: IpAddr, port: u16) -> Self {
+    pub const fn from_addr(addr: IpAddr, port: u16) -> Self {
         Self::Tcp((addr, port))
     }
 }
 
 #[derive(Clone)]
-pub struct MonitoredInstance {
+pub struct Instance {
     // The name this instance belongs to (if it's from our config.toml)
     name: Option<String>,
 
@@ -257,7 +257,7 @@ pub struct MonitoredInstance {
     stats: CommandStats,
 }
 
-impl MonitoredInstance {
+impl Instance {
     fn make_fmt_string(name: &Option<String>, addr: &RedisAddr, fmt: &str) -> String {
         let fmt = fmt.to_owned();
         let mut fmt = fmt.replace("{host}", &addr.get_host());
@@ -329,7 +329,7 @@ impl MonitoredInstance {
         &self.fmt
     }
 
-    pub fn get_color(&self) -> Option<Color> {
+    pub const fn get_color(&self) -> Option<Color> {
         self.color
     }
 
@@ -341,16 +341,16 @@ impl MonitoredInstance {
         self.stats.incr(cmd, bytes);
     }
 
-    pub fn get_auth(&self) -> &Option<RedisAuth> {
+    pub const fn get_auth(&self) -> &Option<RedisAuth> {
         &self.auth
     }
 }
 
-impl From<RedisAddr> for MonitoredInstance {
+impl From<RedisAddr> for Instance {
     fn from(addr: RedisAddr) -> Self {
         let fmt = match addr {
             RedisAddr::Tcp(_, _) => "{host}:{port}",
-            _ => "{host}",
+            RedisAddr::Unix(_) => "{host}",
         };
 
         Self::new(None, addr, None, None, Some(fmt.to_owned()))

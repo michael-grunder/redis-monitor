@@ -4,7 +4,7 @@
 use crate::{
     config::{ConfigFile, RedisAuth},
     filter::Filter,
-    monitor::{MonitorLine, MonitoredInstance},
+    monitor::{Instance, Line},
     stats::CommandStats,
 };
 use tokio::{io::AsyncBufReadExt, io::BufReader, task};
@@ -93,28 +93,28 @@ impl<'de> Deserialize<'de> for CsvArgument {
     }
 }
 
-async fn get_monitor<T: AsRef<str>>(
-    url: T,
-    auth: &Option<RedisAuth>,
-) -> Result<redis::aio::Monitor> {
+async fn get_monitor<T>(url: T, auth: &Option<RedisAuth>) -> Result<redis::aio::Monitor>
+where
+    T: AsRef<str> + Send,
+{
     let cli = redis::Client::open(url.as_ref()).context("Failed to open connection to")?;
-    let mut con = cli.get_async_connection().await?;
+    let mut connection = cli.get_async_connection().await?;
 
     if let Some(auth) = auth {
         assert!(
-            (auth.auth(&mut con).await),
+            (auth.auth(&mut connection).await),
             "Failed to authenticate connection!"
         );
     }
 
-    let mut mon = con.into_monitor();
+    let mut mon = connection.into_monitor();
     mon.monitor().await?;
     Ok(mon)
 }
 
 async fn get_monitor_pairs(
-    instances: Vec<MonitoredInstance>,
-) -> Result<Vec<(MonitoredInstance, redis::aio::Monitor)>> {
+    instances: Vec<Instance>,
+) -> Result<Vec<(Instance, redis::aio::Monitor)>> {
     let mut res = vec![];
 
     for instance in instances {
@@ -133,7 +133,7 @@ async fn get_monitor_pairs(
 // Take the array of instances provided on the command line and attempt to map them to one ore more
 // instances.  These can either be named instances like `mycluster` which were loaded from our
 // config file, or be in some parsable form like "host:port", or "redis://...".
-fn process_instances(cfg: &ConfigFile, instances: &[String]) -> Vec<MonitoredInstance> {
+fn process_instances(cfg: &ConfigFile, instances: &[String]) -> Vec<Instance> {
     instances
         .iter()
         .flat_map(|instance| {
@@ -148,7 +148,7 @@ fn process_instances(cfg: &ConfigFile, instances: &[String]) -> Vec<MonitoredIns
                         |addr| vec![addr.into()],
                     )
                 },
-                |entry| MonitoredInstance::from_config_entry(instance, entry),
+                |entry| Instance::from_config_entry(instance, entry),
             )
 
             //
@@ -206,7 +206,7 @@ async fn main() -> Result<()> {
     });
 
     while let Some((mut instance, msg)) = streams.next().await {
-        let (_, line) = MonitorLine::from_line(&msg).expect("Failed to parse line");
+        let (_, line) = Line::from_line(&msg).expect("Failed to parse line");
 
         instance.incr_stats(line.cmd, msg.len());
 

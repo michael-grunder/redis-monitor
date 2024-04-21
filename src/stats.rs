@@ -7,7 +7,7 @@ pub struct CommandStat {
 }
 
 impl CommandStat {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { count: 0, bytes: 0 }
     }
 

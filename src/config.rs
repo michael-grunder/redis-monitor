@@ -57,11 +57,7 @@ impl FromStr for DisplayColor {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Ok(color) = Color::from_str(s) {
-            Ok(Self(color))
-        } else {
-            Ok(Self(Color::Black))
-        }
+        Color::from_str(s).map_or_else(|()| Ok(Self(Color::Black)), |color| Ok(Self(color)))
     }
 }
 
@@ -146,7 +142,7 @@ impl ConfigFile {
     }
 
     fn from_default_toml_file() -> Option<HashMap<String, ConfigEntry>> {
-        Self::find().map_or(None, |filename| {
+        Self::find().and_then(|filename| {
             let str = filename.to_str().expect("TODO:  Can't unwrap filename");
             Some(Self::from_toml_file(str).expect("Failed to load config file"))
         })
