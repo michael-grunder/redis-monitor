@@ -101,7 +101,10 @@ async fn get_monitor<T: AsRef<str>>(
     let mut con = cli.get_async_connection().await?;
 
     if let Some(auth) = auth {
-        assert!((auth.auth(&mut con).await), "Failed to authenticate connection!");
+        assert!(
+            (auth.auth(&mut con).await),
+            "Failed to authenticate connection!"
+        );
     }
 
     let mut mon = con.into_monitor();
@@ -136,13 +139,14 @@ fn process_instances(cfg: &ConfigFile, instances: &[String]) -> Vec<MonitoredIns
         .flat_map(|instance| {
             cfg.get(instance).map_or_else(
                 || {
-                    if let Ok(addr) = RedisAddr::from_str(instance) {
-                        vec![addr.into()]
-                    } else {
-                        panic!(
+                    RedisAddr::from_str(instance).map_or_else(
+                        |_| {
+                            panic!(
                             "Unable to interpret '{instance}' as a redis address or named instance"
                         );
-                    }
+                        },
+                        |addr| vec![addr.into()],
+                    )
                 },
                 |entry| MonitoredInstance::from_config_entry(instance, entry),
             )
