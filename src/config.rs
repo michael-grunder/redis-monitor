@@ -146,12 +146,10 @@ impl ConfigFile {
     }
 
     fn from_default_toml_file() -> Option<HashMap<String, ConfigEntry>> {
-        if let Some(filename) = Self::find() {
+        Self::find().map_or(None, |filename| {
             let str = filename.to_str().expect("TODO:  Can't unwrap filename");
             Some(Self::from_toml_file(str).expect("Failed to load config file"))
-        } else {
-            None
-        }
+        })
     }
 
     pub fn load(path: Option<impl AsRef<str>>) -> Self {
