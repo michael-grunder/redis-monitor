@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
     let opt: Options = Options::parse();
     let cfg = Map::load(opt.config_file);
 
-    let filter_db = opt.db.unwrap_or(u64::MAX);
+    //let filter_db = opt.db.unwrap_or(u64::MAX);
 
     if opt.instances.is_empty() {
         eprintln!("Must pass at least one redis instance (either host/port or named instance)");
@@ -198,11 +198,7 @@ async fn main() -> Result<()> {
 
         instance.incr_stats(line.cmd, msg.len());
 
-        if filter_db != u64::MAX && filter_db != line.db {
-            continue;
-        }
-
-        if filter.filter(line.cmd) {
+        if opt.db.is_some() && opt.db.unwrap() != line.db || filter.filter(line.cmd) {
             continue;
         }
 
