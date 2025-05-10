@@ -133,9 +133,10 @@ async fn get_monitor_pairs(
     Ok(res)
 }
 
-// Take the array of instances provided on the command line and attempt to map them to one ore more
-// instances.  These can either be named instances like `mycluster` which were loaded from our
-// config file, or be in some parsable form like "host:port", or "redis://...".
+// Take the array of instances provided on the command line and attempt to map
+// them to one ore more instances. These can either be named instances like
+// mycluster` which were loaded from our config file, or be in some parsable
+// form like "host:port", or "redis://...".
 fn process_instances(cfg: &Map, instances: &[String]) -> Vec<Instance> {
     instances
         .iter()
@@ -162,12 +163,8 @@ async fn main() -> Result<()> {
     let opt: Options = Options::parse();
     let cfg = Map::load(opt.config_file);
 
-    //let filter_db = opt.db.unwrap_or(u64::MAX);
-
     if opt.instances.is_empty() {
-        eprintln!(
-            "Must pass at least one redis instance (either host/port or named instance)"
-        );
+        eprintln!("Must pass at least one unstance (host/port or name)");
         std::process::exit(1);
     }
 

@@ -244,8 +244,7 @@ impl Cluster {
 
                 if !primaries.contains(&primary) {
                     for replica in &entries[1..] {
-                        let replica: ClusterNode = replica.into();
-                        primary.add_replica(replica);
+                        primary.add_replica(replica.into());
                     }
                     primaries.insert(primary);
                 }
