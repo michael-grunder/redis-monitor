@@ -2,13 +2,13 @@ use crate::connection::RedisAddr;
 use anyhow::{Context, Result};
 use colored::Color;
 use config::{Config, File, FileFormat};
-use redis::cmd;
 use redis::Cmd;
+use redis::cmd;
 
-use serde::{de, Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, de};
 use std::{
-    collections::HashMap, convert::AsRef, env, iter::IntoIterator, option::Option, path::PathBuf,
-    str::FromStr,
+    collections::HashMap, convert::AsRef, env, iter::IntoIterator,
+    option::Option, path::PathBuf, str::FromStr,
 };
 
 const DEFAULT_CFGFILE_NAMES: &[&str] = &[".redis-monitor", "redis-monitor"];
@@ -57,7 +57,8 @@ impl FromStr for DisplayColor {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Color::from_str(s).map_or_else(|()| Ok(Self(Color::Black)), |color| Ok(Self(color)))
+        Color::from_str(s)
+            .map_or_else(|()| Ok(Self(Color::Black)), |color| Ok(Self(color)))
     }
 }
 
@@ -130,7 +131,9 @@ impl Map {
         None
     }
 
-    fn from_toml_file<P: AsRef<str>>(path: P) -> Result<HashMap<String, Entry>> {
+    fn from_toml_file<P: AsRef<str>>(
+        path: P,
+    ) -> Result<HashMap<String, Entry>> {
         let s = Config::builder()
             .add_source(File::new(path.as_ref(), FileFormat::Toml))
             .build()
@@ -150,7 +153,9 @@ impl Map {
 
     pub fn load(path: Option<impl AsRef<str>>) -> Self {
         let cfg = path.map_or_else(Self::from_default_toml_file, |path| {
-            Some(Self::from_toml_file(path).expect("Failed to load config file"))
+            Some(
+                Self::from_toml_file(path).expect("Failed to load config file"),
+            )
         });
 
         Self(cfg.unwrap_or_default())
@@ -175,7 +180,9 @@ impl Entry {
 
     pub fn get_auth(&self) -> Option<RedisAuth> {
         match (&self.user, &self.pass) {
-            (Some(user), Some(pass)) => Some(RedisAuth::from_user_pass(user, pass)),
+            (Some(user), Some(pass)) => {
+                Some(RedisAuth::from_user_pass(user, pass))
+            }
             (None, Some(pass)) => Some(RedisAuth::from_pass(pass)),
             _ => None,
         }

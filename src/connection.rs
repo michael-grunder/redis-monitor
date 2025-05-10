@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use redis::{Client, Connection, Value};
-use serde::{de, Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, de};
 use std::convert::AsRef;
 use std::hash::{Hash, Hasher};
 use std::{collections::HashSet, str::FromStr};
@@ -114,8 +114,8 @@ impl RedisAddr {
 
     fn get_connection(&self) -> Result<Connection> {
         let uri = self.get_url_string();
-        let cli =
-            Client::open(&*uri).with_context(|| format!("Failed to open connection to {uri}"))?;
+        let cli = Client::open(&*uri)
+            .with_context(|| format!("Failed to open connection to {uri}"))?;
         let con = cli
             .get_connection()
             .context("Failed to get connection from client")?;
@@ -177,9 +177,13 @@ impl Cluster {
         Self(primaries)
     }
 
-    fn parse_slot_bulk(host: &Value, port: &Value, id: &Value) -> Option<(String, u16, String)> {
+    fn parse_slot_bulk(
+        host: &Value,
+        port: &Value,
+        id: &Value,
+    ) -> Option<(String, u16, String)> {
         match (host, port, id) {
-            (Value::Data(ref host), Value::Int(port), Value::Data(ref id)) => Some((
+            (Value::Data(host), Value::Int(port), Value::Data(id)) => Some((
                 String::from_utf8_lossy(host).to_string(),
                 u16::try_from(*port).expect("Failed to convert port to u16"),
                 String::from_utf8_lossy(id).to_string(),

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use redis::{aio::Connection, RedisError};
+use redis::{RedisError, aio::Connection};
 use std::{collections::HashSet, hash::Hash};
 
 #[derive(Debug, Hash, Eq, PartialEq)]
@@ -16,7 +16,9 @@ pub struct Command {
 impl Command {
     fn from_redis_values(values: &[redis::Value]) -> Option<Self> {
         let name = match &values[0] {
-            redis::Value::Data(bytes) => String::from_utf8(bytes.clone()).ok()?,
+            redis::Value::Data(bytes) => {
+                String::from_utf8(bytes.clone()).ok()?
+            }
             _ => return None,
         };
 
@@ -29,7 +31,9 @@ impl Command {
             redis::Value::Bulk(values) => values
                 .iter()
                 .filter_map(|v| match v {
-                    redis::Value::Data(bytes) => String::from_utf8(bytes.clone()).ok(),
+                    redis::Value::Data(bytes) => {
+                        String::from_utf8(bytes.clone()).ok()
+                    }
                     _ => None,
                 })
                 .collect(),
@@ -55,7 +59,9 @@ impl Command {
             redis::Value::Bulk(values) => values
                 .iter()
                 .filter_map(|v| match v {
-                    redis::Value::Status(status_string) => Some(status_string.clone()),
+                    redis::Value::Status(status_string) => {
+                        Some(status_string.clone())
+                    }
                     _ => None,
                 })
                 .collect(),

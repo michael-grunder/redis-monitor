@@ -13,7 +13,7 @@ use clap::Parser;
 use colored::Colorize;
 use connection::RedisAddr;
 use futures::stream::StreamExt;
-use serde::{de, Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, de};
 use std::{
     collections::HashSet,
     convert::{AsRef, From},
@@ -92,11 +92,15 @@ impl<'de> Deserialize<'de> for CsvArgument {
     }
 }
 
-async fn get_monitor<T>(url: T, auth: &Option<RedisAuth>) -> Result<redis::aio::Monitor>
+async fn get_monitor<T>(
+    url: T,
+    auth: &Option<RedisAuth>,
+) -> Result<redis::aio::Monitor>
 where
     T: AsRef<str> + Send,
 {
-    let cli = redis::Client::open(url.as_ref()).context("Failed to open connection to")?;
+    let cli = redis::Client::open(url.as_ref())
+        .context("Failed to open connection to")?;
     let mut connection = cli.get_async_connection().await?;
 
     if let Some(auth) = auth {
@@ -161,7 +165,9 @@ async fn main() -> Result<()> {
     //let filter_db = opt.db.unwrap_or(u64::MAX);
 
     if opt.instances.is_empty() {
-        eprintln!("Must pass at least one redis instance (either host/port or named instance)");
+        eprintln!(
+            "Must pass at least one redis instance (either host/port or named instance)"
+        );
         std::process::exit(1);
     }
 
@@ -173,10 +179,11 @@ async fn main() -> Result<()> {
         opt.exclude.unwrap_or_default().to_vec(),
     );
 
-    let mut streams = futures::stream::select_all(pairs.into_iter().map(move |(info, c)| {
-        c.into_on_message::<String>()
-            .map(move |c| (info.clone(), c))
-    }));
+    let mut streams =
+        futures::stream::select_all(pairs.into_iter().map(move |(info, c)| {
+            c.into_on_message::<String>()
+                .map(move |c| (info.clone(), c))
+        }));
 
     // Spawn a task to read from stdin
     let mut reader = BufReader::new(tokio::io::stdin());
@@ -198,7 +205,9 @@ async fn main() -> Result<()> {
 
         instance.incr_stats(line.cmd, msg.len());
 
-        if opt.db.is_some() && opt.db.unwrap() != line.db || filter.filter(line.cmd) {
+        if opt.db.is_some() && opt.db.unwrap() != line.db
+            || filter.filter(line.cmd)
+        {
             continue;
         }
 

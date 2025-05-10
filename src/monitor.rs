@@ -7,6 +7,7 @@ use colored::Color;
 use std::net::{IpAddr, Ipv4Addr};
 
 use nom::{
+    Err, IResult,
     branch::alt,
     bytes::{
         complete::{tag, take_until},
@@ -19,7 +20,6 @@ use nom::{
     multi::{fold_many0, many0, many1},
     number::complete::double,
     sequence::preceded,
-    Err, IResult,
 };
 
 #[derive(Debug)]
@@ -46,17 +46,20 @@ enum StringFragment<'a> {
 impl<'a> Line<'a> {
     fn parse_escaped_hex<E>(input: &'a str) -> IResult<&'a str, char, E>
     where
-        E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+        E: ParseError<&'a str>
+            + FromExternalError<&'a str, std::num::ParseIntError>,
     {
         let parse_hex = take_while_m_n(2, 2, |c: char| c.is_ascii_hexdigit());
-        let parse_u8 = map_res(parse_hex, move |hex| u8::from_str_radix(hex, 16));
+        let parse_u8 =
+            map_res(parse_hex, move |hex| u8::from_str_radix(hex, 16));
 
         map_opt(parse_u8, |value| std::char::from_u32(u32::from(value)))(input)
     }
 
     fn parse_escaped_char<E>(input: &'a str) -> IResult<&'a str, char, E>
     where
-        E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+        E: ParseError<&'a str>
+            + FromExternalError<&'a str, std::num::ParseIntError>,
     {
         preceded(
             char('\\'),
@@ -77,7 +80,9 @@ impl<'a> Line<'a> {
     }
 
     /// Parse a non-empty block of text that doesn't include \ or "
-    fn parse_literal<E: ParseError<&'a str>>(input: &'a str) -> IResult<&'a str, &'a str, E> {
+    fn parse_literal<E: ParseError<&'a str>>(
+        input: &'a str,
+    ) -> IResult<&'a str, &'a str, E> {
         let not_quote_slash = is_not("\"\\");
 
         verify(not_quote_slash, |s: &str| !s.is_empty())(input)
@@ -85,9 +90,12 @@ impl<'a> Line<'a> {
 
     /// Combine `parse_literal`, `parse_escaped_whitespace`, and `parse_escaped_char`
     /// into a `StringFragment`.
-    fn parse_fragment<E>(input: &'a str) -> IResult<&'a str, StringFragment<'a>, E>
+    fn parse_fragment<E>(
+        input: &'a str,
+    ) -> IResult<&'a str, StringFragment<'a>, E>
     where
-        E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+        E: ParseError<&'a str>
+            + FromExternalError<&'a str, std::num::ParseIntError>,
     {
         alt((
             // The `map` combinator runs a parser, then applies a function to the output
@@ -99,9 +107,12 @@ impl<'a> Line<'a> {
 
     /// Parse a string. Use a loop of `parse_fragment` and push all of the fragments
     /// into an output string.
-    pub fn parse_escaped_string<E>(input: &'a str) -> IResult<&'a str, String, E>
+    pub fn parse_escaped_string<E>(
+        input: &'a str,
+    ) -> IResult<&'a str, String, E>
     where
-        E: ParseError<&'a str> + FromExternalError<&'a str, std::num::ParseIntError>,
+        E: ParseError<&'a str>
+            + FromExternalError<&'a str, std::num::ParseIntError>,
     {
         // fold_many0 is the equivalent of iterator::fold. It runs a parser in a loop,
         // and for each output value, calls a folding function on each output value.
@@ -198,7 +209,7 @@ impl<'a> Line<'a> {
         Ok((input, (db, addr)))
     }
 
-    pub fn from_line(input: &'a str) -> IResult<&str, Line> {
+    pub fn from_line(input: &'a str) -> IResult<&'a str, Line> {
         let (input, timestamp) = double(input)?;
         let (input, _) = space0(input)?;
         let (input, (db, addr)) = Self::parse_source(input)?;
@@ -258,7 +269,11 @@ pub struct Instance {
 }
 
 impl Instance {
-    fn make_fmt_string(name: &Option<String>, addr: &RedisAddr, fmt: &str) -> String {
+    fn make_fmt_string(
+        name: &Option<String>,
+        addr: &RedisAddr,
+        fmt: &str,
+    ) -> String {
         let fmt = fmt.to_owned();
         let mut fmt = fmt.replace("{host}", &addr.get_host());
 
@@ -280,8 +295,11 @@ impl Instance {
         color: Option<Color>,
         fmt: Option<String>,
     ) -> Self {
-        let fmt =
-            Self::make_fmt_string(&name, &addr, &fmt.unwrap_or_else(|| "{host}:{port}".into()));
+        let fmt = Self::make_fmt_string(
+            &name,
+            &addr,
+            &fmt.unwrap_or_else(|| "{host}:{port}".into()),
+        );
 
         Self {
             name,
@@ -295,7 +313,8 @@ impl Instance {
 
     pub fn from_config_entry(name: &str, entry: &Entry) -> Vec<Self> {
         if entry.cluster {
-            let c = Cluster::from_seeds(&entry.get_addresses()).expect("Can't get cluster nodes");
+            let c = Cluster::from_seeds(&entry.get_addresses())
+                .expect("Can't get cluster nodes");
             c.get_primary_nodes()
                 .iter()
                 .map(|primary| {
