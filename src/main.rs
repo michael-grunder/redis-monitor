@@ -101,18 +101,18 @@ where
 {
     let cli = redis::Client::open(url.as_ref())
         .context("Failed to open connection to")?;
-    let mut connection = cli.get_async_connection().await?;
+    //let connection = cli.get_connection();
+    let mut connection_manager =
+        redis::aio::ConnectionManager::new(cli.clone()).await?;
 
     if let Some(auth) = auth {
         assert!(
-            (auth.auth(&mut connection).await),
+            (auth.auth(&mut connection_manager).await),
             "Failed to authenticate connection!"
         );
     }
 
-    let mut mon = connection.into_monitor();
-    mon.monitor().await?;
-    Ok(mon)
+    Ok(cli.get_async_monitor().await?)
 }
 
 async fn get_monitor_pairs(

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use redis::{RedisError, aio::Connection};
+use redis::{RedisError, aio::ConnectionManager};
 use std::{collections::HashSet, hash::Hash};
 
 #[derive(Debug, Hash, Eq, PartialEq)]
@@ -16,7 +16,7 @@ pub struct Command {
 impl Command {
     fn from_redis_values(values: &[redis::Value]) -> Option<Self> {
         let name = match &values[0] {
-            redis::Value::Data(bytes) => {
+            redis::Value::BulkString(bytes) => {
                 String::from_utf8(bytes.clone()).ok()?
             }
             _ => return None,
@@ -28,11 +28,12 @@ impl Command {
         };
 
         let flags = match &values[2] {
-            redis::Value::Bulk(values) => values
+            redis::Value::Array(values) => values
                 .iter()
                 .filter_map(|v| match v {
-                    redis::Value::Data(bytes) => {
-                        String::from_utf8(bytes.clone()).ok()
+                    redis::Value::SimpleString(bytes) => {
+                        Some(bytes.clone())
+//                        String::from_utf8(bytes.clone()).ok()
                     }
                     _ => None,
                 })
@@ -56,10 +57,10 @@ impl Command {
         };
 
         let categories = match &values[6] {
-            redis::Value::Bulk(values) => values
+            redis::Value::Array(values) => values
                 .iter()
                 .filter_map(|v| match v {
-                    redis::Value::Status(status_string) => {
+                    redis::Value::SimpleString(status_string) => {
                         Some(status_string.clone())
                     }
                     _ => None,
@@ -81,7 +82,7 @@ impl Command {
         })
     }
 
-    pub async fn load(con: &mut Connection) -> Result<HashSet<Self>> {
+    pub async fn load(con: &mut ConnectionManager) -> Result<HashSet<Self>> {
         let commands: Vec<Vec<redis::Value>> = redis::cmd("COMMAND")
             .query_async(con)
             .await

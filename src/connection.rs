@@ -181,7 +181,7 @@ impl Cluster {
         id: &Value,
     ) -> Option<(String, u16, String)> {
         match (host, port, id) {
-            (Value::Data(host), Value::Int(port), Value::Data(id)) => Some((
+            (Value::BulkString(host), Value::Int(port), Value::BulkString(id)) => Some((
                 String::from_utf8_lossy(host).to_string(),
                 u16::try_from(*port).expect("Failed to convert port to u16"),
                 String::from_utf8_lossy(id).to_string(),
@@ -194,7 +194,7 @@ impl Cluster {
         nodes
             .iter()
             .filter_map(|node| {
-                if let Value::Bulk(node) = node {
+                if let Value::Array(node) = node {
                     Self::parse_slot_bulk(&node[0], &node[1], &node[2])
                 } else {
                     None
@@ -226,10 +226,10 @@ impl Cluster {
             .query(con)
             .context("Failed to excute CLUSTER SLOTS")?;
 
-        if let Value::Bulk(items) = value {
+        if let Value::Array(items) = value {
             let mut iter = items.into_iter();
 
-            while let Some(Value::Bulk(item)) = iter.next() {
+            while let Some(Value::Array(item)) = iter.next() {
                 if item.len() < 3 {
                     continue;
                 }

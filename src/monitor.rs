@@ -7,6 +7,7 @@ use colored::Color;
 use std::net::{IpAddr, Ipv4Addr};
 
 use nom::{
+    Parser,
     Err, IResult,
     branch::alt,
     bytes::{
@@ -53,7 +54,7 @@ impl<'a> Line<'a> {
         let parse_u8 =
             map_res(parse_hex, move |hex| u8::from_str_radix(hex, 16));
 
-        map_opt(parse_u8, |value| std::char::from_u32(u32::from(value)))(input)
+        map_opt(parse_u8, |value| std::char::from_u32(u32::from(value))).parse(input)
     }
 
     fn parse_escaped_char<E>(input: &'a str) -> IResult<&'a str, char, E>
@@ -76,7 +77,7 @@ impl<'a> Line<'a> {
                 value('"', char('"')),
                 value(' ', char(' ')),
             )),
-        )(input)
+        ).parse(input)
     }
 
     /// Parse a non-empty block of text that doesn't include \ or "
@@ -85,7 +86,7 @@ impl<'a> Line<'a> {
     ) -> IResult<&'a str, &'a str, E> {
         let not_quote_slash = is_not("\"\\");
 
-        verify(not_quote_slash, |s: &str| !s.is_empty())(input)
+        verify(not_quote_slash, |s: &str| !s.is_empty()).parse(input)
     }
 
     /// Combine `parse_literal`, `parse_escaped_whitespace`, and `parse_escaped_char`
@@ -102,7 +103,7 @@ impl<'a> Line<'a> {
             // of that parser.
             map(Self::parse_literal, StringFragment::Literal),
             map(Self::parse_escaped_char, StringFragment::EscapedChar),
-        ))(input)
+        )).parse(input)
     }
 
     /// Parse a string. Use a loop of `parse_fragment` and push all of the fragments
@@ -133,14 +134,14 @@ impl<'a> Line<'a> {
         );
 
         let (input, _) = tag("\"")(input)?;
-        let (input, string) = build_string(input)?;
+        let (input, string) = build_string.parse(input)?;
         let (input, _) = tag("\"")(input)?;
 
         Ok((input, string))
     }
 
     fn parse_from_str<T: std::str::FromStr>(input: &str) -> IResult<&str, T> {
-        map_res(recognize(many1(digit1)), |s: &str| s.parse::<T>())(input)
+        map_res(recognize(many1(digit1)), |s: &str| s.parse::<T>()).parse(input)
     }
 
     // aaa.bbb.ccc.ddd (127.0.0.1)
@@ -216,9 +217,9 @@ impl<'a> Line<'a> {
 
         let (input, _) = space0(input)?;
         let (input, _) = tag("\"")(input)?;
-        let (input, cmd) = recognize(many1(alpha1))(input)?;
+        let (input, cmd) = recognize(many1(alpha1)).parse(input)?;
         let (input, _) = tag("\"")(input)?;
-        let (input, args) = many0(Self::parse_escaped_string)(input)?;
+        let (input, args) = many0(Self::parse_escaped_string).parse(input)?;
 
         Ok((input, Self::new(timestamp, db, addr, cmd, args)))
     }

@@ -2,8 +2,7 @@ use crate::connection::RedisAddr;
 use anyhow::{Context, Result};
 use colored::Color;
 use config::{Config, File, FileFormat};
-use redis::Cmd;
-use redis::cmd;
+use redis::{Cmd, cmd};
 
 use serde::{Deserialize, Deserializer, de};
 use std::{
@@ -96,7 +95,7 @@ impl RedisAuth {
         command
     }
 
-    pub async fn auth(&self, con: &mut redis::aio::Connection) -> bool {
+    pub async fn auth(&self, con: &mut redis::aio::ConnectionManager) -> bool {
         let command = self.get_command();
         matches!(command.query_async(con).await, Ok(redis::Value::Okay))
     }
