@@ -94,7 +94,7 @@ impl<'de> Deserialize<'de> for CsvArgument {
 
 async fn get_monitor<T>(
     url: T,
-    auth: &Option<RedisAuth>,
+    auth: Option<&RedisAuth>,
 ) -> Result<redis::aio::Monitor>
 where
     T: AsRef<str> + Send,

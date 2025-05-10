@@ -209,7 +209,7 @@ impl<'a> Line<'a> {
         Ok((input, (db, addr)))
     }
 
-    pub fn from_line(input: &'a str) -> IResult<&'a str, Line> {
+    pub fn from_line(input: &'a str) -> IResult<&'a str, Line<'a>> {
         let (input, timestamp) = double(input)?;
         let (input, _) = space0(input)?;
         let (input, (db, addr)) = Self::parse_source(input)?;
@@ -223,7 +223,7 @@ impl<'a> Line<'a> {
         Ok((input, Self::new(timestamp, db, addr, cmd, args)))
     }
 
-    pub fn new(
+    pub const fn new(
         timestamp: f64,
         db: u64,
         addr: ClientAddr<'a>,
@@ -270,7 +270,7 @@ pub struct Instance {
 
 impl Instance {
     fn make_fmt_string(
-        name: &Option<String>,
+        name: Option<&String>,
         addr: &RedisAddr,
         fmt: &str,
     ) -> String {
@@ -279,7 +279,7 @@ impl Instance {
 
         if let Some(name) = name {
             fmt = fmt.replace("{name}", name);
-        };
+        }
 
         if let Some(port) = addr.get_port() {
             fmt = fmt.replace("{port}", &format!("{port}"));
@@ -296,7 +296,7 @@ impl Instance {
         fmt: Option<String>,
     ) -> Self {
         let fmt = Self::make_fmt_string(
-            &name,
+            name.as_ref(),
             &addr,
             &fmt.unwrap_or_else(|| "{host}:{port}".into()),
         );
@@ -360,8 +360,8 @@ impl Instance {
         self.stats.incr(cmd, bytes);
     }
 
-    pub const fn get_auth(&self) -> &Option<RedisAuth> {
-        &self.auth
+    pub const fn get_auth(&self) -> Option<&RedisAuth> {
+        self.auth.as_ref()
     }
 }
 

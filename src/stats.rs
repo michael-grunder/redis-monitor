@@ -11,7 +11,7 @@ impl Stat {
         Self { count: 0, bytes: 0 }
     }
 
-    pub fn incr(&mut self, bytes: usize) {
+    pub const fn incr(&mut self, bytes: usize) {
         self.count += 1;
         self.bytes += bytes;
     }
