@@ -164,7 +164,7 @@ impl Map {
         self.0.get(name)
     }
 }
-// self.color.as_ref().map(|c| c.0)
+
 impl Entry {
     pub fn get_color(&self) -> Option<Color> {
         self.color.as_ref().map(|c| c.0)
