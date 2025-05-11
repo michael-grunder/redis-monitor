@@ -7,20 +7,7 @@ use colored::Color;
 use std::net::{IpAddr, Ipv4Addr};
 
 use nom::{
-    Parser,
-    Err, IResult,
-    branch::alt,
-    bytes::{
-        complete::{tag, take_until},
-        streaming::{is_not, take_while_m_n},
-    },
-    character::complete::{alpha1, digit1, space0},
-    character::streaming::char,
-    combinator::{map, map_opt, map_res, recognize, value, verify},
-    error::{ErrorKind, FromExternalError, ParseError},
-    multi::{fold_many0, many0, many1},
-    number::complete::double,
-    sequence::preceded,
+    branch::alt, bytes::complete::{is_not, take_while_m_n, tag, take_until}, character::{complete::{char, alpha1, digit1, space0}}, combinator::{map, map_opt, map_res, opt, recognize, value, verify}, error::{ErrorKind, FromExternalError, ParseError}, multi::{fold_many0, many0, many1}, number::complete::double, sequence::preceded, Err, IResult, Parser
 };
 
 #[derive(Debug)]
@@ -54,7 +41,8 @@ impl<'a> Line<'a> {
         let parse_u8 =
             map_res(parse_hex, move |hex| u8::from_str_radix(hex, 16));
 
-        map_opt(parse_u8, |value| std::char::from_u32(u32::from(value))).parse(input)
+        map_opt(parse_u8, |value| std::char::from_u32(u32::from(value)))
+            .parse(input)
     }
 
     fn parse_escaped_char<E>(input: &'a str) -> IResult<&'a str, char, E>
@@ -77,7 +65,8 @@ impl<'a> Line<'a> {
                 value('"', char('"')),
                 value(' ', char(' ')),
             )),
-        ).parse(input)
+        )
+        .parse(input)
     }
 
     /// Parse a non-empty block of text that doesn't include \ or "
@@ -103,7 +92,8 @@ impl<'a> Line<'a> {
             // of that parser.
             map(Self::parse_literal, StringFragment::Literal),
             map(Self::parse_escaped_char, StringFragment::EscapedChar),
-        )).parse(input)
+        ))
+        .parse(input)
     }
 
     /// Parse a string. Use a loop of `parse_fragment` and push all of the fragments
@@ -136,6 +126,7 @@ impl<'a> Line<'a> {
         let (input, _) = tag("\"")(input)?;
         let (input, string) = build_string.parse(input)?;
         let (input, _) = tag("\"")(input)?;
+        let (input, _) = opt(char(' ')).parse(input)?;
 
         Ok((input, string))
     }
@@ -218,8 +209,14 @@ impl<'a> Line<'a> {
         let (input, _) = space0(input)?;
         let (input, _) = tag("\"")(input)?;
         let (input, cmd) = recognize(many1(alpha1)).parse(input)?;
-        let (input, _) = tag("\"")(input)?;
-        let (input, args) = many0(Self::parse_escaped_string).parse(input)?;
+
+        //let (input, _) = tag("\" ")(input)?;
+        //let (input, args) = many0(Self::parse_escaped_string).parse(input)?;
+
+        let (input, args) =
+            opt(preceded(tag("\" "), many0(Self::parse_escaped_string)))
+                .map(|v| v.unwrap_or_default())
+                .parse(input)?;
 
         Ok((input, Self::new(timestamp, db, addr, cmd, args)))
     }
@@ -275,15 +272,18 @@ impl Instance {
         addr: &RedisAddr,
         fmt: &str,
     ) -> String {
-        let fmt = fmt.to_owned();
-        let mut fmt = fmt.replace("{host}", &addr.get_host());
+        let mut fmt = fmt.to_owned();
 
-        if let Some(name) = name {
-            fmt = fmt.replace("{name}", name);
-        }
+        let vars: &[(&'static str, Option<String>)] = &[
+            ("{host}", Some(addr.get_host().to_string())),
+            ("{port}", addr.get_port().map(|p| p.to_string())),
+            ("{name}", name.map(|n| n.to_string())),
+        ];
 
-        if let Some(port) = addr.get_port() {
-            fmt = fmt.replace("{port}", &format!("{port}"));
+        for (var, value) in vars {
+            if let Some(v) = value {
+                fmt = fmt.replace(var, v);
+            }
         }
 
         fmt

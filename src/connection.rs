@@ -181,7 +181,11 @@ impl Cluster {
         id: &Value,
     ) -> Option<(String, u16, String)> {
         match (host, port, id) {
-            (Value::BulkString(host), Value::Int(port), Value::BulkString(id)) => Some((
+            (
+                Value::BulkString(host),
+                Value::Int(port),
+                Value::BulkString(id),
+            ) => Some((
                 String::from_utf8_lossy(host).to_string(),
                 u16::try_from(*port).expect("Failed to convert port to u16"),
                 String::from_utf8_lossy(id).to_string(),

@@ -31,12 +31,6 @@ impl Filter {
         let value = value.to_lowercase();
 
         !self.should_include(&value) || self.should_exclude(&value)
-
-        //        if self.should_include(&value) {
-        //            self.should_exclude(&value)
-        //        } else {
-        //            true
-        //        }
     }
 
     pub fn from_args(include: Vec<String>, exclude: Vec<String>) -> Self {

@@ -198,13 +198,17 @@ async fn main() -> Result<()> {
     });
 
     while let Some((mut instance, msg)) = streams.next().await {
-        let (_, line) = Line::from_line(&msg).expect("Failed to parse line");
+        let line = match Line::from_line(&msg) {
+            Ok((_, line)) => line,
+            Err(e) => {
+                eprintln!("Failed to parse MONITOR line: {e:?} <- input: {msg:?}");
+                continue;
+            }
+        };
 
         instance.incr_stats(line.cmd, msg.len());
 
-        if opt.db.is_some() && opt.db.unwrap() != line.db
-            || filter.filter(line.cmd)
-        {
+        if matches!(opt.db, Some(db) if db != line.db) || filter.filter(line.cmd) {
             continue;
         }
 
@@ -221,6 +225,8 @@ async fn main() -> Result<()> {
             println!("{hdr} {msg}");
         }
     }
+
+    println!("{}", "Exiting...".green().bold());
 
     Ok(())
 }

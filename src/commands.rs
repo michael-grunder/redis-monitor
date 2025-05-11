@@ -33,7 +33,7 @@ impl Command {
                 .filter_map(|v| match v {
                     redis::Value::SimpleString(bytes) => {
                         Some(bytes.clone())
-//                        String::from_utf8(bytes.clone()).ok()
+                        //                        String::from_utf8(bytes.clone()).ok()
                     }
                     _ => None,
                 })
