@@ -250,7 +250,7 @@ async fn main() -> Result<()> {
     });
 
     while let Some((mut instance, msg)) = streams.next().await {
-        let line = match Line::from_line(&msg) {
+        let line = match Line::from_line(&msg, false) {
             Ok((_, line)) => line,
             Err(e) => {
                 eprintln!(
@@ -259,6 +259,9 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
+
+        println!("{:#?}", line);
+        continue;
 
         instance.incr_stats(line.cmd, msg.len());
 

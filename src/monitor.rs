@@ -5,6 +5,7 @@ use crate::{
 };
 use colored::Color;
 use std::{
+    borrow::Cow,
     hash::Hash,
     net::{IpAddr, Ipv4Addr},
 };
@@ -22,12 +23,18 @@ use nom::{
 };
 
 #[derive(Debug)]
+pub enum LineArgs<'a> {
+    Raw(&'a str),
+    Parsed(Vec<String>),
+}
+
+#[derive(Debug)]
 pub struct Line<'a> {
     pub timestamp: f64,
     pub db: u64,
     pub addr: ClientAddr<'a>,
     pub cmd: &'a str,
-    pub args: Vec<String>,
+    pub args: LineArgs<'a>,
 }
 
 #[derive(Debug)]
@@ -212,7 +219,10 @@ impl<'a> Line<'a> {
         Ok((input, (db, addr)))
     }
 
-    pub fn from_line(input: &'a str) -> IResult<&'a str, Line<'a>> {
+    pub fn from_line(
+        input: &'a str,
+        parse_args: bool,
+    ) -> IResult<&'a str, Line<'a>> {
         let (input, timestamp) = double(input)?;
         let (input, _) = space0(input)?;
         let (input, (db, addr)) = Self::parse_source(input)?;
@@ -221,13 +231,19 @@ impl<'a> Line<'a> {
         let (input, _) = tag("\"")(input)?;
         let (input, cmd) = recognize(many1(alpha1)).parse(input)?;
 
-        //let (input, _) = tag("\" ")(input)?;
-        //let (input, args) = many0(Self::parse_escaped_string).parse(input)?;
+        let args = if parse_args {
+            let (_, args) =
+                opt(preceded(tag("\" "), many0(Self::parse_escaped_string)))
+                    .map(|v| v.unwrap_or_default())
+                    .parse(input)?;
 
-        let (input, args) =
-            opt(preceded(tag("\" "), many0(Self::parse_escaped_string)))
-                .map(|v| v.unwrap_or_default())
-                .parse(input)?;
+            LineArgs::Parsed(args)
+        } else {
+            let (input, _) = tag("\"").parse(input)?;
+            let (input, _) = opt(char(' ')).parse(input)?;
+
+            LineArgs::Raw(input)
+        };
 
         Ok((input, Self::new(timestamp, db, addr, cmd, args)))
     }
@@ -237,7 +253,7 @@ impl<'a> Line<'a> {
         db: u64,
         addr: ClientAddr<'a>,
         cmd: &'a str,
-        args: Vec<String>,
+        args: LineArgs<'a>,
     ) -> Self {
         Self {
             timestamp,
@@ -248,6 +264,17 @@ impl<'a> Line<'a> {
         }
     }
 }
+
+//impl<'a> LineArgs<'a> {
+//    pub fn raw(s: &'a str) -> Self {
+//        Self::Raw(s)
+//    }
+//
+//    pub fn parsed(s: &'a str) -> IResult<&'a str, Self> {
+//        let (input, args) = many1(Self::parse_escaped_string).parse(s)?;
+//        Ok((input, Self::Parsed(args)))
+//    }
+//}
 
 impl<'a> ClientAddr<'a> {
     pub const fn from_path(path: &'a str) -> Self {
