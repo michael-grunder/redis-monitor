@@ -4,10 +4,19 @@ use crate::{
     stats::Map as CommandStats,
 };
 use colored::Color;
-use std::net::{IpAddr, Ipv4Addr};
+use std::{hash::Hash, net::{IpAddr, Ipv4Addr}};
+
 
 use nom::{
-    branch::alt, bytes::complete::{is_not, take_while_m_n, tag, take_until}, character::{complete::{char, alpha1, digit1, space0}}, combinator::{map, map_opt, map_res, opt, recognize, value, verify}, error::{ErrorKind, FromExternalError, ParseError}, multi::{fold_many0, many0, many1}, number::complete::double, sequence::preceded, Err, IResult, Parser
+    Err, IResult, Parser,
+    branch::alt,
+    bytes::complete::{is_not, tag, take_until, take_while_m_n},
+    character::complete::{alpha1, char, digit1, space0},
+    combinator::{map, map_opt, map_res, opt, recognize, value, verify},
+    error::{ErrorKind, FromExternalError, ParseError},
+    multi::{fold_many0, many0, many1},
+    number::complete::double,
+    sequence::preceded,
 };
 
 #[derive(Debug)]
@@ -266,6 +275,20 @@ pub struct Instance {
     stats: CommandStats,
 }
 
+impl Hash for Instance {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.addr.hash(state);
+    }
+}
+
+impl PartialEq for Instance {
+    fn eq(&self, other: &Self) -> bool {
+        self.addr == other.addr
+    }
+}
+
+impl Eq for Instance {}
+
 impl Instance {
     fn make_fmt_string(
         name: Option<&String>,
@@ -289,7 +312,7 @@ impl Instance {
         fmt
     }
 
-    fn new(
+    pub fn new(
         name: Option<String>,
         addr: RedisAddr,
         auth: Option<RedisAuth>,
@@ -310,6 +333,18 @@ impl Instance {
             stats: CommandStats::new(),
             fmt,
         }
+    }
+
+    pub fn from_cluster_seeds(
+        addresses: &[RedisAddr],
+    ) -> anyhow::Result<Vec<Self>> {
+        for address in addresses {
+            let cluster = Cluster::from_seeds(&[address.clone()])?;
+        }
+
+        let cluster = Cluster::from_seeds(addresses)?;
+
+        Ok(vec![])
     }
 
     pub fn from_config_entry(name: &str, entry: &Entry) -> Vec<Self> {

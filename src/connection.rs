@@ -41,7 +41,18 @@ impl<'de> Deserialize<'de> for RedisAddr {
 
 impl PartialEq for RedisAddr {
     fn eq(&self, other: &Self) -> bool {
-        self.to_string() == other.to_string()
+        match self {
+            Self::Tcp(host, port) => match other {
+                Self::Tcp(other_host, other_port) => {
+                    host == other_host && port == other_port
+                }
+                _ => false,
+            },
+            Self::Unix(path) => match other {
+                Self::Unix(other_path) => path == other_path,
+                _ => false,
+            },
+        }
     }
 }
 
@@ -55,10 +66,14 @@ impl Hash for RedisAddr {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
             Self::Tcp(host, port) => {
+                0u8.hash(state);
                 host.hash(state);
                 port.hash(state);
             }
-            Self::Unix(path) => path.hash(state),
+            Self::Unix(path) => {
+                1u8.hash(state);
+                path.hash(state)
+            }
         }
     }
 }
@@ -205,6 +220,12 @@ impl Cluster {
                 }
             })
             .collect()
+    }
+
+    pub fn from_seed(seed: &RedisAddr) -> Result<Self> {
+        let mut con = seed.get_connection()?;
+        let primaries = Self::get_nodes(&mut con)?;
+        Ok(Self::new(primaries))
     }
 
     pub fn from_seeds(seeds: &[RedisAddr]) -> Result<Self> {

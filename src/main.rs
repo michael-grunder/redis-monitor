@@ -2,6 +2,7 @@
 //#![allow(clippy::non_ascii_literal)]
 //#![allow(clippy::must_use_candidate)]
 use crate::{
+    connection::Cluster,
     config::{Map, RedisAuth},
     filter::Filter,
     monitor::{Instance, Line},
@@ -33,6 +34,9 @@ struct CsvArgument(Vec<String>);
 
 #[derive(Parser, Debug)]
 struct Options {
+    #[arg(short, long)]
+    cluster: bool,
+
     #[arg(short, long)]
     replicas: bool,
 
@@ -101,7 +105,6 @@ where
 {
     let cli = redis::Client::open(url.as_ref())
         .context("Failed to open connection to")?;
-    //let connection = cli.get_connection();
     let mut connection_manager =
         redis::aio::ConnectionManager::new(cli.clone()).await?;
 
@@ -131,6 +134,39 @@ async fn get_monitor_pairs(
     }
 
     Ok(res)
+}
+
+// Treat each instnace as a potential cluster seed. This means that if more than
+// one seeds of the same cluster are passed we may map the same keyspace more than
+// once. This is fine, but we should be aware of it.
+fn process_cluster_instances(instances: &[String]) -> Vec<Instance> {
+    // First make sure we can turn them all into RedisAddr
+    let addresses = instances
+        .iter()
+        .map(|i| RedisAddr::from_str(i).unwrap_or_else(|_| {
+            panic!("Unable to interpret '{i:?}' as a redis address");
+        }));
+
+    let unique: HashSet<Instance> = addresses
+        .flat_map(|address| {
+            Cluster::from_seed(&address)
+                .unwrap_or_else(|_| {
+                    panic!("Unable to interpret '{address:?}' as a cluster address");
+                })
+                .get_primary_nodes()
+                .iter()
+                .map(|primary| {
+                    Instance::new(
+                        None,
+                        primary.addr.clone(),
+                        None,
+                        None,
+                        None,
+                    )
+                }).collect::<Vec<_>>()
+        }).collect();
+
+    unique.into_iter().collect()
 }
 
 // Take the array of instances provided on the command line and attempt to map

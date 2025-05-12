@@ -1,4 +1,7 @@
-use std::{collections::HashSet, hash::{Hash, Hasher}};
+use std::{
+    collections::HashSet,
+    hash::{Hash, Hasher},
+};
 
 #[derive(Debug, Clone, Eq)]
 struct FilterString(String);
