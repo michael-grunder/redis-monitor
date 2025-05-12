@@ -337,17 +337,15 @@ impl Instance {
         }
     }
 
-    pub fn from_cluster_seeds(
-        addresses: &[RedisAddr],
-    ) -> anyhow::Result<Vec<Self>> {
-        for address in addresses {
-            let cluster = Cluster::from_seeds(&[address.clone()])?;
-        }
-
-        let cluster = Cluster::from_seeds(addresses)?;
-
-        Ok(vec![])
-    }
+    //pub fn from_cluster_seeds(
+    //    addresses: &[RedisAddr],
+    //) -> anyhow::Result<Vec<Self>> {
+    //    for address in addresses {
+    //        let cluster = Cluster::from_seeds(&[address.clone()])?;
+    //    }
+    //    let cluster = Cluster::from_seeds(addresses)?;
+    //    Ok(vec![])
+    //}
 
     pub fn from_config_entry(name: &str, entry: &Entry) -> Vec<Self> {
         if entry.cluster {

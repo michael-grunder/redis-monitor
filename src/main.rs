@@ -37,6 +37,9 @@ struct Options {
     #[arg(short, long, help = "Treat each instance like its a cluster seed")]
     cluster: bool,
 
+    #[arg(short, long, help = "How to format each MONITOR line")]
+    format: Option<String>,
+
     #[arg(short, long)]
     replicas: bool,
 
