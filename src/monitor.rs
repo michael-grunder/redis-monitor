@@ -4,8 +4,10 @@ use crate::{
     stats::Map as CommandStats,
 };
 use colored::Color;
-use std::{hash::Hash, net::{IpAddr, Ipv4Addr}};
-
+use std::{
+    hash::Hash,
+    net::{IpAddr, Ipv4Addr},
+};
 
 use nom::{
     Err, IResult, Parser,

@@ -2,8 +2,8 @@
 //#![allow(clippy::non_ascii_literal)]
 //#![allow(clippy::must_use_candidate)]
 use crate::{
-    connection::Cluster,
     config::{Map, RedisAuth},
+    connection::Cluster,
     filter::Filter,
     monitor::{Instance, Line},
 };
@@ -34,7 +34,7 @@ struct CsvArgument(Vec<String>);
 
 #[derive(Parser, Debug)]
 struct Options {
-    #[arg(short, long)]
+    #[arg(short, long, help = "Treat each instance like its a cluster seed")]
     cluster: bool,
 
     #[arg(short, long)]
@@ -141,32 +141,30 @@ async fn get_monitor_pairs(
 // once. This is fine, but we should be aware of it.
 fn process_cluster_instances(instances: &[String]) -> Vec<Instance> {
     // First make sure we can turn them all into RedisAddr
-    let addresses = instances
-        .iter()
-        .map(|i| RedisAddr::from_str(i).unwrap_or_else(|_| {
+    let addresses = instances.iter().map(|i| {
+        RedisAddr::from_str(i).unwrap_or_else(|_| {
             panic!("Unable to interpret '{i:?}' as a redis address");
-        }));
+        })
+    });
 
-    let unique: HashSet<Instance> = addresses
+    addresses
         .flat_map(|address| {
             Cluster::from_seed(&address)
                 .unwrap_or_else(|_| {
-                    panic!("Unable to interpret '{address:?}' as a cluster address");
+                    panic!(
+                        "Unable to interpret '{address:?}' as a cluster address"
+                    );
                 })
                 .get_primary_nodes()
                 .iter()
                 .map(|primary| {
-                    Instance::new(
-                        None,
-                        primary.addr.clone(),
-                        None,
-                        None,
-                        None,
-                    )
-                }).collect::<Vec<_>>()
-        }).collect();
-
-    unique.into_iter().collect()
+                    Instance::new(None, primary.addr.clone(), None, None, None)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 // Take the array of instances provided on the command line and attempt to map
@@ -204,7 +202,12 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let seeds = process_instances(&cfg, &opt.instances);
+    let seeds = if opt.cluster {
+        process_cluster_instances(&opt.instances)
+    } else {
+        process_instances(&cfg, &opt.instances)
+    };
+
     let pairs = get_monitor_pairs(seeds).await.unwrap();
 
     let filter = Filter::from_args(
@@ -237,14 +240,18 @@ async fn main() -> Result<()> {
         let line = match Line::from_line(&msg) {
             Ok((_, line)) => line,
             Err(e) => {
-                eprintln!("Failed to parse MONITOR line: {e:?} <- input: {msg:?}");
+                eprintln!(
+                    "Failed to parse MONITOR line: {e:?} <- input: {msg:?}"
+                );
                 continue;
             }
         };
 
         instance.incr_stats(line.cmd, msg.len());
 
-        if matches!(opt.db, Some(db) if db != line.db) || filter.filter(line.cmd) {
+        if matches!(opt.db, Some(db) if db != line.db)
+            || filter.filter(line.cmd)
+        {
             continue;
         }
 
