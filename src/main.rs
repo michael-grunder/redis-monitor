@@ -139,7 +139,10 @@ async fn get_monitor_pairs(
 // Treat each instnace as a potential cluster seed. This means that if more than
 // one seeds of the same cluster are passed we may map the same keyspace more than
 // once. This is fine, but we should be aware of it.
-fn process_cluster_instances(instances: &[String]) -> Vec<Instance> {
+fn process_cluster_instances(
+    instances: &[String],
+    with_replicas: bool,
+) -> Vec<Instance> {
     // First make sure we can turn them all into RedisAddr
     let addresses = instances.iter().map(|i| {
         RedisAddr::from_str(i).unwrap_or_else(|_| {
@@ -155,10 +158,17 @@ fn process_cluster_instances(instances: &[String]) -> Vec<Instance> {
                         "Unable to interpret '{address:?}' as a cluster address"
                     );
                 })
-                .get_primary_nodes()
+                .get_nodes()
                 .iter()
-                .map(|primary| {
-                    Instance::new(None, primary.addr.clone(), None, None, None)
+                .flat_map(|primary| {
+                    let mut nodes = vec![primary];
+                    if with_replicas {
+                        nodes.extend(&primary.replicas);
+                    }
+
+                    nodes.into_iter().map(|n| {
+                        Instance::new(None, n.addr.clone(), None, None, None)
+                    })
                 })
                 .collect::<Vec<_>>()
         })
@@ -203,7 +213,7 @@ async fn main() -> Result<()> {
     }
 
     let seeds = if opt.cluster {
-        process_cluster_instances(&opt.instances)
+        process_cluster_instances(&opt.instances, opt.replicas)
     } else {
         process_instances(&cfg, &opt.instances)
     };

@@ -353,7 +353,7 @@ impl Instance {
         if entry.cluster {
             let c = Cluster::from_seeds(&entry.get_addresses())
                 .expect("Can't get cluster nodes");
-            c.get_primary_nodes()
+            c.get_nodes()
                 .iter()
                 .map(|primary| {
                     Self::new(

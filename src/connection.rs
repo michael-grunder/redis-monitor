@@ -224,14 +224,13 @@ impl Cluster {
 
     pub fn from_seed(seed: &RedisAddr) -> Result<Self> {
         let mut con = seed.get_connection()?;
-        let primaries = Self::get_nodes(&mut con)?;
-        Ok(Self::new(primaries))
+        Ok(Self::new(Self::exec_slots(&mut con)?))
     }
 
     pub fn from_seeds(seeds: &[RedisAddr]) -> Result<Self> {
         for seed in seeds {
             if let Ok(mut con) = seed.get_connection() {
-                if let Ok(primaries) = Self::get_nodes(&mut con) {
+                if let Ok(primaries) = Self::exec_slots(&mut con) {
                     return Ok(Self::new(primaries));
                 }
             }
@@ -243,7 +242,7 @@ impl Cluster {
         ))
     }
 
-    fn get_nodes(con: &mut Connection) -> Result<HashSet<ClusterNode>> {
+    fn exec_slots(con: &mut Connection) -> Result<HashSet<ClusterNode>> {
         let mut primaries = HashSet::new();
 
         let value = redis::cmd("CLUSTER")
@@ -279,7 +278,7 @@ impl Cluster {
         Ok(primaries)
     }
 
-    pub fn get_primary_nodes(&self) -> Vec<ClusterNode> {
+    pub fn get_nodes(&self) -> Vec<ClusterNode> {
         self.0.iter().cloned().collect()
     }
 }
