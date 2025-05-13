@@ -260,9 +260,6 @@ async fn main() -> Result<()> {
             }
         };
 
-        println!("{:#?}", line);
-        continue;
-
         instance.incr_stats(line.cmd, msg.len());
 
         if matches!(opt.db, Some(db) if db != line.db)

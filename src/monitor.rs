@@ -232,8 +232,8 @@ impl<'a> Line<'a> {
         let (input, _) = tag("\"")(input)?;
         let (input, cmd) = recognize(many1(alpha1)).parse(input)?;
 
-        let (input, _) = tag("\"").parse(input)?; // consume closing quote
-        let (input, _) = opt(char(' ')).parse(input)?; // optionally consume space
+        let (input, _) = tag("\"").parse(input)?;
+        let (input, _) = opt(char(' ')).parse(input)?;
 
         let args = if parse_args {
             let (_, args) = many0(Self::parse_escaped_string).parse(input)?;
@@ -241,20 +241,6 @@ impl<'a> Line<'a> {
         } else {
             LineArgs::Raw(input)
         };
-
-        //let args = if parse_args {
-        //    let (_, args) =
-        //        opt(preceded(tag("\" "), many0(Self::parse_escaped_string)))
-        //            .map(|v| v.unwrap_or_default())
-        //            .parse(input)?;
-
-        //    LineArgs::Parsed(args)
-        //} else {
-        //    let (input, _) = tag("\"").parse(input)?;
-        //    let (input, _) = opt(char(' ')).parse(input)?;
-
-        //    LineArgs::Raw(input)
-        //};
 
         Ok((input, Self::new(timestamp, db, addr, cmd, args)))
     }
