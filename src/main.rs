@@ -190,19 +190,19 @@ fn process_cluster_instances(
 fn process_instances(cfg: &Map, instances: &[String]) -> Vec<Instance> {
     instances
         .iter()
-        .flat_map(|instance| {
-            cfg.get(instance).map_or_else(
+        .flat_map(|inst| {
+            cfg.get(inst).map_or_else(
                 || {
-                    RedisAddr::from_str(instance).map_or_else(
+                    RedisAddr::from_str(inst).map_or_else(
                         |_| {
                             panic!(
-                            "Unable to interpret '{instance}' as a redis address or named instance"
+                            "Unable to parse '{inst}' as an address or named instance"
                         );
                         },
                         |addr| vec![addr.into()],
                     )
                 },
-                |entry| Instance::from_config_entry(instance, entry),
+                |entry| Instance::from_config_entry(inst, entry),
             )
         })
         .collect()
@@ -224,7 +224,10 @@ async fn main() -> Result<()> {
         process_instances(&cfg, &opt.instances)
     };
 
-    let pairs = get_monitor_pairs(seeds).await.unwrap();
+    let pairs = get_monitor_pairs(seeds).await.unwrap_or_else(|_| {
+        eprintln!("Failed to get monitor pairs");
+        std::process::exit(1);
+    });
 
     let filter = Filter::from_args(
         opt.include.unwrap_or_default().to_vec(),
@@ -237,10 +240,8 @@ async fn main() -> Result<()> {
                 .map(move |c| (info.clone(), c))
         }));
 
-    // Spawn a task to read from stdin
     let mut reader = BufReader::new(tokio::io::stdin());
     task::spawn(async move {
-        // Read a line of input from the user
         let mut input = String::new();
         while reader.read_line(&mut input).await.is_ok() {
             println!("Input: {input}");
@@ -256,9 +257,7 @@ async fn main() -> Result<()> {
         let line = match Line::from_line(&msg, false) {
             Ok((_, line)) => line,
             Err(e) => {
-                eprintln!(
-                    "Failed to parse MONITOR line: {e:?} <- input: {msg:?}"
-                );
+                eprintln!("Failed to parse line: {e:?} <- input: {msg:?}");
                 continue;
             }
         };
