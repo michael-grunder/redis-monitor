@@ -61,6 +61,9 @@ struct Options {
     #[arg(long)]
     db: Option<u64>,
 
+    #[arg(short, long, help = "Output in JSON format")]
+    json: bool,
+
     pub instances: Vec<String>,
 }
 
@@ -128,7 +131,7 @@ async fn get_monitor_pairs(
 
     for instance in instances {
         let url = instance.get_url_string();
-        println!("MONITOR {url} {}", instance.fmt_str());
+        eprintln!("MONITOR {url} {}", instance.fmt_str());
 
         let mon = get_monitor(&url, instance.get_auth())
             .await
@@ -268,7 +271,12 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        if opt.no_color {
+        if opt.json {
+            let json = serde_json::to_string(&line).unwrap_or_else(|_| {
+                panic!("Failed to serialize line to JSON: {line:?}")
+            });
+            println!("{json}");
+        } else if opt.no_color {
             println!("{} {msg}", instance.fmt_str());
         } else {
             let msg = if let Some(color) = instance.get_color() {

@@ -4,6 +4,7 @@ use crate::{
     stats::Map as CommandStats,
 };
 use colored::Color;
+use serde::Serialize;
 use std::{
     borrow::Cow,
     hash::Hash,
@@ -22,13 +23,13 @@ use nom::{
     sequence::preceded,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub enum LineArgs<'a> {
     Raw(&'a str),
     Parsed(Vec<String>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct Line<'a> {
     pub timestamp: f64,
     pub db: u64,
@@ -37,7 +38,7 @@ pub struct Line<'a> {
     pub args: LineArgs<'a>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub enum ClientAddr<'a> {
     Path(&'a str),
     Tcp((IpAddr, u16)),
@@ -96,8 +97,6 @@ impl<'a> Line<'a> {
         verify(not_quote_slash, |s: &str| !s.is_empty()).parse(input)
     }
 
-    /// Combine `parse_literal`, `parse_escaped_whitespace`, and `parse_escaped_char`
-    /// into a `StringFragment`.
     fn parse_fragment<E>(
         input: &'a str,
     ) -> IResult<&'a str, StringFragment<'a>, E>
@@ -106,8 +105,6 @@ impl<'a> Line<'a> {
             + FromExternalError<&'a str, std::num::ParseIntError>,
     {
         alt((
-            // The `map` combinator runs a parser, then applies a function to the output
-            // of that parser.
             map(Self::parse_literal, StringFragment::Literal),
             map(Self::parse_escaped_char, StringFragment::EscapedChar),
         ))
@@ -261,17 +258,6 @@ impl<'a> Line<'a> {
         }
     }
 }
-
-//impl<'a> LineArgs<'a> {
-//    pub fn raw(s: &'a str) -> Self {
-//        Self::Raw(s)
-//    }
-//
-//    pub fn parsed(s: &'a str) -> IResult<&'a str, Self> {
-//        let (input, args) = many1(Self::parse_escaped_string).parse(s)?;
-//        Ok((input, Self::Parsed(args)))
-//    }
-//}
 
 impl<'a> ClientAddr<'a> {
     pub const fn from_path(path: &'a str) -> Self {
