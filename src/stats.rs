@@ -6,6 +6,9 @@ pub struct Stat {
     bytes: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct Map(HashMap<String, Stat>);
+
 impl Stat {
     pub const fn new() -> Self {
         Self { count: 0, bytes: 0 }
@@ -17,18 +20,17 @@ impl Stat {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Map(HashMap<String, Stat>);
-
 impl Map {
     pub fn new() -> Self {
         Self(HashMap::new())
     }
 
     pub fn incr(&mut self, cmd: &str, bytes: usize) {
-        self.0
-            .entry(cmd.to_string())
-            .or_insert_with(Stat::new)
-            .incr(bytes);
+        match self.0.get_mut(cmd) {
+            Some(v) => v.incr(bytes),
+            None => {
+                self.0.insert(cmd.to_string(), Stat::new());
+            }
+        };
     }
 }
