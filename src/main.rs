@@ -61,6 +61,12 @@ struct Options {
     #[arg(long)]
     db: Option<u64>,
 
+    #[arg(short, long, help = "Redis user")]
+    user: Option<String>,
+
+    #[arg(short, long, help = "Redis password")]
+    pass: Option<String>,
+
     #[arg(short, long, help = "Output in JSON format")]
     json: bool,
 
@@ -102,10 +108,7 @@ impl<'de> Deserialize<'de> for CsvArgument {
     }
 }
 
-async fn get_monitor<T>(
-    url: T,
-    auth: Option<&RedisAuth>,
-) -> Result<redis::aio::Monitor>
+async fn get_monitor<T>(url: T, auth: &RedisAuth) -> Result<redis::aio::Monitor>
 where
     T: AsRef<str> + Send,
 {
@@ -114,12 +117,7 @@ where
     let mut connection_manager =
         redis::aio::ConnectionManager::new(cli.clone()).await?;
 
-    if let Some(auth) = auth {
-        assert!(
-            (auth.auth(&mut connection_manager).await),
-            "Failed to authenticate connection!"
-        );
-    }
+    auth.auth(&mut connection_manager).await?;
 
     Ok(cli.get_async_monitor().await?)
 }
@@ -145,12 +143,9 @@ async fn get_monitor_pairs(
 // Treat each instnace as a potential cluster seed. This means that if more than
 // one seeds of the same cluster are passed we may map the same keyspace more than
 // once. This is fine, but we should be aware of it.
-fn process_cluster_instances(
-    instances: &[String],
-    with_replicas: bool,
-) -> Vec<Instance> {
+fn process_cluster_instances(opt: &Options, auth: &RedisAuth) -> Vec<Instance> {
     // First make sure we can turn them all into RedisAddr
-    let addresses = instances.iter().map(|i| {
+    let addresses = opt.instances.iter().map(|i| {
         RedisAddr::from_str(i).unwrap_or_else(|_| {
             panic!("Unable to interpret '{i:?}' as a redis address");
         })
@@ -168,12 +163,18 @@ fn process_cluster_instances(
                 .iter()
                 .flat_map(|primary| {
                     let mut nodes = vec![primary];
-                    if with_replicas {
+                    if opt.replicas {
                         nodes.extend(&primary.replicas);
                     }
 
                     nodes.into_iter().map(|n| {
-                        Instance::new(None, n.addr.clone(), None, None, None)
+                        Instance::new(
+                            Some(n.id.clone()),
+                            n.addr.clone(),
+                            auth.clone(),
+                            None,
+                            None,
+                        )
                     })
                 })
                 .collect::<Vec<_>>()
@@ -211,15 +212,18 @@ fn process_instances(cfg: &Map, instances: &[String]) -> Vec<Instance> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let opt: Options = Options::parse();
-    let cfg = Map::load(opt.config_file);
+    let cfg = Map::load(opt.config_file.as_ref());
 
     if opt.instances.is_empty() {
         eprintln!("Must pass at least one unstance (host/port or name)");
         std::process::exit(1);
     }
 
+    let auth =
+        RedisAuth::from_user_pass(opt.user.as_deref(), opt.pass.as_deref());
+
     let seeds = if opt.cluster {
-        process_cluster_instances(&opt.instances, opt.replicas)
+        process_cluster_instances(&opt, &auth)
     } else {
         process_instances(&cfg, &opt.instances)
     };

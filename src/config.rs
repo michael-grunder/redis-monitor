@@ -1,5 +1,5 @@
 use crate::connection::RedisAddr;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use colored::Color;
 use config::{Config, File, FileFormat};
 use redis::{Cmd, cmd};
@@ -19,10 +19,10 @@ pub struct Map(HashMap<String, Entry>);
 #[derive(Debug)]
 pub struct DisplayColor(Color);
 
-#[derive(Debug, Clone)]
-pub enum RedisAuth {
-    UserPass(String, String),
-    Pass(String),
+#[derive(Debug, Clone, Default)]
+pub struct RedisAuth {
+    user: Option<String>,
+    pass: Option<String>,
 }
 
 impl<'a> IntoIterator for &'a Map {
@@ -72,32 +72,37 @@ impl<'de> Deserialize<'de> for DisplayColor {
 }
 
 impl RedisAuth {
-    fn from_pass(pass: &str) -> Self {
-        Self::Pass(pass.to_owned())
+    pub fn from_user_pass(user: Option<&str>, pass: Option<&str>) -> Self {
+        Self {
+            user: user.map(|s| s.to_owned()),
+            pass: pass.map(|s| s.to_owned()),
+        }
     }
 
-    fn from_user_pass(user: &str, pass: &str) -> Self {
-        Self::UserPass(user.to_owned(), pass.to_owned())
-    }
-
-    pub fn get_command(&self) -> Cmd {
-        let mut command = cmd("AUTH");
-
-        match self {
-            Self::UserPass(user, pass) => {
-                command.arg(user).arg(pass);
-            }
-            Self::Pass(pass) => {
-                command.arg(pass);
-            }
+    pub async fn auth(
+        &self,
+        con: &mut redis::aio::ConnectionManager,
+    ) -> Result<()> {
+        if self.user.is_none() && self.pass.is_none() {
+            return Ok(());
         }
 
-        command
-    }
+        let mut command = cmd("AUTH");
 
-    pub async fn auth(&self, con: &mut redis::aio::ConnectionManager) -> bool {
-        let command = self.get_command();
-        matches!(command.query_async(con).await, Ok(redis::Value::Okay))
+        if let Some(user) = &self.user {
+            command.arg(user);
+        }
+        if let Some(pass) = &self.pass {
+            command.arg(pass);
+        }
+
+        match command.query_async(con).await {
+            Ok(redis::Value::Okay) => Ok(()),
+            other => bail!(
+                "AUTH failed: unexpected response from Redis: {:?}",
+                other
+            ),
+        }
     }
 }
 
@@ -177,14 +182,8 @@ impl Entry {
         }
     }
 
-    pub fn get_auth(&self) -> Option<RedisAuth> {
-        match (&self.user, &self.pass) {
-            (Some(user), Some(pass)) => {
-                Some(RedisAuth::from_user_pass(user, pass))
-            }
-            (None, Some(pass)) => Some(RedisAuth::from_pass(pass)),
-            _ => None,
-        }
+    pub fn get_auth(&self) -> RedisAuth {
+        RedisAuth::from_user_pass(self.user.as_deref(), self.pass.as_deref())
     }
 
     pub fn get_addresses(&self) -> Vec<RedisAddr> {

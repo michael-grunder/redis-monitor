@@ -277,7 +277,7 @@ pub struct Instance {
     // The address itself
     addr: RedisAddr,
 
-    auth: Option<RedisAuth>,
+    auth: RedisAuth,
 
     // Format string (defaults to {host}:{port}
     fmt: String,
@@ -327,7 +327,7 @@ impl Instance {
     pub fn new(
         name: Option<String>,
         addr: RedisAddr,
-        auth: Option<RedisAuth>,
+        auth: RedisAuth,
         color: Option<Color>,
         fmt: Option<String>,
     ) -> Self {
@@ -407,8 +407,8 @@ impl Instance {
         self.stats.incr(cmd, bytes);
     }
 
-    pub const fn get_auth(&self) -> Option<&RedisAuth> {
-        self.auth.as_ref()
+    pub const fn get_auth(&self) -> &RedisAuth {
+        &self.auth
     }
 }
 
@@ -419,6 +419,6 @@ impl From<RedisAddr> for Instance {
             RedisAddr::Unix(_) => "{host}",
         };
 
-        Self::new(None, addr, None, None, Some(fmt.to_owned()))
+        Self::new(None, addr, RedisAuth::default(), None, Some(fmt.to_owned()))
     }
 }
