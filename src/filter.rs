@@ -45,6 +45,10 @@ impl std::borrow::Borrow<str> for FilterString {
 }
 
 impl Filter {
+    pub fn is_empty(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
+    }
+
     fn should_include(&self, value: &str) -> bool {
         self.include.is_empty() || self.include.contains(value)
     }

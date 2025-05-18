@@ -7,7 +7,7 @@ pub struct Stat {
 }
 
 #[derive(Debug, Clone)]
-pub struct Map(HashMap<String, Stat>);
+pub struct CommandStats(HashMap<String, Stat>);
 
 impl Stat {
     pub const fn new() -> Self {
@@ -20,7 +20,7 @@ impl Stat {
     }
 }
 
-impl Map {
+impl CommandStats {
     pub fn new() -> Self {
         Self(HashMap::new())
     }

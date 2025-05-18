@@ -1,4 +1,4 @@
-use crate::connection::RedisAddr;
+use crate::connection::ServerAddr;
 use anyhow::{Context, Result, bail};
 use colored::Color;
 use config::{Config, File, FileFormat};
@@ -20,9 +20,9 @@ pub struct Map(HashMap<String, Entry>);
 pub struct DisplayColor(Color);
 
 #[derive(Debug, Clone, Default)]
-pub struct RedisAuth {
-    user: Option<String>,
-    pass: Option<String>,
+pub struct ServerAuth {
+    pub user: Option<String>,
+    pub pass: Option<String>,
 }
 
 impl<'a> IntoIterator for &'a Map {
@@ -36,7 +36,7 @@ impl<'a> IntoIterator for &'a Map {
 
 #[derive(Debug, Deserialize)]
 pub struct Entry {
-    addresses: Option<Vec<RedisAddr>>,
+    addresses: Option<Vec<ServerAddr>>,
     path: Option<String>,
     host: Option<String>,
     port: Option<u16>,
@@ -71,7 +71,7 @@ impl<'de> Deserialize<'de> for DisplayColor {
     }
 }
 
-impl RedisAuth {
+impl ServerAuth {
     pub fn from_user_pass(user: Option<&str>, pass: Option<&str>) -> Self {
         Self {
             user: user.map(|s| s.to_owned()),
@@ -182,17 +182,17 @@ impl Entry {
         }
     }
 
-    pub fn get_auth(&self) -> RedisAuth {
-        RedisAuth::from_user_pass(self.user.as_deref(), self.pass.as_deref())
+    pub fn get_auth(&self) -> ServerAuth {
+        ServerAuth::from_user_pass(self.user.as_deref(), self.pass.as_deref())
     }
 
-    pub fn get_addresses(&self) -> Vec<RedisAddr> {
+    pub fn get_addresses(&self) -> Vec<ServerAddr> {
         if let Some((host, port)) = self.host_port() {
-            vec![RedisAddr::from_tcp_addr(host, port)]
+            vec![ServerAddr::from_tcp_addr(host, port)]
         } else if let Some(addresses) = &self.addresses {
             addresses.to_owned()
         } else if let Some(path) = &self.path {
-            vec![RedisAddr::from_path(path)]
+            vec![ServerAddr::from_path(path)]
         } else {
             panic!("Could not determine one or more Redis addresses");
         }

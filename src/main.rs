@@ -2,24 +2,26 @@
 //#![allow(clippy::non_ascii_literal)]
 //#![allow(clippy::must_use_candidate)]
 use crate::{
-    config::{Map, RedisAuth},
+    config::{Map, ServerAuth},
     connection::Cluster,
+    connection::Monitor,
     filter::Filter,
-    monitor::{Instance, Line},
+    monitor::Line,
 };
-use tokio::{io::AsyncBufReadExt, io::BufReader, task};
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
-use colored::Colorize;
-use connection::RedisAddr;
-use futures::stream::StreamExt;
+use colored::{ColoredString, Colorize};
+use connection::ServerAddr;
+use futures::stream::FuturesUnordered;
 use serde::{Deserialize, Deserializer, de};
 use std::{
-    collections::HashSet,
-    convert::{AsRef, From},
-    default::Default,
-    str::FromStr,
+    collections::HashSet, convert::From, default::Default, str::FromStr,
+    sync::Arc,
+};
+use tokio::{
+    io::AsyncBufReadExt,
+    sync::mpsc,
+    time::{Duration, sleep},
 };
 
 mod commands;
@@ -92,9 +94,9 @@ impl FromStr for CsvArgument {
     }
 }
 
-impl CsvArgument {
-    pub fn to_vec(&self) -> Vec<String> {
-        self.0.clone()
+impl From<CsvArgument> for Vec<String> {
+    fn from(arg: CsvArgument) -> Self {
+        arg.0
     }
 }
 
@@ -108,45 +110,13 @@ impl<'de> Deserialize<'de> for CsvArgument {
     }
 }
 
-async fn get_monitor<T>(url: T, auth: &RedisAuth) -> Result<redis::aio::Monitor>
-where
-    T: AsRef<str> + Send,
-{
-    let cli = redis::Client::open(url.as_ref())
-        .context("Failed to open connection to")?;
-    let mut connection_manager =
-        redis::aio::ConnectionManager::new(cli.clone()).await?;
-
-    auth.auth(&mut connection_manager).await?;
-
-    Ok(cli.get_async_monitor().await?)
-}
-
-async fn get_monitor_pairs(
-    instances: Vec<Instance>,
-) -> Result<Vec<(Instance, redis::aio::Monitor)>> {
-    let mut res = vec![];
-
-    for instance in instances {
-        let url = instance.get_url_string();
-        eprintln!("MONITOR {url} {}", instance.fmt_str());
-
-        let mon = get_monitor(&url, instance.get_auth())
-            .await
-            .with_context(|| format!("Failed to get connection for '{url}'"))?;
-        res.push((instance, mon));
-    }
-
-    Ok(res)
-}
-
 // Treat each instnace as a potential cluster seed. This means that if more than
 // one seeds of the same cluster are passed we may map the same keyspace more than
 // once. This is fine, but we should be aware of it.
-fn process_cluster_instances(opt: &Options, auth: &RedisAuth) -> Vec<Instance> {
+fn process_cluster_instances(opt: &Options, auth: &ServerAuth) -> Vec<Monitor> {
     // First make sure we can turn them all into RedisAddr
     let addresses = opt.instances.iter().map(|i| {
-        RedisAddr::from_str(i).unwrap_or_else(|_| {
+        ServerAddr::from_str(i).unwrap_or_else(|_| {
             panic!("Unable to interpret '{i:?}' as a redis address");
         })
     });
@@ -168,12 +138,12 @@ fn process_cluster_instances(opt: &Options, auth: &RedisAuth) -> Vec<Instance> {
                     }
 
                     nodes.into_iter().map(|n| {
-                        Instance::new(
+                        Monitor::new(
                             Some(n.id.clone()),
                             n.addr.clone(),
                             auth.clone(),
                             None,
-                            None,
+                            opt.format.clone(),
                         )
                     })
                 })
@@ -188,25 +158,87 @@ fn process_cluster_instances(opt: &Options, auth: &RedisAuth) -> Vec<Instance> {
 // them to one ore more instances. These can either be named instances like
 // mycluster` which were loaded from our config file, or be in some parsable
 // form like "host:port", or "redis://...".
-fn process_instances(cfg: &Map, instances: &[String]) -> Vec<Instance> {
+fn process_instances(
+    cfg: &Map,
+    instances: &[String],
+    format: &Option<String>,
+) -> Vec<Monitor> {
     instances
         .iter()
         .flat_map(|inst| {
             cfg.get(inst).map_or_else(
                 || {
-                    RedisAddr::from_str(inst).map_or_else(
+                    ServerAddr::from_str(inst).map_or_else(
                         |_| {
                             panic!(
                             "Unable to parse '{inst}' as an address or named instance"
                         );
                         },
-                        |addr| vec![addr.into()],
+                        |addr| {
+                            let mut addr: Monitor = addr.into();
+                            if let Some(format) = format {
+                                addr.format = format.clone();
+                            }
+                            vec![addr]
+                        }
                     )
                 },
-                |entry| Instance::from_config_entry(inst, entry),
+                |entry| Monitor::from_config_entry(inst, entry),
             )
         })
         .collect()
+}
+
+#[derive(Debug)]
+pub struct MonitorMessage {
+    pub prefix: Arc<str>,
+    pub address: Arc<ServerAddr>,
+    line: String,
+}
+
+async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
+    let prefix: Arc<str> = Arc::from(mon.format.clone());
+    let address = Arc::new(mon.address.clone());
+
+    let mut informed = false;
+
+    loop {
+        match mon.clone().connect().await {
+            Ok((_, mut reader)) => {
+                informed = false;
+
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let msg = MonitorMessage {
+                                prefix: prefix.clone(),
+                                address: address.clone(),
+                                line: line[1..].trim_end().to_string(),
+                            };
+                            if tx.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[{prefix}] Read error {e:?}");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if !informed {
+                    eprintln!("[{prefix}] Error connecting {e}");
+                    informed = true;
+                }
+            }
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[tokio::main]
@@ -220,80 +252,115 @@ async fn main() -> Result<()> {
     }
 
     let auth =
-        RedisAuth::from_user_pass(opt.user.as_deref(), opt.pass.as_deref());
+        ServerAuth::from_user_pass(opt.user.as_deref(), opt.pass.as_deref());
 
     let seeds = if opt.cluster {
         process_cluster_instances(&opt, &auth)
     } else {
-        process_instances(&cfg, &opt.instances)
+        process_instances(&cfg, &opt.instances, &opt.format)
     };
 
-    let pairs = get_monitor_pairs(seeds).await.unwrap_or_else(|_| {
-        eprintln!("Failed to get monitor pairs");
-        std::process::exit(1);
-    });
-
+    let (tx, mut rx) = mpsc::channel::<MonitorMessage>(1000);
     let filter = Filter::from_args(
-        opt.include.unwrap_or_default().to_vec(),
-        opt.exclude.unwrap_or_default().to_vec(),
+        opt.include.unwrap_or_default().into(),
+        opt.exclude.unwrap_or_default().into(),
     );
 
-    let mut streams =
-        futures::stream::select_all(pairs.into_iter().map(move |(info, c)| {
-            c.into_on_message::<String>()
-                .map(move |c| (info.clone(), c))
-        }));
+    let tasks = FuturesUnordered::new();
 
-    let mut reader = BufReader::new(tokio::io::stdin());
-    task::spawn(async move {
-        let mut input = String::new();
-        while reader.read_line(&mut input).await.is_ok() {
-            println!("Input: {input}");
-            if input.to_lowercase().starts_with("quit") {
-                println!("Quit detected, exiting.");
-                std::process::exit(0);
-            }
-            input.truncate(0);
+    for mon in seeds {
+        println!("MONITOR: {}", mon.address);
+        tasks.push(tokio::spawn(run_monitor(mon, tx.clone())));
+    }
+
+    let format_prefix: Box<dyn Fn(&str) -> ColoredString> = if opt.no_color {
+        Box::new(|p| format!("[{}]", p).normal())
+    } else {
+        Box::new(|p| format!("[{}]", p).bold())
+    };
+
+    let mut stats = stats::CommandStats::new();
+
+    while let Some(MonitorMessage { prefix, line, .. }) = rx.recv().await {
+        if opt.db.is_none() && filter.is_empty() {
+            println!("{} {}", format_prefix(&prefix), line);
+            continue;
         }
-    });
 
-    while let Some((mut instance, msg)) = streams.next().await {
-        let line = match Line::from_line(&msg, false) {
+        let parsed = match Line::from_line(&line, false) {
             Ok((_, line)) => line,
             Err(e) => {
-                eprintln!("Failed to parse line: {e:?} <- input: {msg:?}");
+                eprintln!("Failed to parse line: {e:?} <- input: {line:?}");
                 continue;
             }
         };
 
-        instance.incr_stats(line.cmd, msg.len());
+        stats.incr(parsed.cmd, line.len());
 
-        if matches!(opt.db, Some(db) if db != line.db)
-            || filter.filter(line.cmd)
+        if matches!(opt.db, Some(db) if db != parsed.db)
+            || filter.filter(parsed.cmd)
         {
             continue;
         }
 
-        if opt.json {
-            let json = serde_json::to_string(&line).unwrap_or_else(|_| {
-                panic!("Failed to serialize line to JSON: {line:?}")
-            });
-            println!("{json}");
-        } else if opt.no_color {
-            println!("{} {msg}", instance.fmt_str());
-        } else {
-            let msg = if let Some(color) = instance.get_color() {
-                msg.color(color).to_string()
-            } else {
-                msg
-            };
-
-            let hdr = instance.fmt_str().bold();
-            println!("{hdr} {msg}");
-        }
+        println!("{} {}", format_prefix(&prefix), line);
     }
 
-    println!("{}", "Exiting...".green().bold());
+    //let filter = Filter::from_args(
+    //    opt.include.unwrap_or_default().to_vec(),
+    //    opt.exclude.unwrap_or_default().to_vec(),
+    //);
+
+    //let mut reader = BufReader::new(tokio::io::stdin());
+    //task::spawn(async move {
+    //    let mut input = String::new();
+    //    while reader.read_line(&mut input).await.is_ok() {
+    //        println!("Input: {input}");
+    //        if input.to_lowercase().starts_with("quit") {
+    //            println!("Quit detected, exiting.");
+    //            std::process::exit(0);
+    //        }
+    //        input.truncate(0);
+    //    }
+    //});
+
+    //while let Some((mut instance, msg)) = streams.next().await {
+    //    let line = match Line::from_line(&msg, false) {
+    //        Ok((_, line)) => line,
+    //        Err(e) => {
+    //            eprintln!("Failed to parse line: {e:?} <- input: {msg:?}");
+    //            continue;
+    //        }
+    //    };
+
+    //    instance.incr_stats(line.cmd, msg.len());
+
+    //    if matches!(opt.db, Some(db) if db != line.db)
+    //        || filter.filter(line.cmd)
+    //    {
+    //        continue;
+    //    }
+
+    //    if opt.json {
+    //        let json = serde_json::to_string(&line).unwrap_or_else(|_| {
+    //            panic!("Failed to serialize line to JSON: {line:?}")
+    //        });
+    //        println!("{json}");
+    //    } else if opt.no_color {
+    //        println!("{} {msg}", instance.fmt_str());
+    //    } else {
+    //        let msg = if let Some(color) = instance.get_color() {
+    //            msg.color(color).to_string()
+    //        } else {
+    //            msg
+    //        };
+
+    //        let hdr = instance.fmt_str().bold();
+    //        println!("{hdr} {msg}");
+    //    }
+    //}
+
+    //println!("{}", "Exiting...".green().bold());
 
     Ok(())
 }

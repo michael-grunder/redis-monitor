@@ -1,12 +1,11 @@
 use crate::{
-    config::{Entry, RedisAuth},
-    connection::{Cluster, GetHost, GetPort, RedisAddr},
-    stats::Map as CommandStats,
+    config::{Entry, ServerAuth},
+    connection::{Cluster, GetHost, GetPort, ServerAddr},
+    stats::CommandStats,
 };
 use colored::Color;
 use serde::Serialize;
 use std::{
-    borrow::Cow,
     hash::Hash,
     net::{IpAddr, Ipv4Addr},
 };
@@ -266,159 +265,5 @@ impl<'a> ClientAddr<'a> {
 
     pub const fn from_addr(addr: IpAddr, port: u16) -> Self {
         Self::Tcp((addr, port))
-    }
-}
-
-#[derive(Clone)]
-pub struct Instance {
-    // The name this instance belongs to (if it's from our config.toml)
-    name: Option<String>,
-
-    // The address itself
-    addr: RedisAddr,
-
-    auth: RedisAuth,
-
-    // Format string (defaults to {host}:{port}
-    fmt: String,
-
-    color: Option<Color>,
-
-    stats: CommandStats,
-}
-
-impl Hash for Instance {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.addr.hash(state);
-    }
-}
-
-impl PartialEq for Instance {
-    fn eq(&self, other: &Self) -> bool {
-        self.addr == other.addr
-    }
-}
-
-impl Eq for Instance {}
-
-impl Instance {
-    fn make_fmt_string(
-        name: Option<&String>,
-        addr: &RedisAddr,
-        fmt: &str,
-    ) -> String {
-        let mut fmt = fmt.to_owned();
-
-        let vars: &[(&'static str, Option<String>)] = &[
-            ("{host}", Some(addr.get_host().to_string())),
-            ("{port}", addr.get_port().map(|p| p.to_string())),
-            ("{name}", name.map(|n| n.to_string())),
-        ];
-
-        for (var, value) in vars {
-            if let Some(v) = value {
-                fmt = fmt.replace(var, v);
-            }
-        }
-
-        fmt
-    }
-
-    pub fn new(
-        name: Option<String>,
-        addr: RedisAddr,
-        auth: RedisAuth,
-        color: Option<Color>,
-        fmt: Option<String>,
-    ) -> Self {
-        let fmt = Self::make_fmt_string(
-            name.as_ref(),
-            &addr,
-            &fmt.unwrap_or_else(|| "{host}:{port}".into()),
-        );
-
-        Self {
-            name,
-            addr,
-            auth,
-            color,
-            stats: CommandStats::new(),
-            fmt,
-        }
-    }
-
-    //pub fn from_cluster_seeds(
-    //    addresses: &[RedisAddr],
-    //) -> anyhow::Result<Vec<Self>> {
-    //    for address in addresses {
-    //        let cluster = Cluster::from_seeds(&[address.clone()])?;
-    //    }
-    //    let cluster = Cluster::from_seeds(addresses)?;
-    //    Ok(vec![])
-    //}
-
-    pub fn from_config_entry(name: &str, entry: &Entry) -> Vec<Self> {
-        if entry.cluster {
-            let c = Cluster::from_seeds(&entry.get_addresses())
-                .expect("Can't get cluster nodes");
-            c.get_nodes()
-                .iter()
-                .map(|primary| {
-                    Self::new(
-                        Some(name.to_owned()),
-                        primary.addr.clone(),
-                        entry.get_auth(),
-                        entry.get_color(),
-                        entry.format.clone(),
-                    )
-                })
-                .collect()
-        } else {
-            entry
-                .get_addresses()
-                .iter()
-                .map(|addr| {
-                    Self::new(
-                        Some(name.to_owned()),
-                        addr.to_owned(),
-                        entry.get_auth(),
-                        entry.get_color(),
-                        entry.format.clone(),
-                    )
-                })
-                .collect()
-        }
-    }
-
-    #[allow(clippy::missing_const_for_fn)]
-    pub fn fmt_str(&self) -> &str {
-        &self.fmt
-    }
-
-    pub const fn get_color(&self) -> Option<Color> {
-        self.color
-    }
-
-    pub fn get_url_string(&self) -> String {
-        self.addr.get_url_string()
-    }
-
-    pub fn incr_stats(&mut self, cmd: &str, bytes: usize) {
-        self.stats.incr(cmd, bytes);
-    }
-
-    pub const fn get_auth(&self) -> &RedisAuth {
-        &self.auth
-    }
-}
-
-impl From<RedisAddr> for Instance {
-    fn from(addr: RedisAddr) -> Self {
-        let fmt = match addr {
-            RedisAddr::Tcp(_, _) => "{host}:{port}",
-            RedisAddr::Unix(_) => "{host}",
-        };
-
-        Self::new(None, addr, RedisAuth::default(), None, Some(fmt.to_owned()))
     }
 }
