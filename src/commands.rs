@@ -31,10 +31,7 @@ impl Command {
             redis::Value::Array(values) => values
                 .iter()
                 .filter_map(|v| match v {
-                    redis::Value::SimpleString(bytes) => {
-                        Some(bytes.clone())
-                        //                        String::from_utf8(bytes.clone()).ok()
-                    }
+                    redis::Value::SimpleString(bytes) => Some(bytes.clone()),
                     _ => None,
                 })
                 .collect(),

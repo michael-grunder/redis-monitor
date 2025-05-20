@@ -16,6 +16,7 @@ futures = "0.3.31"
 lazy_static = "1.5.0"
 nom = "8.0.0"
 prettytable-rs = "0.10.0"
+rand = "0.9.1"
 redis = { version = "0.31.0", features = ["tls", "tokio-native-tls-comp", "aio", "connection-manager", "tokio-comp"] }
 regex = "1.11.1"
 serde = { version = "1.0.219", features = ["derive"] }

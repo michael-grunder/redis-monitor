@@ -1,14 +1,5 @@
-use crate::{
-    config::{Entry, ServerAuth},
-    connection::{Cluster, GetHost, GetPort, ServerAddr},
-    stats::CommandStats,
-};
-use colored::Color;
 use serde::Serialize;
-use std::{
-    hash::Hash,
-    net::{IpAddr, Ipv4Addr},
-};
+use std::net::{IpAddr, Ipv4Addr};
 
 use nom::{
     Err, IResult, Parser,

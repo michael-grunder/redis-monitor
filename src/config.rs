@@ -2,7 +2,7 @@ use crate::connection::ServerAddr;
 use anyhow::{Context, Result, bail};
 use colored::Color;
 use config::{Config, File, FileFormat};
-use redis::{Cmd, cmd};
+use redis::cmd;
 
 use serde::{Deserialize, Deserializer, de};
 use std::{

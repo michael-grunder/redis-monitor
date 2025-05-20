@@ -1,4 +1,4 @@
-use crate::{ServerAuth, config::Entry, stats::CommandStats};
+use crate::{ServerAuth, config::Entry};
 use anyhow::{Context, Result, anyhow};
 use colored::Color;
 use redis::{Client, Connection, Value};
@@ -10,8 +10,6 @@ use std::{
     io::Write,
     pin::Pin,
     str::FromStr,
-    sync::Arc,
-    time::Instant,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
@@ -28,13 +26,10 @@ pub enum Stream {
 
 #[derive(Debug, Clone)]
 pub struct Monitor {
-    pub name: Option<String>,
     pub address: ServerAddr,
     pub auth: ServerAuth,
     pub color: Option<Color>,
     pub format: String,
-    stats: CommandStats,
-    pub last_reconnect: Option<Instant>,
 }
 
 #[derive(Debug, Eq, Clone)]
@@ -451,13 +446,10 @@ impl Monitor {
         );
 
         Self {
-            name,
             address,
             auth,
             color,
-            stats: CommandStats::new(),
             format,
-            last_reconnect: None,
         }
     }
 

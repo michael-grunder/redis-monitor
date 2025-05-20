@@ -10,9 +10,10 @@ use crate::{
 };
 use anyhow::Result;
 use clap::Parser;
-use colored::{ColoredString, Colorize};
+use colored::{Color, ColoredString, Colorize};
 use connection::ServerAddr;
 use futures::stream::FuturesUnordered;
+use rand::{Rng, rng};
 use serde::{Deserialize, Deserializer, de};
 use std::{
     collections::HashSet, convert::From, default::Default, str::FromStr,
@@ -24,7 +25,7 @@ use tokio::{
     time::{Duration, sleep},
 };
 
-mod commands;
+//mod commands;
 mod config;
 mod connection;
 mod filter;
@@ -190,23 +191,52 @@ fn process_instances(
 }
 
 #[derive(Debug)]
+struct RetryBackoff {
+    attempt: u32,
+    max_delay: Duration,
+}
+
+#[derive(Debug)]
 pub struct MonitorMessage {
     pub prefix: Arc<str>,
     pub address: Arc<ServerAddr>,
+    pub color: Arc<Option<Color>>,
     line: String,
+}
+
+impl RetryBackoff {
+    const MIN_DELAY: Duration = Duration::from_millis(50);
+    const MAX_DELAY: Duration = Duration::from_secs(1);
+
+    fn new() -> Self {
+        Self {
+            attempt: 0,
+            max_delay: Self::MAX_DELAY,
+        }
+    }
+
+    fn delay(&mut self) -> Duration {
+        let mut rng = rng();
+
+        self.attempt += 1;
+        let delay_ms = (Self::MIN_DELAY.as_millis()
+            << self.attempt.min(6) + rng.random_range(0..100))
+            as u64;
+
+        Duration::from_millis(delay_ms.min(self.max_delay.as_millis() as u64))
+    }
 }
 
 async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
     let prefix: Arc<str> = Arc::from(mon.format.clone());
     let address = Arc::new(mon.address.clone());
+    let color = Arc::new(mon.color.clone());
 
-    let mut informed = false;
+    let mut backoff = RetryBackoff::new();
 
     loop {
         match mon.clone().connect().await {
             Ok((_, mut reader)) => {
-                informed = false;
-
                 let mut line = String::new();
                 loop {
                     line.clear();
@@ -216,6 +246,7 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
                             let msg = MonitorMessage {
                                 prefix: prefix.clone(),
                                 address: address.clone(),
+                                color: color.clone(),
                                 line: line[1..].trim_end().to_string(),
                             };
                             if tx.send(msg).await.is_err() {
@@ -230,14 +261,13 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
                 }
             }
             Err(e) => {
-                if !informed {
+                if backoff.attempt == 0 {
                     eprintln!("[{prefix}] Error connecting {e}");
-                    informed = true;
                 }
             }
         }
 
-        sleep(Duration::from_millis(100)).await;
+        sleep(backoff.delay()).await;
     }
 }
 
@@ -305,62 +335,6 @@ async fn main() -> Result<()> {
 
         println!("{} {}", format_prefix(&prefix), line);
     }
-
-    //let filter = Filter::from_args(
-    //    opt.include.unwrap_or_default().to_vec(),
-    //    opt.exclude.unwrap_or_default().to_vec(),
-    //);
-
-    //let mut reader = BufReader::new(tokio::io::stdin());
-    //task::spawn(async move {
-    //    let mut input = String::new();
-    //    while reader.read_line(&mut input).await.is_ok() {
-    //        println!("Input: {input}");
-    //        if input.to_lowercase().starts_with("quit") {
-    //            println!("Quit detected, exiting.");
-    //            std::process::exit(0);
-    //        }
-    //        input.truncate(0);
-    //    }
-    //});
-
-    //while let Some((mut instance, msg)) = streams.next().await {
-    //    let line = match Line::from_line(&msg, false) {
-    //        Ok((_, line)) => line,
-    //        Err(e) => {
-    //            eprintln!("Failed to parse line: {e:?} <- input: {msg:?}");
-    //            continue;
-    //        }
-    //    };
-
-    //    instance.incr_stats(line.cmd, msg.len());
-
-    //    if matches!(opt.db, Some(db) if db != line.db)
-    //        || filter.filter(line.cmd)
-    //    {
-    //        continue;
-    //    }
-
-    //    if opt.json {
-    //        let json = serde_json::to_string(&line).unwrap_or_else(|_| {
-    //            panic!("Failed to serialize line to JSON: {line:?}")
-    //        });
-    //        println!("{json}");
-    //    } else if opt.no_color {
-    //        println!("{} {msg}", instance.fmt_str());
-    //    } else {
-    //        let msg = if let Some(color) = instance.get_color() {
-    //            msg.color(color).to_string()
-    //        } else {
-    //            msg
-    //        };
-
-    //        let hdr = instance.fmt_str().bold();
-    //        println!("{hdr} {msg}");
-    //    }
-    //}
-
-    //println!("{}", "Exiting...".green().bold());
 
     Ok(())
 }
