@@ -16,8 +16,8 @@ use futures::stream::FuturesUnordered;
 use rand::{Rng, rng};
 use serde::{Deserialize, Deserializer, de};
 use std::{
-    collections::HashSet, convert::From, default::Default, str::FromStr,
-    sync::Arc,
+    collections::HashSet, convert::From, default::Default, path::PathBuf,
+    str::FromStr, sync::Arc,
 };
 use tokio::{
     io::AsyncBufReadExt,
@@ -72,6 +72,21 @@ struct Options {
 
     #[arg(short, long, help = "Output in JSON format")]
     json: bool,
+
+    #[arg(long, help = "Connect using TLS")]
+    tls: bool,
+
+    #[arg(long, help = "Disable TLS certificate verification")]
+    insecure: bool,
+
+    #[arg(long, help = "Path to CA cert for TLS")]
+    tls_ca: Option<PathBuf>,
+
+    #[arg(long, help = "Path to client cert for TLS")]
+    tls_cert: Option<PathBuf>,
+
+    #[arg(long, help = "Path to client private key for TLS")]
+    tls_key: Option<PathBuf>,
 
     pub instances: Vec<String>,
 }
@@ -159,12 +174,8 @@ fn process_cluster_instances(opt: &Options, auth: &ServerAuth) -> Vec<Monitor> {
 // them to one ore more instances. These can either be named instances like
 // mycluster` which were loaded from our config file, or be in some parsable
 // form like "host:port", or "redis://...".
-fn process_instances(
-    cfg: &Map,
-    instances: &[String],
-    format: &Option<String>,
-) -> Vec<Monitor> {
-    instances
+fn process_instances(cfg: &Map, opt: &Options) -> Vec<Monitor> {
+    opt.instances
         .iter()
         .flat_map(|inst| {
             cfg.get(inst).map_or_else(
@@ -177,7 +188,7 @@ fn process_instances(
                         },
                         |addr| {
                             let mut addr: Monitor = addr.into();
-                            if let Some(format) = format {
+                            if let Some(format) = &opt.format {
                                 addr.format = format.clone();
                             }
                             vec![addr]
@@ -287,7 +298,7 @@ async fn main() -> Result<()> {
     let seeds = if opt.cluster {
         process_cluster_instances(&opt, &auth)
     } else {
-        process_instances(&cfg, &opt.instances, &opt.format)
+        process_instances(&cfg, &opt)
     };
 
     let (tx, mut rx) = mpsc::channel::<MonitorMessage>(1000);

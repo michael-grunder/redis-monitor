@@ -6,8 +6,10 @@ use serde::{Deserialize, Deserializer, de};
 use std::{
     collections::HashSet,
     convert::AsRef,
+    fs,
     hash::{Hash, Hasher},
-    io::Write,
+    io::{Cursor, Write},
+    path::{Path, PathBuf},
     pin::Pin,
     str::FromStr,
 };
@@ -15,13 +17,28 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpStream, UnixStream},
 };
-use tokio_rustls::client::TlsStream as TokioTlsStream;
+use tokio_rustls::{
+    TlsConnector, TlsStream, client::TlsStream as TokioTlsStream,
+};
+
+use rustls::{
+    ClientConfig, RootCertStore,
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName},
+};
 
 #[derive(Debug)]
 pub enum Stream {
     Tcp(TcpStream),
     Tls(TokioTlsStream<TcpStream>),
     Unix(UnixStream),
+}
+
+#[derive(Debug)]
+pub struct TlsConfig {
+    pub insecure: bool,
+    pub ca: Option<Vec<CertificateDer<'static>>>,
+    pub cert: Option<CertificateDer<'static>>,
+    pub key: Option<PrivateKeyDer<'static>>,
 }
 
 #[derive(Debug, Clone)]
@@ -490,15 +507,6 @@ impl Monitor {
         }
     }
 
-    //async fn read_line(s: &mut Stream) -> Result<String> {
-    //    let mut buf = Vec::new();
-    //    tokio::io::AsyncReadExt::read_to_end(s, &mut buf).await?;
-    //    let line =
-    //        String::from_utf8(buf).context("Failed to convert to UTF-8")?;
-
-    //    Ok(line[1..].to_string())
-    //}
-
     async fn try_auth(auth: &ServerAuth, s: &mut Stream) -> Result<()> {
         let resp = match (&auth.user, &auth.pass) {
             (Some(user), Some(pass)) => {
@@ -561,5 +569,63 @@ impl From<ServerAddr> for Monitor {
             None,
             Some(fmt.to_owned()),
         )
+    }
+}
+
+impl TlsConfig {
+    fn load_ca(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+        let buf = fs::read(&path)
+            .with_context(|| format!("Failed to read CA file: {path:?}"))?;
+
+        let mut c = Cursor::new(buf);
+        let parsed = rustls_pemfile::certs(&mut c)
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to parse CA certs")?;
+
+        Ok(parsed
+            .into_iter()
+            .map(CertificateDer::from)
+            .collect::<Vec<_>>())
+    }
+
+    fn load_cert(path: &Path) -> Result<CertificateDer<'static>> {
+        let buf = fs::read(&path)
+            .with_context(|| format!("Failed to read cert file: {path:?}"))?;
+
+        let mut c = Cursor::new(buf);
+        let parsed = rustls_pemfile::certs(&mut c)
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to parse cert")?;
+
+        Ok(CertificateDer::from(parsed[0].clone()))
+    }
+
+    fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
+        let buf = fs::read(&path)
+            .with_context(|| format!("Failed to read key file: {path:?}"))?;
+
+        let key = rustls_pemfile::private_key(&mut &buf[..])
+            .context("Failed to parse private key")?
+            .ok_or_else(|| anyhow!("No private key found in file: {path:?}"))?;
+
+        Ok(key)
+    }
+
+    pub fn new(
+        insecure: bool,
+        ca: Option<PathBuf>,
+        cert: Option<PathBuf>,
+        key: Option<PathBuf>,
+    ) -> Result<Self> {
+        let ca = ca.as_ref().map(|p| Self::load_ca(p)).transpose()?;
+        let cert = cert.as_ref().map(|p| Self::load_cert(p)).transpose()?;
+        let key = key.as_ref().map(|p| Self::load_key(p)).transpose()?;
+
+        Ok(Self {
+            insecure,
+            ca,
+            cert,
+            key,
+        })
     }
 }
