@@ -2,20 +2,12 @@ use crate::{ServerAuth, config::Entry};
 use anyhow::{Context, Result, anyhow};
 use colored::Color;
 use redis::{Client, Connection, Value};
-
-//use rustls::client::ServerCertVerifier;
-use rustls::client::WebPkiServerVerifier;
-use rustls::client::danger::{
-    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-};
-use rustls::pki_types::UnixTime;
-use rustls::server::WebPkiClientVerifier;
-
+use rustls::client::danger::ServerCertVerifier;
 use rustls::{
-    ClientConfig, Error, RootCertStore,
+    ClientConfig, RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer, ServerName},
 };
-use rustls::{DigitallySignedStruct, SignatureScheme};
+
 use serde::{Deserialize, Deserializer, de};
 use std::{
     collections::HashSet,
@@ -23,19 +15,16 @@ use std::{
     fs,
     hash::{Hash, Hasher},
     io::{Cursor, Write},
-    path::{Path, PathBuf},
+    path::Path,
     pin::Pin,
     str::FromStr,
     sync::Arc,
-    time::SystemTime,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpStream, UnixStream},
 };
-use tokio_rustls::{
-    TlsConnector, TlsStream, client::TlsStream as ClientTlsStream,
-};
+use tokio_rustls::{TlsConnector, client::TlsStream as ClientTlsStream};
 
 #[derive(Debug)]
 pub enum Stream {
@@ -652,68 +641,16 @@ impl TlsConfig {
             }
         }
 
-        let verifier: Arc<dyn ServerCertVerifier> = if self.insecure {
-            #[derive(Debug)]
-            struct NoVerifier;
+        let config =
+            ClientConfig::builder().with_root_certificates(root_cert_store);
 
-            impl ServerCertVerifier for NoVerifier {
-                fn verify_server_cert(
-                    &self,
-                    _end_entity: &CertificateDer<'_>,
-                    _intermediates: &[CertificateDer<'_>],
-                    _server_name: &ServerName,
-                    _ocsp_response: &[u8],
-                    _now: UnixTime,
-                ) -> Result<ServerCertVerified, rustls::Error> {
-                    Ok(ServerCertVerified::assertion())
-                }
-
-                fn verify_tls12_signature(
-                    &self,
-                    _message: &[u8],
-                    _cert: &CertificateDer<'_>,
-                    _dss: &DigitallySignedStruct,
-                ) -> Result<HandshakeSignatureValid, Error> {
-                    Ok(HandshakeSignatureValid::assertion())
-                }
-
-                fn verify_tls13_signature(
-                    &self,
-                    _message: &[u8],
-                    _cert: &CertificateDer<'_>,
-                    _dss: &DigitallySignedStruct,
-                ) -> Result<HandshakeSignatureValid, Error> {
-                    Ok(HandshakeSignatureValid::assertion())
-                }
-
-                fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-                    vec![
-                        SignatureScheme::RSA_PKCS1_SHA1,
-                        SignatureScheme::ECDSA_SHA1_Legacy,
-                        SignatureScheme::RSA_PKCS1_SHA256,
-                        SignatureScheme::ECDSA_NISTP256_SHA256,
-                        SignatureScheme::RSA_PKCS1_SHA384,
-                        SignatureScheme::ECDSA_NISTP384_SHA384,
-                        SignatureScheme::RSA_PKCS1_SHA512,
-                        SignatureScheme::ECDSA_NISTP521_SHA512,
-                        SignatureScheme::RSA_PSS_SHA256,
-                        SignatureScheme::RSA_PSS_SHA384,
-                        SignatureScheme::RSA_PSS_SHA512,
-                        SignatureScheme::ED25519,
-                        SignatureScheme::ED448,
-                    ]
-                }
-            }
-            Arc::new(NoVerifier)
+        let config = if let (Some(cert), Some(key)) = (&self.cert, &self.key) {
+            config
+                .with_client_auth_cert(vec![cert.clone()], key.clone_key())
+                .context("Failed to set client authentication")?
         } else {
-            WebPkiServerVerifier::builder(Arc::new(root_cert_store.clone()))
-                .build()
-                .expect("Failed to build WebPkiServerVerifier")
+            config.with_no_client_auth()
         };
-
-        let config = ClientConfig::builder()
-            .with_root_certificates(root_cert_store)
-            .with_no_client_auth();
 
         let connector = TlsConnector::from(Arc::new(config));
         let server_name =
@@ -742,5 +679,50 @@ impl TlsConfig {
             cert,
             key,
         })
+    }
+}
+
+#[derive(Debug)]
+struct NoVerifier;
+
+impl ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+    {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+    {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::ED25519,
+        ]
     }
 }
