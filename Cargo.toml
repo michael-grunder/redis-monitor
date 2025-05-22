@@ -20,6 +20,7 @@ rand = "0.9.1"
 redis = { version = "0.31.0", features = ["tls", "tokio-native-tls-comp", "aio", "connection-manager", "tokio-comp"] }
 regex = "1.11.1"
 rustls = "0.23.27"
+rustls-native-certs = "0.8.1"
 rustls-pemfile = "2.2.0"
 serde = { version = "1.0.219", features = ["derive"] }
 serde-redis = "0.14.0"

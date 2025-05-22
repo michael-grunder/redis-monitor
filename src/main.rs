@@ -11,7 +11,7 @@ use crate::{
 use anyhow::Result;
 use clap::Parser;
 use colored::{Color, ColoredString, Colorize};
-use connection::ServerAddr;
+use connection::{ServerAddr, TlsConfig};
 use futures::stream::FuturesUnordered;
 use rand::{Rng, rng};
 use serde::{Deserialize, Deserializer, de};
@@ -129,7 +129,11 @@ impl<'de> Deserialize<'de> for CsvArgument {
 // Treat each instnace as a potential cluster seed. This means that if more than
 // one seeds of the same cluster are passed we may map the same keyspace more than
 // once. This is fine, but we should be aware of it.
-fn process_cluster_instances(opt: &Options, auth: &ServerAuth) -> Vec<Monitor> {
+fn process_cluster_instances(
+    opt: &Options,
+    tls: Option<Arc<TlsConfig>>,
+    auth: &ServerAuth,
+) -> Vec<Monitor> {
     // First make sure we can turn them all into RedisAddr
     let addresses = opt.instances.iter().map(|i| {
         ServerAddr::from_str(i).unwrap_or_else(|_| {
@@ -157,6 +161,7 @@ fn process_cluster_instances(opt: &Options, auth: &ServerAuth) -> Vec<Monitor> {
                         Monitor::new(
                             Some(n.id.clone()),
                             n.addr.clone(),
+                            tls.clone(),
                             auth.clone(),
                             None,
                             opt.format.clone(),
@@ -174,7 +179,12 @@ fn process_cluster_instances(opt: &Options, auth: &ServerAuth) -> Vec<Monitor> {
 // them to one ore more instances. These can either be named instances like
 // mycluster` which were loaded from our config file, or be in some parsable
 // form like "host:port", or "redis://...".
-fn process_instances(cfg: &Map, opt: &Options) -> Vec<Monitor> {
+fn process_instances(
+    cfg: &Map,
+    opt: &Options,
+    tls: Option<Arc<TlsConfig>>,
+    auth: &ServerAuth,
+) -> Vec<Monitor> {
     opt.instances
         .iter()
         .flat_map(|inst| {
@@ -187,11 +197,16 @@ fn process_instances(cfg: &Map, opt: &Options) -> Vec<Monitor> {
                         );
                         },
                         |addr| {
-                            let mut addr: Monitor = addr.into();
-                            if let Some(format) = &opt.format {
-                                addr.format = format.clone();
-                            }
-                            vec![addr]
+                            let monitor = Monitor::new(
+                                None,
+                                addr.clone(),
+                                tls.clone(),
+                                auth.clone(),
+                                None,
+                                opt.format.clone(),
+                            );
+
+                            vec![monitor]
                         }
                     )
                 },
@@ -292,13 +307,26 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    let tls = if opt.tls {
+        let tls_cfg = TlsConfig::new(
+            opt.insecure,
+            opt.tls_ca.as_deref(),
+            opt.tls_cert.as_deref(),
+            opt.tls_key.as_deref(),
+        )?;
+
+        Some(Arc::new(tls_cfg))
+    } else {
+        None
+    };
+
     let auth =
         ServerAuth::from_user_pass(opt.user.as_deref(), opt.pass.as_deref());
 
     let seeds = if opt.cluster {
-        process_cluster_instances(&opt, &auth)
+        process_cluster_instances(&opt, tls, &auth)
     } else {
-        process_instances(&cfg, &opt)
+        process_instances(&cfg, &opt, tls, &auth)
     };
 
     let (tx, mut rx) = mpsc::channel::<MonitorMessage>(1000);

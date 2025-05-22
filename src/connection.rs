@@ -2,6 +2,20 @@ use crate::{ServerAuth, config::Entry};
 use anyhow::{Context, Result, anyhow};
 use colored::Color;
 use redis::{Client, Connection, Value};
+
+//use rustls::client::ServerCertVerifier;
+use rustls::client::WebPkiServerVerifier;
+use rustls::client::danger::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+};
+use rustls::pki_types::UnixTime;
+use rustls::server::WebPkiClientVerifier;
+
+use rustls::{
+    ClientConfig, Error, RootCertStore,
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName},
+};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use serde::{Deserialize, Deserializer, de};
 use std::{
     collections::HashSet,
@@ -12,24 +26,21 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     str::FromStr,
+    sync::Arc,
+    time::SystemTime,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpStream, UnixStream},
 };
 use tokio_rustls::{
-    TlsConnector, TlsStream, client::TlsStream as TokioTlsStream,
-};
-
-use rustls::{
-    ClientConfig, RootCertStore,
-    pki_types::{CertificateDer, PrivateKeyDer, ServerName},
+    TlsConnector, TlsStream, client::TlsStream as ClientTlsStream,
 };
 
 #[derive(Debug)]
 pub enum Stream {
     Tcp(TcpStream),
-    Tls(TokioTlsStream<TcpStream>),
+    Tls(ClientTlsStream<TcpStream>),
     Unix(UnixStream),
 }
 
@@ -44,6 +55,7 @@ pub struct TlsConfig {
 #[derive(Debug, Clone)]
 pub struct Monitor {
     pub address: ServerAddr,
+    pub tls: Option<Arc<TlsConfig>>,
     pub auth: ServerAuth,
     pub color: Option<Color>,
     pub format: String,
@@ -403,6 +415,7 @@ impl Monitor {
                     Self::new(
                         Some(name.to_owned()),
                         primary.addr.clone(),
+                        None, // TODO: TLS config
                         entry.get_auth(),
                         entry.get_color(),
                         entry.format.clone(),
@@ -417,6 +430,7 @@ impl Monitor {
                     Self::new(
                         Some(name.to_owned()),
                         addr.to_owned(),
+                        None, // TODO: TLS config
                         entry.get_auth(),
                         entry.get_color(),
                         entry.format.clone(),
@@ -452,6 +466,7 @@ impl Monitor {
     pub fn new(
         name: Option<String>,
         address: ServerAddr,
+        tls: Option<Arc<TlsConfig>>,
         auth: ServerAuth,
         color: Option<Color>,
         format: Option<String>,
@@ -464,6 +479,7 @@ impl Monitor {
 
         Self {
             address,
+            tls,
             auth,
             color,
             format,
@@ -535,7 +551,15 @@ impl Monitor {
         let mut stream = match &self.address {
             ServerAddr::Tcp(host, port) => {
                 let stream = TcpStream::connect((host.as_str(), *port)).await?;
-                Stream::Tcp(stream)
+
+                if let Some(tls_config) = &self.tls {
+                    let tls_stream =
+                        TlsConfig::initialize_tls(stream, host, tls_config)
+                            .await?;
+                    Stream::Tls(tls_stream)
+                } else {
+                    Stream::Tcp(stream)
+                }
             }
             ServerAddr::Unix(path) => {
                 let stream = UnixStream::connect(path).await?;
@@ -552,23 +576,6 @@ impl Monitor {
             .context("Failed to send MONITOR command")?;
 
         Ok((self, BufReader::new(stream)))
-    }
-}
-
-impl From<ServerAddr> for Monitor {
-    fn from(addr: ServerAddr) -> Self {
-        let fmt = match addr {
-            ServerAddr::Tcp(_, _) => "{host}:{port}",
-            ServerAddr::Unix(_) => "{host}",
-        };
-
-        Self::new(
-            None,
-            addr,
-            ServerAuth::default(),
-            None,
-            Some(fmt.to_owned()),
-        )
     }
 }
 
@@ -611,11 +618,121 @@ impl TlsConfig {
         Ok(key)
     }
 
+    pub async fn initialize_tls(
+        stream: TcpStream,
+        host: &str,
+        tls_config: &Arc<TlsConfig>,
+    ) -> Result<ClientTlsStream<TcpStream>> {
+        let mut root_cert_store = RootCertStore::empty();
+
+        if let Some(ca_certs) = &tls_config.ca {
+            for cert in ca_certs {
+                root_cert_store
+                    .add(cert.clone())
+                    .context("Failed to add CA certificate")?;
+            }
+        } else if !tls_config.insecure {
+            let native_certs = rustls_native_certs::load_native_certs();
+
+            if !native_certs.errors.is_empty() {
+                let error_messages: Vec<String> = native_certs
+                    .errors
+                    .into_iter()
+                    .map(|e| e.to_string())
+                    .collect();
+                let error_summary = error_messages.join("; ");
+                return Err(anyhow!(
+                    "Failed to load some system certificates: {}",
+                    error_summary
+                ));
+            }
+
+            for cert in native_certs.certs {
+                root_cert_store
+                    .add(cert)
+                    .context("Failed to add native certificate")?;
+            }
+        }
+
+        let verifier: Arc<dyn ServerCertVerifier> = if tls_config.insecure {
+            #[derive(Debug)]
+            struct NoVerifier;
+
+            impl ServerCertVerifier for NoVerifier {
+                fn verify_server_cert(
+                    &self,
+                    _end_entity: &CertificateDer<'_>,
+                    _intermediates: &[CertificateDer<'_>],
+                    _server_name: &ServerName,
+                    _ocsp_response: &[u8],
+                    _now: UnixTime,
+                ) -> Result<ServerCertVerified, rustls::Error> {
+                    Ok(ServerCertVerified::assertion())
+                }
+
+                fn verify_tls12_signature(
+                    &self,
+                    _message: &[u8],
+                    _cert: &CertificateDer<'_>,
+                    _dss: &DigitallySignedStruct,
+                ) -> Result<HandshakeSignatureValid, Error> {
+                    Ok(HandshakeSignatureValid::assertion())
+                }
+
+                fn verify_tls13_signature(
+                    &self,
+                    _message: &[u8],
+                    _cert: &CertificateDer<'_>,
+                    _dss: &DigitallySignedStruct,
+                ) -> Result<HandshakeSignatureValid, Error> {
+                    Ok(HandshakeSignatureValid::assertion())
+                }
+
+                fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                    vec![
+                        SignatureScheme::RSA_PKCS1_SHA1,
+                        SignatureScheme::ECDSA_SHA1_Legacy,
+                        SignatureScheme::RSA_PKCS1_SHA256,
+                        SignatureScheme::ECDSA_NISTP256_SHA256,
+                        SignatureScheme::RSA_PKCS1_SHA384,
+                        SignatureScheme::ECDSA_NISTP384_SHA384,
+                        SignatureScheme::RSA_PKCS1_SHA512,
+                        SignatureScheme::ECDSA_NISTP521_SHA512,
+                        SignatureScheme::RSA_PSS_SHA256,
+                        SignatureScheme::RSA_PSS_SHA384,
+                        SignatureScheme::RSA_PSS_SHA512,
+                        SignatureScheme::ED25519,
+                        SignatureScheme::ED448,
+                    ]
+                }
+            }
+            Arc::new(NoVerifier)
+        } else {
+            WebPkiServerVerifier::builder(Arc::new(root_cert_store.clone()))
+                .build()
+                .expect("Failed to build WebPkiServerVerifier")
+        };
+
+        let config = ClientConfig::builder()
+            .with_root_certificates(root_cert_store)
+            .with_no_client_auth();
+
+        let connector = TlsConnector::from(Arc::new(config));
+        let server_name =
+            ServerName::try_from(host).context("Invalid DNS name")?;
+        let tls_stream = connector
+            .connect(server_name.to_owned(), stream)
+            .await
+            .context("TLS handshake failed")?;
+
+        Ok(tls_stream)
+    }
+
     pub fn new(
         insecure: bool,
-        ca: Option<PathBuf>,
-        cert: Option<PathBuf>,
-        key: Option<PathBuf>,
+        ca: Option<&Path>,
+        cert: Option<&Path>,
+        key: Option<&Path>,
     ) -> Result<Self> {
         let ca = ca.as_ref().map(|p| Self::load_ca(p)).transpose()?;
         let cert = cert.as_ref().map(|p| Self::load_cert(p)).transpose()?;
