@@ -610,46 +610,54 @@ impl TlsConfig {
         stream: TcpStream,
         host: &str,
     ) -> Result<ClientTlsStream<TcpStream>> {
-        let mut root_cert_store = RootCertStore::empty();
-
-        if let Some(ca_certs) = &self.ca {
-            for cert in ca_certs {
-                root_cert_store
-                    .add(cert.clone())
-                    .context("Failed to add CA certificate")?;
-            }
-        } else if !self.insecure {
-            let native_certs = rustls_native_certs::load_native_certs();
-
-            if !native_certs.errors.is_empty() {
-                let error_messages: Vec<String> = native_certs
-                    .errors
-                    .into_iter()
-                    .map(|e| e.to_string())
-                    .collect();
-                let error_summary = error_messages.join("; ");
-                return Err(anyhow!(
-                    "Failed to load some system certificates: {}",
-                    error_summary
-                ));
-            }
-
-            for cert in native_certs.certs {
-                root_cert_store
-                    .add(cert)
-                    .context("Failed to add native certificate")?;
-            }
-        }
-
-        let config =
-            ClientConfig::builder().with_root_certificates(root_cert_store);
-
-        let config = if let (Some(cert), Some(key)) = (&self.cert, &self.key) {
-            config
-                .with_client_auth_cert(vec![cert.clone()], key.clone_key())
-                .context("Failed to set client authentication")?
+        let config = if self.insecure {
+            let verifier = Arc::new(NoVerifier);
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth()
         } else {
-            config.with_no_client_auth()
+            let mut root_cert_store = RootCertStore::empty();
+
+            if let Some(ca_certs) = &self.ca {
+                for cert in ca_certs {
+                    root_cert_store
+                        .add(cert.clone())
+                        .context("Failed to add CA certificate")?;
+                }
+            } else if !self.insecure {
+                let native_certs = rustls_native_certs::load_native_certs();
+
+                if !native_certs.errors.is_empty() {
+                    let error_messages: Vec<String> = native_certs
+                        .errors
+                        .into_iter()
+                        .map(|e| e.to_string())
+                        .collect();
+                    let error_summary = error_messages.join("; ");
+                    return Err(anyhow!(
+                        "Failed to load some system certificates: {}",
+                        error_summary
+                    ));
+                }
+
+                for cert in native_certs.certs {
+                    root_cert_store
+                        .add(cert)
+                        .context("Failed to add native certificate")?;
+                }
+            }
+
+            let config =
+                ClientConfig::builder().with_root_certificates(root_cert_store);
+
+            if let (Some(cert), Some(key)) = (&self.cert, &self.key) {
+                config
+                    .with_client_auth_cert(vec![cert.clone()], key.clone_key())
+                    .context("Failed to set client authentication")?
+            } else {
+                config.with_no_client_auth()
+            }
         };
 
         let connector = TlsConnector::from(Arc::new(config));
