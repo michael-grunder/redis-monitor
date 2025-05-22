@@ -1,4 +1,4 @@
-use crate::connection::ServerAddr;
+use crate::connection::{ServerAddr, TlsConfig};
 use anyhow::{Context, Result, bail};
 use colored::Color;
 use config::{Config, File, FileFormat};
@@ -43,6 +43,12 @@ pub struct Entry {
 
     user: Option<String>,
     pass: Option<String>,
+
+    tls: Option<bool>,
+    insecure: Option<bool>,
+    tls_ca: Option<PathBuf>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
 
     #[serde(default)]
     pub cluster: bool,
@@ -195,6 +201,20 @@ impl Entry {
             vec![ServerAddr::from_path(path)]
         } else {
             panic!("Could not determine one or more Redis addresses");
+        }
+    }
+
+    pub fn get_tls_config(&self) -> Result<Option<TlsConfig>> {
+        if self.tls.unwrap_or(false) {
+            let tls = TlsConfig::new(
+                self.insecure.unwrap_or(false),
+                self.tls_ca.as_deref(),
+                self.tls_cert.as_deref(),
+                self.tls_key.as_deref(),
+            )?;
+            Ok(Some(tls))
+        } else {
+            Ok(None)
         }
     }
 }

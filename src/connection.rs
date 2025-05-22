@@ -401,10 +401,14 @@ impl Monitor {
             c.get_nodes()
                 .iter()
                 .map(|primary| {
+                    let tls = entry.get_tls_config().unwrap_or_else(|e| {
+                        panic!("Failed to create TLS config: {e:?}")
+                    });
+
                     Self::new(
                         Some(name.to_owned()),
                         primary.addr.clone(),
-                        None, // TODO: TLS config
+                        tls.map(|t| Arc::new(t)),
                         entry.get_auth(),
                         entry.get_color(),
                         entry.format.clone(),
