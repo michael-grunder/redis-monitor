@@ -358,7 +358,7 @@ impl Cluster {
         let value = redis::cmd("CLUSTER")
             .arg("SLOTS")
             .query(con)
-            .context("Failed to excute CLUSTER SLOTS")?;
+            .map_err(|e| anyhow!("Failed to execute CLUSTER SLOTS: {e}"))?;
 
         if let Value::Array(items) = value {
             let mut iter = items.into_iter();
@@ -573,12 +573,12 @@ impl Monitor {
 impl TlsConfig {
     fn load_ca(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
         let buf = fs::read(&path)
-            .with_context(|| format!("Failed to read CA file: {path:?}"))?;
+            .map_err(|e| anyhow!("Failed to read CA file: {e}"))?;
 
         let mut c = Cursor::new(buf);
         let parsed = rustls_pemfile::certs(&mut c)
             .collect::<Result<Vec<_>, _>>()
-            .context("Failed to parse CA certs")?;
+            .map_err(|e| anyhow!("Failed to parse CA certs: {e}"))?;
 
         Ok(parsed
             .into_iter()
@@ -588,12 +588,12 @@ impl TlsConfig {
 
     fn load_cert(path: &Path) -> Result<CertificateDer<'static>> {
         let buf = fs::read(&path)
-            .with_context(|| format!("Failed to read cert file: {path:?}"))?;
+            .map_err(|e| anyhow!("Failed to read cert file: {e}"))?;
 
         let mut c = Cursor::new(buf);
         let parsed = rustls_pemfile::certs(&mut c)
             .collect::<Result<Vec<_>, _>>()
-            .context("Failed to parse cert")?;
+            .map_err(|e| anyhow!("Failed to parse certs: {e}"))?;
 
         Ok(CertificateDer::from(parsed[0].clone()))
     }
@@ -603,7 +603,7 @@ impl TlsConfig {
             .with_context(|| format!("Failed to read key file: {path:?}"))?;
 
         let key = rustls_pemfile::private_key(&mut &buf[..])
-            .context("Failed to parse private key")?
+            .map_err(|e| anyhow!("Failed to parse private key: {e}"))?
             .ok_or_else(|| anyhow!("No private key found in file: {path:?}"))?;
 
         Ok(key)
@@ -625,9 +625,9 @@ impl TlsConfig {
 
             if let Some(ca_certs) = &self.ca {
                 for cert in ca_certs {
-                    root_cert_store
-                        .add(cert.clone())
-                        .context("Failed to add CA certificate")?;
+                    root_cert_store.add(cert.clone()).map_err(|e| {
+                        anyhow!("Failed to add CA certificate: {e}")
+                    })?;
                 }
             } else if !self.insecure {
                 let native_certs = rustls_native_certs::load_native_certs();
@@ -640,15 +640,14 @@ impl TlsConfig {
                         .collect();
                     let error_summary = error_messages.join("; ");
                     return Err(anyhow!(
-                        "Failed to load some system certificates: {}",
-                        error_summary
+                        "Failed to load some system certificates: {error_summary}",
                     ));
                 }
 
                 for cert in native_certs.certs {
-                    root_cert_store
-                        .add(cert)
-                        .context("Failed to add native certificate")?;
+                    root_cert_store.add(cert).map_err(|e| {
+                        anyhow!("Failed to add native certificate: {e}")
+                    })?;
                 }
             }
 
@@ -658,19 +657,20 @@ impl TlsConfig {
             if let (Some(cert), Some(key)) = (&self.cert, &self.key) {
                 config
                     .with_client_auth_cert(vec![cert.clone()], key.clone_key())
-                    .context("Failed to set client authentication")?
+                    .map_err(|e| anyhow!("Failed to set client auth: {e}"))?
             } else {
                 config.with_no_client_auth()
             }
         };
 
         let connector = TlsConnector::from(Arc::new(config));
-        let server_name =
-            ServerName::try_from(host).context("Invalid DNS name")?;
+        let server_name = ServerName::try_from(host)
+            .map_err(|e| anyhow!("Failed to create server name: {e}"))?;
+
         let tls_stream = connector
             .connect(server_name.to_owned(), stream)
             .await
-            .context("TLS handshake failed")?;
+            .map_err(|e| anyhow!("TLS handshake failed: {e}"))?;
 
         Ok(tls_stream)
     }
