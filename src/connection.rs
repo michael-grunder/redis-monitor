@@ -552,11 +552,9 @@ impl Monitor {
             ServerAddr::Tcp(host, port) => {
                 let stream = TcpStream::connect((host.as_str(), *port)).await?;
 
-                if let Some(tls_config) = &self.tls {
-                    let tls_stream =
-                        TlsConfig::initialize_tls(stream, host, tls_config)
-                            .await?;
-                    Stream::Tls(tls_stream)
+                if let Some(tls) = &self.tls {
+                    let stream = tls.initialize_tls(stream, host).await?;
+                    Stream::Tls(stream)
                 } else {
                     Stream::Tcp(stream)
                 }
@@ -619,19 +617,19 @@ impl TlsConfig {
     }
 
     pub async fn initialize_tls(
+        &self,
         stream: TcpStream,
         host: &str,
-        tls_config: &Arc<TlsConfig>,
     ) -> Result<ClientTlsStream<TcpStream>> {
         let mut root_cert_store = RootCertStore::empty();
 
-        if let Some(ca_certs) = &tls_config.ca {
+        if let Some(ca_certs) = &self.ca {
             for cert in ca_certs {
                 root_cert_store
                     .add(cert.clone())
                     .context("Failed to add CA certificate")?;
             }
-        } else if !tls_config.insecure {
+        } else if !self.insecure {
             let native_certs = rustls_native_certs::load_native_certs();
 
             if !native_certs.errors.is_empty() {
@@ -654,7 +652,7 @@ impl TlsConfig {
             }
         }
 
-        let verifier: Arc<dyn ServerCertVerifier> = if tls_config.insecure {
+        let verifier: Arc<dyn ServerCertVerifier> = if self.insecure {
             #[derive(Debug)]
             struct NoVerifier;
 
