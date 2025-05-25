@@ -94,7 +94,9 @@ struct Options {
     pub instances: Vec<String>,
 }
 
-pub const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+const GIT_HASH: &'static str = env!("GIT_HASH");
+const GIT_DIRTY: &'static str = env!("GIT_DIRTY");
 
 impl FromStr for CsvArgument {
     type Err = anyhow::Error;
@@ -308,7 +310,14 @@ async fn main() -> Result<()> {
     let cfg = Map::load(opt.config_file.as_ref());
 
     if opt.version {
-        println!("redis-monitor v{VERSION}");
+        let git_display = if GIT_DIRTY == "yes" {
+            format!("{} (dirty)", GIT_HASH)
+        } else {
+            GIT_HASH.to_string()
+        };
+
+        println!("redis-monitor v{VERSION} (git {git_display})");
+
         return Ok(());
     }
 
