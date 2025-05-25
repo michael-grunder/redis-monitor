@@ -8,7 +8,7 @@ use nom::{
     character::complete::{alpha1, char, digit1, space0},
     combinator::{map, map_opt, map_res, opt, recognize, value, verify},
     error::{ErrorKind, FromExternalError, ParseError},
-    multi::{fold_many0, many0, many1},
+    multi::{fold_many0, many1, separated_list0},
     number::complete::double,
     sequence::preceded,
 };
@@ -46,7 +46,10 @@ impl<'a> Line<'a> {
         E: ParseError<&'a str>
             + FromExternalError<&'a str, std::num::ParseIntError>,
     {
+        let (input, _) = char('x').parse(input)?;
+
         let parse_hex = take_while_m_n(2, 2, |c: char| c.is_ascii_hexdigit());
+
         let parse_u8 =
             map_res(parse_hex, move |hex| u8::from_str_radix(hex, 16));
 
@@ -223,7 +226,8 @@ impl<'a> Line<'a> {
         let (input, _) = opt(char(' ')).parse(input)?;
 
         let args = if parse_args {
-            let (_, args) = many0(Self::parse_escaped_string).parse(input)?;
+            let (_, args) = separated_list0(space0, Self::parse_escaped_string)
+                .parse(input)?;
             LineArgs::Parsed(args)
         } else {
             LineArgs::Raw(input)
