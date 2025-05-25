@@ -338,7 +338,11 @@ async fn main() -> Result<()> {
     let tasks = FuturesUnordered::new();
 
     for mon in seeds {
-        println!("MONITOR: {}", mon.address);
+        if opt.json {
+            println!("{}\n", serde_json::to_string(&mon.address)?);
+        } else {
+            println!("MONITOR: {}", mon.address);
+        }
         tasks.push(tokio::spawn(run_monitor(mon, tx.clone())));
     }
 
@@ -351,12 +355,12 @@ async fn main() -> Result<()> {
     let mut stats = stats::CommandStats::new();
 
     while let Some(MonitorMessage { prefix, line, .. }) = rx.recv().await {
-        if opt.db.is_none() && filter.is_empty() {
+        if !opt.json && (opt.db.is_none() && filter.is_empty()) {
             println!("{} {}", format_prefix(&prefix), line);
             continue;
         }
 
-        let parsed = match Line::from_line(&line, false) {
+        let parsed = match Line::from_line(&line, opt.json) {
             Ok((_, line)) => line,
             Err(e) => {
                 eprintln!("Failed to parse line: {e:?} <- input: {line:?}");
@@ -372,7 +376,11 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        println!("{} {}", format_prefix(&prefix), line);
+        if opt.json {
+            println!("{}", serde_json::to_string(&parsed)?);
+        } else {
+            println!("{} {}", format_prefix(&prefix), line);
+        }
     }
 
     Ok(())

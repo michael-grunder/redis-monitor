@@ -7,6 +7,7 @@ use rustls::{
     ClientConfig, RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer, ServerName},
 };
+use serde::Serialize;
 
 use serde::{Deserialize, Deserializer, de};
 use std::{
@@ -50,7 +51,7 @@ pub struct Monitor {
     pub format: String,
 }
 
-#[derive(Debug, Eq, Clone)]
+#[derive(Debug, Eq, Clone, Serialize)]
 pub enum ServerAddr {
     Tcp(String, u16),
     Unix(String),
