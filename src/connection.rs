@@ -30,7 +30,7 @@ use tokio_rustls::{TlsConnector, client::TlsStream as ClientTlsStream};
 #[derive(Debug)]
 pub enum Stream {
     Tcp(TcpStream),
-    Tls(ClientTlsStream<TcpStream>),
+    Tls(Box<ClientTlsStream<TcpStream>>),
     Unix(UnixStream),
 }
 
@@ -550,7 +550,7 @@ impl Monitor {
 
                 if let Some(tls) = &self.tls {
                     let stream = tls.initialize_tls(stream, host).await?;
-                    Stream::Tls(stream)
+                    Stream::Tls(Box::new(stream))
                 } else {
                     Stream::Tcp(stream)
                 }
