@@ -311,7 +311,7 @@ async fn main() -> Result<()> {
 
     if opt.version {
         let git_display = if GIT_DIRTY == "yes" {
-            format!("{} (dirty)", GIT_HASH)
+            format!("{}-dirty", GIT_HASH)
         } else {
             GIT_HASH.to_string()
         };
