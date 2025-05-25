@@ -150,11 +150,11 @@ impl PartialEq for ServerAddr {
                 Self::Tcp(other_host, other_port) => {
                     host == other_host && port == other_port
                 }
-                _ => false,
+                Self::Unix(_) => false,
             },
             Self::Unix(path) => match other {
                 Self::Unix(other_path) => path == other_path,
-                _ => false,
+                Self::Tcp(..) => false,
             },
         }
     }
@@ -407,7 +407,7 @@ impl Monitor {
                     });
 
                     Self::new(
-                        Some(name.to_owned()),
+                        Some(&name.to_owned()),
                         primary.addr.clone(),
                         tls.map(Arc::new),
                         entry.get_auth(),
@@ -422,7 +422,7 @@ impl Monitor {
                 .iter()
                 .map(|addr| {
                     Self::new(
-                        Some(name.to_owned()),
+                        Some(&name.to_owned()),
                         addr.to_owned(),
                         None, // TODO: TLS config
                         entry.get_auth(),
@@ -458,7 +458,7 @@ impl Monitor {
     }
 
     pub fn new(
-        name: Option<String>,
+        name: Option<&String>,
         address: ServerAddr,
         tls: Option<Arc<TlsConfig>>,
         auth: ServerAuth,
@@ -466,7 +466,7 @@ impl Monitor {
         format: Option<String>,
     ) -> Self {
         let format = Self::make_fmt_string(
-            name.as_ref(),
+            name,
             &address,
             &format.unwrap_or_else(|| "{address}".into()),
         );
@@ -509,9 +509,11 @@ impl Monitor {
         reader.read_line(&mut line).await?;
 
         if line.starts_with('+') {
-            Ok(line[1..].trim_end().to_string())
+            Ok(line.strip_prefix('+').unwrap().trim_end().to_string())
         } else if line.starts_with('-') {
-            Err(anyhow!(line[1..].trim_end().to_string()))
+            Err(anyhow!(
+                line.strip_prefix('-').unwrap().trim_end().to_string()
+            ))
         } else {
             Err(anyhow!("Unexpected server reply: {}", line.trim_end()))
         }
@@ -581,8 +583,7 @@ impl TlsConfig {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| anyhow!("Failed to parse CA certs: {e}"))?;
 
-        Ok(parsed
-            .into_iter().collect::<Vec<_>>())
+        Ok(parsed.into_iter().collect::<Vec<_>>())
     }
 
     fn load_cert(path: &Path) -> Result<CertificateDer<'static>> {
@@ -598,12 +599,15 @@ impl TlsConfig {
     }
 
     fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-        let buf = fs::read(path)
-            .with_context(|| format!("Failed to read key file: {path:?}"))?;
+        let buf = fs::read(path).with_context(|| {
+            format!("Failed to read key file: {}", path.display())
+        })?;
 
         let key = rustls_pemfile::private_key(&mut &buf[..])
             .map_err(|e| anyhow!("Failed to parse private key: {e}"))?
-            .ok_or_else(|| anyhow!("No private key found in file: {path:?}"))?;
+            .ok_or_else(|| {
+                anyhow!("No private key found in file: {}", path.display())
+            })?;
 
         Ok(key)
     }

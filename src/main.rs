@@ -36,6 +36,7 @@ mod stats;
 struct CsvArgument(Vec<String>);
 
 #[derive(Parser, Debug)]
+#[allow(clippy::struct_excessive_bools)]
 struct Options {
     #[arg(short, long, help = "Treat each instance like its a cluster seed")]
     cluster: bool,
@@ -138,7 +139,7 @@ impl<'de> Deserialize<'de> for CsvArgument {
 // once. This is fine, but we should be aware of it.
 fn process_cluster_instances(
     opt: &Options,
-    tls: Option<Arc<TlsConfig>>,
+    tls: Option<&Arc<TlsConfig>>,
     auth: &ServerAuth,
 ) -> Vec<Monitor> {
     // First make sure we can turn them all into RedisAddr
@@ -166,9 +167,9 @@ fn process_cluster_instances(
 
                     nodes.into_iter().map(|n| {
                         Monitor::new(
-                            Some(n.id.clone()),
+                            Some(&n.id),
                             n.addr.clone(),
-                            tls.clone(),
+                            tls.cloned(),
                             auth.clone(),
                             None,
                             opt.format.clone(),
@@ -189,7 +190,7 @@ fn process_cluster_instances(
 fn process_instances(
     cfg: &Map,
     opt: &Options,
-    tls: Option<Arc<TlsConfig>>,
+    tls: Option<&Arc<TlsConfig>>,
     auth: &ServerAuth,
 ) -> Vec<Monitor> {
     opt.instances
@@ -207,7 +208,7 @@ fn process_instances(
                             let monitor = Monitor::new(
                                 None,
                                 addr,
-                                tls.clone(),
+                                tls.cloned(),
                                 auth.clone(),
                                 None,
                                 opt.format.clone(),
@@ -252,8 +253,11 @@ impl RetryBackoff {
         let mut rng = rng();
 
         self.attempt += 1;
-        let delay_ms = (Self::MIN_DELAY.as_millis() << (self.attempt.min(6) + rng.random_range(0..100)))
-            as u64;
+        let shift_amount =
+            (self.attempt.min(6) + rng.random_range(0..3)) as u32;
+        let base_delay = Self::MIN_DELAY.as_millis();
+        let delay_ms =
+            (base_delay << shift_amount).try_into().unwrap_or(u64::MAX);
 
         Duration::from_millis(
             delay_ms.min(
@@ -349,9 +353,9 @@ async fn main() -> Result<()> {
         ServerAuth::from_user_pass(opt.user.as_deref(), opt.pass.as_deref());
 
     let seeds = if opt.cluster {
-        process_cluster_instances(&opt, tls, &auth)
+        process_cluster_instances(&opt, tls.as_ref(), &auth)
     } else {
-        process_instances(&cfg, &opt, tls, &auth)
+        process_instances(&cfg, &opt, tls.as_ref(), &auth)
     };
 
     let (tx, mut rx) = mpsc::channel::<MonitorMessage>(1000);
