@@ -206,7 +206,7 @@ fn process_instances(
                         |addr| {
                             let monitor = Monitor::new(
                                 None,
-                                addr.clone(),
+                                addr,
                                 tls.clone(),
                                 auth.clone(),
                                 None,
@@ -256,7 +256,14 @@ impl RetryBackoff {
             << self.attempt.min(6) + rng.random_range(0..100))
             as u64;
 
-        Duration::from_millis(delay_ms.min(self.max_delay.as_millis() as u64))
+        Duration::from_millis(
+            delay_ms.min(
+                self.max_delay
+                    .as_millis()
+                    .try_into()
+                    .expect("Delay too long"),
+            ),
+        )
     }
 }
 
@@ -311,7 +318,7 @@ async fn main() -> Result<()> {
 
     if opt.version {
         let git_display = if GIT_DIRTY == "yes" {
-            format!("{}-dirty", GIT_HASH)
+            format!("{GIT_HASH}-dirty")
         } else {
             GIT_HASH.to_string()
         };
@@ -366,9 +373,9 @@ async fn main() -> Result<()> {
     }
 
     let format_prefix: Box<dyn Fn(&str) -> ColoredString> = if opt.no_color {
-        Box::new(|p| format!("[{}]", p).normal())
+        Box::new(|p| format!("[{p}]").normal())
     } else {
-        Box::new(|p| format!("[{}]", p).bold())
+        Box::new(|p| format!("[{p}]").bold())
     };
 
     let mut stats = stats::CommandStats::new();
