@@ -94,9 +94,9 @@ struct Options {
     pub instances: Vec<String>,
 }
 
-const VERSION: &'static str = env!("CARGO_PKG_VERSION");
-const GIT_HASH: &'static str = env!("GIT_HASH");
-const GIT_DIRTY: &'static str = env!("GIT_DIRTY");
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const GIT_HASH: &str = env!("GIT_HASH");
+const GIT_DIRTY: &str = env!("GIT_DIRTY");
 
 impl FromStr for CsvArgument {
     type Err = anyhow::Error;
@@ -241,7 +241,7 @@ impl RetryBackoff {
     const MIN_DELAY: Duration = Duration::from_millis(50);
     const MAX_DELAY: Duration = Duration::from_secs(1);
 
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             attempt: 0,
             max_delay: Self::MAX_DELAY,
@@ -252,8 +252,7 @@ impl RetryBackoff {
         let mut rng = rng();
 
         self.attempt += 1;
-        let delay_ms = (Self::MIN_DELAY.as_millis()
-            << self.attempt.min(6) + rng.random_range(0..100))
+        let delay_ms = (Self::MIN_DELAY.as_millis() << (self.attempt.min(6) + rng.random_range(0..100)))
             as u64;
 
         Duration::from_millis(
@@ -270,7 +269,7 @@ impl RetryBackoff {
 async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
     let prefix: Arc<str> = Arc::from(mon.format.clone());
     let address = Arc::new(mon.address.clone());
-    let color = Arc::new(mon.color.clone());
+    let color = Arc::new(mon.color);
 
     let mut backoff = RetryBackoff::new();
 

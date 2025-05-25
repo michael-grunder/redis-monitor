@@ -14,13 +14,13 @@ pub struct Filter {
 
 impl From<&str> for FilterString {
     fn from(s: &str) -> Self {
-        FilterString(s.to_ascii_lowercase())
+        Self(s.to_ascii_lowercase())
     }
 }
 
 impl From<String> for FilterString {
     fn from(s: String) -> Self {
-        FilterString(s.into())
+        Self(s)
     }
 }
 
@@ -58,7 +58,7 @@ impl Filter {
     }
 
     pub fn filter(&self, value: &str) -> bool {
-        !self.should_include(&value) || self.should_exclude(&value)
+        !self.should_include(value) || self.should_exclude(value)
     }
 
     pub fn from_args(include: Vec<String>, exclude: Vec<String>) -> Self {

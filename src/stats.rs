@@ -31,6 +31,6 @@ impl CommandStats {
             None => {
                 self.0.insert(cmd.to_string(), Stat::new());
             }
-        };
+        }
     }
 }

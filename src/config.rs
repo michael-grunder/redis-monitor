@@ -80,8 +80,8 @@ impl<'de> Deserialize<'de> for DisplayColor {
 impl ServerAuth {
     pub fn from_user_pass(user: Option<&str>, pass: Option<&str>) -> Self {
         Self {
-            user: user.map(|s| s.to_owned()),
-            pass: pass.map(|s| s.to_owned()),
+            user: user.map(std::borrow::ToOwned::to_owned),
+            pass: pass.map(std::borrow::ToOwned::to_owned),
         }
     }
 

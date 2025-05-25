@@ -176,7 +176,7 @@ impl Hash for ServerAddr {
             }
             Self::Unix(path) => {
                 1u8.hash(state);
-                path.hash(state)
+                path.hash(state);
             }
         }
     }
@@ -409,7 +409,7 @@ impl Monitor {
                     Self::new(
                         Some(name.to_owned()),
                         primary.addr.clone(),
-                        tls.map(|t| Arc::new(t)),
+                        tls.map(Arc::new),
                         entry.get_auth(),
                         entry.get_color(),
                         entry.format.clone(),
@@ -443,9 +443,9 @@ impl Monitor {
 
         let vars: &[(&'static str, Option<String>)] = &[
             ("{address}", Some(address.to_string())),
-            ("{host}", Some(address.get_host().to_string())),
+            ("{host}", Some(address.get_host())),
             ("{port}", address.get_port().map(|p| p.to_string())),
-            ("{name}", name.map(|n| n.to_string())),
+            ("{name}", name.map(std::string::ToString::to_string)),
         ];
 
         for (var, value) in vars {
@@ -508,9 +508,9 @@ impl Monitor {
         let mut line = String::new();
         reader.read_line(&mut line).await?;
 
-        if line.starts_with("+") {
+        if line.starts_with('+') {
             Ok(line[1..].trim_end().to_string())
-        } else if line.starts_with("-") {
+        } else if line.starts_with('-') {
             Err(anyhow!(line[1..].trim_end().to_string()))
         } else {
             Err(anyhow!("Unexpected server reply: {}", line.trim_end()))
@@ -573,7 +573,7 @@ impl Monitor {
 
 impl TlsConfig {
     fn load_ca(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-        let buf = fs::read(&path)
+        let buf = fs::read(path)
             .map_err(|e| anyhow!("Failed to read CA file: {e}"))?;
 
         let mut c = Cursor::new(buf);
@@ -582,13 +582,11 @@ impl TlsConfig {
             .map_err(|e| anyhow!("Failed to parse CA certs: {e}"))?;
 
         Ok(parsed
-            .into_iter()
-            .map(CertificateDer::from)
-            .collect::<Vec<_>>())
+            .into_iter().collect::<Vec<_>>())
     }
 
     fn load_cert(path: &Path) -> Result<CertificateDer<'static>> {
-        let buf = fs::read(&path)
+        let buf = fs::read(path)
             .map_err(|e| anyhow!("Failed to read cert file: {e}"))?;
 
         let mut c = Cursor::new(buf);
@@ -596,11 +594,11 @@ impl TlsConfig {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| anyhow!("Failed to parse certs: {e}"))?;
 
-        Ok(CertificateDer::from(parsed[0].clone()))
+        Ok(parsed[0].clone())
     }
 
     fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-        let buf = fs::read(&path)
+        let buf = fs::read(path)
             .with_context(|| format!("Failed to read key file: {path:?}"))?;
 
         let key = rustls_pemfile::private_key(&mut &buf[..])

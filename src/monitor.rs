@@ -210,7 +210,7 @@ impl<'a> Line<'a> {
     pub fn from_line(
         input: &'a str,
         parse_args: bool,
-    ) -> IResult<&'a str, Line<'a>> {
+    ) -> IResult<&'a str, Self> {
         let (input, timestamp) = double(input)?;
         let (input, _) = space0(input)?;
         let (input, (db, addr)) = Self::parse_source(input)?;
