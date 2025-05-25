@@ -377,12 +377,11 @@ impl Cluster {
 
                 let mut primary: ClusterNode = (&entries[0]).into();
 
-                if !primaries.contains(&primary) {
-                    for replica in &entries[1..] {
-                        primary.add_replica(replica.into());
-                    }
-                    primaries.insert(primary);
+                for replica in &entries[1..] {
+                    primary.add_replica(replica.into());
                 }
+
+                primaries.insert(primary);
             }
         }
 
@@ -442,10 +441,10 @@ impl Monitor {
         let mut fmt = format.to_owned();
 
         let vars: &[(&'static str, Option<String>)] = &[
-            ("{address}", Some(address.to_string())),
-            ("{host}", Some(address.get_host())),
-            ("{port}", address.get_port().map(|p| p.to_string())),
-            ("{name}", name.map(std::string::ToString::to_string)),
+            ("%A", Some(address.to_string())),
+            ("%h", Some(address.get_host())),
+            ("%p", address.get_port().map(|p| p.to_string())),
+            ("%n", name.map(std::string::ToString::to_string)),
         ];
 
         for (var, value) in vars {
@@ -468,7 +467,7 @@ impl Monitor {
         let format = Self::make_fmt_string(
             name,
             &address,
-            &format.unwrap_or_else(|| "{address}".into()),
+            &format.unwrap_or_else(|| "%A".into()),
         );
 
         Self {

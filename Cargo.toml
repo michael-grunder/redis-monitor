@@ -3,10 +3,6 @@ name = "redis-monitor"
 version = "0.1.1"
 edition = "2024"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[dependecies]
-
 [dependencies]
 anyhow = "1.0.98"
 clap = { version = "4.5.37", features = ["derive", "wrap_help"] }
