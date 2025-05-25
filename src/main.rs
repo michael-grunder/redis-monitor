@@ -88,8 +88,13 @@ struct Options {
     #[arg(long, help = "Path to client private key for TLS")]
     tls_key: Option<PathBuf>,
 
+    #[arg(short, long, help = "Display the version and exit")]
+    version: bool,
+
     pub instances: Vec<String>,
 }
+
+pub const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
 impl FromStr for CsvArgument {
     type Err = anyhow::Error;
@@ -301,6 +306,11 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
 async fn main() -> Result<()> {
     let opt: Options = Options::parse();
     let cfg = Map::load(opt.config_file.as_ref());
+
+    if opt.version {
+        println!("redis-monitor v{VERSION}");
+        return Ok(());
+    }
 
     if opt.instances.is_empty() {
         eprintln!("Must pass at least one unstance (host/port or name)");
