@@ -1,9 +1,6 @@
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/index");
-
     let output = Command::new("git")
         .args(&["rev-parse", "--short", "HEAD"])
         .output()
@@ -20,7 +17,11 @@ fn main() {
         .output()
         .expect("Failed to execute git diff");
 
-    if !status_output.stdout.is_empty() {
-        println!("cargo:rustc-env=GIT_DIRTY=yes");
+    let git_dirty = if !status_output.stdout.is_empty() {
+        "yes"
+    } else {
+        "no"
     };
+
+    println!("cargo:rustc-env=GIT_DIRTY={git_dirty}");
 }
