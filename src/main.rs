@@ -131,6 +131,21 @@ impl<'de> Deserialize<'de> for CsvArgument {
     }
 }
 
+impl Options {
+    fn get_tls_config(&self) -> Result<Option<Arc<TlsConfig>>> {
+        if self.tls {
+            Ok(Some(Arc::new(TlsConfig::new(
+                self.insecure,
+                self.tls_ca.as_deref(),
+                self.tls_cert.as_deref(),
+                self.tls_key.as_deref(),
+            )?)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 // Treat each instnace as a potential cluster seed. This means that if more than
 // one seeds of the same cluster are passed we may map the same keyspace more than
 // once. This is fine, but we should be aware of it.
@@ -317,11 +332,10 @@ async fn main() -> Result<()> {
     let cfg = Map::load(opt.config_file.as_deref())?;
 
     if opt.version {
-        let git_display = if GIT_DIRTY == "yes" {
-            format!("{GIT_HASH}-dirty")
-        } else {
-            GIT_HASH.to_string()
-        };
+        let git_display = format!(
+            "{GIT_HASH}{}",
+            if GIT_DIRTY == "yes" { "-dirty" } else { "" }
+        );
 
         println!("redis-monitor v{VERSION} (git {git_display})");
 
@@ -333,18 +347,7 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let tls = if opt.tls {
-        let tls_cfg = TlsConfig::new(
-            opt.insecure,
-            opt.tls_ca.as_deref(),
-            opt.tls_cert.as_deref(),
-            opt.tls_key.as_deref(),
-        )?;
-
-        Some(Arc::new(tls_cfg))
-    } else {
-        None
-    };
+    let tls = opt.get_tls_config()?;
 
     let auth =
         ServerAuth::from_user_pass(opt.user.as_deref(), opt.pass.as_deref());

@@ -164,13 +164,13 @@ impl Map {
     }
 
     fn from_default_toml_file() -> Option<HashMap<String, Entry>> {
-        Self::find().map(|filename| {
-            let str = filename.to_str().unwrap_or_else(|| {
-                panic!("Invalid UTF-8 in config file path: {filename:?}");
+        Self::find().map(|file| {
+            let str = file.to_str().unwrap_or_else(|| {
+                panic!("Invalid UTF-8 in config file path: {}", file.display());
             });
 
             Self::from_toml_file(str).unwrap_or_else(|e| {
-                panic!("Failed to read config file {filename:?}: {e}");
+                panic!("Failed to read config file {}: {e}", file.display());
             })
         })
     }
