@@ -89,6 +89,9 @@ struct Options {
     #[arg(short, long, help = "Display the version and exit")]
     version: bool,
 
+    #[arg(short, long, help = "Capture stats on commands and their sizes")]
+    stats: bool,
+
     pub instances: Vec<String>,
 }
 
@@ -393,10 +396,14 @@ async fn main() -> Result<()> {
         Box::new(|p| format!("{p}").bold())
     };
 
-    let mut stats = stats::CommandStats::new();
+    let mut stats = if opt.stats {
+        Some(stats::CommandStats::new())
+    } else {
+        None
+    };
 
     while let Some(MonitorMessage { prefix, line, .. }) = rx.recv().await {
-        if !opt.json && (opt.db.is_none() && filter.is_empty()) {
+        if !opt.stats && !opt.json && (opt.db.is_none() && filter.is_empty()) {
             println!("{} {}", format_prefix(&prefix), line);
             continue;
         }
@@ -409,7 +416,9 @@ async fn main() -> Result<()> {
             }
         };
 
-        stats.incr(parsed.cmd, line.len());
+        if let Some(ref mut stats) = stats {
+            stats.incr(parsed.cmd, line.len());
+        }
 
         if matches!(opt.db, Some(db) if db != parsed.db)
             || filter.filter(parsed.cmd)
