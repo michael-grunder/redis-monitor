@@ -395,6 +395,8 @@ impl Cluster {
 }
 
 impl Monitor {
+    const DEFAULT_FORMAT: &'static str = "[%A]";
+
     pub fn from_config_entry(name: &str, entry: &Entry) -> Vec<Self> {
         if entry.cluster {
             let c = Cluster::from_seeds(&entry.get_addresses())
@@ -434,12 +436,12 @@ impl Monitor {
         }
     }
 
-    fn make_fmt_string(
+    fn make_format_string(
         name: Option<&String>,
         address: &ServerAddr,
         format: &str,
     ) -> String {
-        let mut fmt = format.to_owned();
+        let mut format = format.to_owned();
 
         let vars: &[(&'static str, Option<String>)] = &[
             ("%A", Some(address.to_string())),
@@ -450,11 +452,11 @@ impl Monitor {
 
         for (var, value) in vars {
             if let Some(v) = value {
-                fmt = fmt.replace(var, v);
+                format = format.replace(var, v);
             }
         }
 
-        fmt
+        format
     }
 
     pub fn new(
@@ -465,10 +467,10 @@ impl Monitor {
         color: Option<Color>,
         format: Option<String>,
     ) -> Self {
-        let format = Self::make_fmt_string(
+        let format = Self::make_format_string(
             name,
             &address,
-            &format.unwrap_or_else(|| "%A".into()),
+            &format.as_deref().unwrap_or(Self::DEFAULT_FORMAT),
         );
 
         Self {

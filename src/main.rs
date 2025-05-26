@@ -388,9 +388,9 @@ async fn main() -> Result<()> {
     }
 
     let format_prefix: Box<dyn Fn(&str) -> ColoredString> = if opt.no_color {
-        Box::new(|p| format!("[{p}]").normal())
+        Box::new(|p| format!("{p}").normal())
     } else {
-        Box::new(|p| format!("[{p}]").bold())
+        Box::new(|p| format!("{p}").bold())
     };
 
     let mut stats = stats::CommandStats::new();
