@@ -287,11 +287,12 @@ impl ClusterNode {
     }
 }
 
-impl<S> From<&(S, u16, S)> for ClusterNode
+impl<S1, S2> From<&(S1, u16, S2)> for ClusterNode
 where
-    S: AsRef<str>,
+    S1: AsRef<str>,
+    S2: AsRef<str>,
 {
-    fn from(input: &(S, u16, S)) -> Self {
+    fn from(input: &(S1, u16, S2)) -> Self {
         Self::new(input.0.as_ref(), input.1, input.2.as_ref())
     }
 }

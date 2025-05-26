@@ -242,7 +242,7 @@ fn process_instances(
 
 #[derive(Debug)]
 struct RetryBackoff {
-    attempt: u32,
+    retries: u32,
     max_delay: Duration,
 }
 
@@ -250,7 +250,7 @@ struct RetryBackoff {
 pub struct MonitorMessage {
     pub prefix: Arc<str>,
     pub address: Arc<ServerAddr>,
-    pub color: Arc<Option<Color>>,
+    pub color: Option<Color>,
     line: String,
 }
 
@@ -260,7 +260,7 @@ impl RetryBackoff {
 
     const fn new() -> Self {
         Self {
-            attempt: 0,
+            retries: 0,
             max_delay: Self::MAX_DELAY,
         }
     }
@@ -268,9 +268,9 @@ impl RetryBackoff {
     fn delay(&mut self) -> Duration {
         let mut rng = rng();
 
-        self.attempt += 1;
+        self.retries += 1;
         let shift_amount =
-            (self.attempt.min(6) + rng.random_range(0..3)) as u32;
+            (self.retries.min(6) + rng.random_range(0..3)) as u32;
         let base_delay = Self::MIN_DELAY.as_millis();
         let delay_ms =
             (base_delay << shift_amount).try_into().unwrap_or(u64::MAX);
@@ -284,18 +284,23 @@ impl RetryBackoff {
             ),
         )
     }
+
+    const fn reset(&mut self) {
+        self.retries = 0;
+    }
 }
 
 async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
     let prefix: Arc<str> = Arc::from(mon.format.clone());
     let address = Arc::new(mon.address.clone());
-    let color = Arc::new(mon.color);
 
     let mut backoff = RetryBackoff::new();
 
     loop {
         match mon.clone().connect().await {
             Ok((_, mut reader)) => {
+                backoff.reset();
+
                 let mut line = String::new();
                 loop {
                     line.clear();
@@ -305,10 +310,13 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
                             let msg = MonitorMessage {
                                 prefix: prefix.clone(),
                                 address: address.clone(),
-                                color: color.clone(),
+                                color: mon.color,
                                 line: line[1..].trim_end().to_string(),
                             };
-                            if tx.send(msg).await.is_err() {
+                            if let Err(e) = tx.send(msg).await {
+                                eprintln!(
+                                    "[{prefix}] Failed to send message: {e:?}"
+                                );
                                 break;
                             }
                         }
@@ -320,7 +328,7 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
                 }
             }
             Err(e) => {
-                if backoff.attempt == 0 {
+                if backoff.retries == 0 {
                     eprintln!("[{prefix}] Error connecting {e}");
                 }
             }
@@ -341,6 +349,9 @@ fn verseion_string() -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Print the size of Color
+    println!("Size of Color: {}", std::mem::size_of::<Color>());
+
     let opt: Options = Options::parse();
     let cfg = Map::load(opt.config_file.as_deref())?;
 
