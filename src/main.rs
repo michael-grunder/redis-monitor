@@ -17,7 +17,7 @@ use rand::{Rng, rng};
 use serde::{Deserialize, Deserializer, de};
 use std::{
     collections::HashSet, convert::From, default::Default, path::PathBuf,
-    str::FromStr, sync::Arc,
+    str::FromStr, sync::Arc, time::Instant,
 };
 use tokio::{
     io::AsyncBufReadExt,
@@ -89,8 +89,14 @@ struct Options {
     #[arg(short, long, help = "Display the version and exit")]
     version: bool,
 
-    #[arg(short, long, help = "Capture stats on commands and their sizes")]
-    stats: bool,
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        num_args(0..=1),
+        default_missing_value = "1.0",
+        value_parser = validate_positive_f64,
+    )]
+    stats: Option<f64>,
 
     pub instances: Vec<String>,
 }
@@ -98,6 +104,14 @@ struct Options {
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_HASH: &str = env!("GIT_HASH");
 const GIT_DIRTY: &str = env!("GIT_DIRTY");
+
+fn validate_positive_f64(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(val) if val > 0.0 => Ok(val),
+        Ok(_) => Err("Value must be positive".to_string()),
+        Err(_) => Err("Invalid number".to_string()),
+    }
+}
 
 impl FromStr for CsvArgument {
     type Err = anyhow::Error;
@@ -161,7 +175,6 @@ fn process_cluster_instances(
     tls: Option<&Arc<TlsConfig>>,
     auth: &ServerAuth,
 ) -> Vec<Monitor> {
-    // First make sure we can turn them all into RedisAddr
     let addresses = opt.instances.iter().map(|i| {
         ServerAddr::from_str(i).unwrap_or_else(|_| {
             panic!("Unable to interpret '{i:?}' as a redis address");
@@ -349,6 +362,29 @@ fn verseion_string() -> String {
     format!("redis-monitor v{VERSION} (git {git_display})")
 }
 
+fn print_stats(stats: &stats::CommandStats, json: bool) {
+    let mut stats = stats.get_stats();
+    stats.sort_by(|a, b| b.count.cmp(&a.count));
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&stats).unwrap_or_else(|e| {
+                eprintln!("Failed to serialize stats to JSON: {e}");
+                "[]".to_string()
+            })
+        );
+    } else {
+        println!("Command Stats:");
+        for stat in stats {
+            println!(
+                "  {}: count={}, bytes={}",
+                stat.name, stat.count, stat.bytes
+            );
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let opt: Options = Options::parse();
@@ -396,14 +432,22 @@ async fn main() -> Result<()> {
         Box::new(|p| format!("{p}").bold())
     };
 
-    let mut stats = if opt.stats {
-        Some(stats::CommandStats::new())
+    let (mut stats, interval) = if let Some(interval) = opt.stats {
+        (
+            Some(stats::CommandStats::new()),
+            Duration::from_secs_f64(interval),
+        )
     } else {
-        None
+        (None, Duration::from_secs(0))
     };
 
+    let mut tick = Instant::now();
+
     while let Some(MonitorMessage { prefix, line, .. }) = rx.recv().await {
-        if !opt.stats && !opt.json && (opt.db.is_none() && filter.is_empty()) {
+        if stats.is_none()
+            && !opt.json
+            && (opt.db.is_none() && filter.is_empty())
+        {
             println!("{} {}", format_prefix(&prefix), line);
             continue;
         }
@@ -418,6 +462,10 @@ async fn main() -> Result<()> {
 
         if let Some(ref mut stats) = stats {
             stats.incr(parsed.cmd, line.len());
+            if tick.elapsed() >= interval {
+                print_stats(&stats, opt.json);
+                tick = Instant::now();
+            }
         }
 
         if matches!(opt.db, Some(db) if db != parsed.db)

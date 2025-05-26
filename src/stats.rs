@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use serde::Serialize;
+
 #[derive(Debug, Clone)]
 pub struct Stat {
     count: usize,
@@ -8,6 +10,13 @@ pub struct Stat {
 
 #[derive(Debug, Clone)]
 pub struct CommandStats(HashMap<String, Stat>);
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandStat {
+    pub name: String,
+    pub count: usize,
+    pub bytes: usize,
+}
 
 impl Stat {
     pub const fn new() -> Self {
@@ -32,5 +41,16 @@ impl CommandStats {
                 self.0.insert(cmd.to_string(), Stat::new());
             }
         }
+    }
+
+    pub fn get_stats(&self) -> Vec<CommandStat> {
+        self.0
+            .iter()
+            .map(|(name, stat)| CommandStat {
+                name: name.clone(),
+                count: stat.count,
+                bytes: stat.bytes,
+            })
+            .collect()
     }
 }
