@@ -369,13 +369,14 @@ fn print_stats(stats: &stats::CommandStats, json: bool) {
             })
         );
     } else {
-        println!("Command Stats:");
-        for stat in stats {
-            println!(
-                "  {}: count={}, bytes={}",
-                stat.name, stat.count, stat.bytes
-            );
-        }
+        println!(
+            "[stats]: {}",
+            stats
+                .iter()
+                .map(|s| format!("count={}, bytes={}", s.count, s.bytes))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 }
 
