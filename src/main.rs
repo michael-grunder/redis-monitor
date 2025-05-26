@@ -326,19 +326,22 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
     }
 }
 
+fn verseion_string() -> String {
+    let git_display = format!(
+        "{GIT_HASH}{}",
+        if GIT_DIRTY == "yes" { "-dirty" } else { "" }
+    );
+
+    format!("redis-monitor v{VERSION} (git {git_display})")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let opt: Options = Options::parse();
     let cfg = Map::load(opt.config_file.as_deref())?;
 
     if opt.version {
-        let git_display = format!(
-            "{GIT_HASH}{}",
-            if GIT_DIRTY == "yes" { "-dirty" } else { "" }
-        );
-
-        println!("redis-monitor v{VERSION} (git {git_display})");
-
+        println!("{}", verseion_string());
         return Ok(());
     }
 
