@@ -44,25 +44,22 @@ struct Options {
     #[arg(short, long, help = "How to format each MONITOR line")]
     format: Option<String>,
 
-    #[arg(short, long)]
+    #[arg(short, long, help = "Also connect and MONITOR cluster replicas")]
     replicas: bool,
-
-    #[arg(short, long)]
-    list: bool,
 
     #[arg(long)]
     config_file: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, help = "Disable colored output")]
     no_color: bool,
 
-    #[arg(long)]
+    #[arg(long, help = "Only include commands matching comma-separated list")]
     include: Option<CsvArgument>,
 
-    #[arg(long)]
+    #[arg(long, help = "Exclude commands matching comma-separated list")]
     exclude: Option<CsvArgument>,
 
-    #[arg(long)]
+    #[arg(long, help = "Only show commands for a specific database")]
     db: Option<u64>,
 
     #[arg(short, long, help = "Redis user")]
