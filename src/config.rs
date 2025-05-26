@@ -1,5 +1,5 @@
 use crate::connection::{ServerAddr, TlsConfig};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use colored::Color;
 use config::{Config, File, FileFormat};
 use redis::cmd;
@@ -152,17 +152,26 @@ impl Map {
         let s = Config::builder()
             .add_source(File::new(path.as_ref(), FileFormat::Toml))
             .build()
-            .context("TODO:  Error handling")?;
+            .map_err(|e| {
+                anyhow!("Failed to read config file {}: {e}", path.as_ref())
+            })?;
 
-        let s = s.try_deserialize().context("Unable to open config file")?;
+        let s = s.try_deserialize().map_err(|e| {
+            anyhow!("Failed to deserialize config file {}: {e}", path.as_ref())
+        })?;
 
         Ok(s)
     }
 
     fn from_default_toml_file() -> Option<HashMap<String, Entry>> {
         Self::find().map(|filename| {
-            let str = filename.to_str().expect("TODO:  Can't unwrap filename");
-            Self::from_toml_file(str).expect("Failed to load config file")
+            let str = filename.to_str().unwrap_or_else(|| {
+                panic!("Invalid UTF-8 in config file path: {filename:?}");
+            });
+
+            Self::from_toml_file(str).unwrap_or_else(|e| {
+                panic!("Failed to read config file {filename:?}: {e}");
+            })
         })
     }
 
@@ -170,21 +179,12 @@ impl Map {
         let cfg = match path {
             Some(p) => {
                 let path_str = p.to_str().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Invalid UTF-8 in config file path: {:?}",
-                        p
-                    )
+                    anyhow!("Invalid UTF-8 in config file path: {p:?}",)
                 })?;
                 Some(Self::from_toml_file(path_str)?)
             }
             None => Self::from_default_toml_file(),
         };
-
-        //let cfg = path.map_or_else(Self::from_default_toml_file, |path| {
-        //    Some(
-        //        Self::from_toml_file(path).expect("Failed to load config file"),
-        //    )
-        //});
 
         Ok(Self(cfg.unwrap_or_default()))
     }
