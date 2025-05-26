@@ -184,8 +184,8 @@ impl Hash for ServerAddr {
 
 impl Hash for Monitor {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // TODO: Theoretically we could have one address with different auth
         self.address.hash(state);
+        self.auth.hash(state);
     }
 }
 
@@ -437,7 +437,7 @@ impl Monitor {
     }
 
     fn make_format_string(
-        name: Option<&String>,
+        name: Option<&str>,
         address: &ServerAddr,
         format: &str,
     ) -> String {
@@ -460,7 +460,7 @@ impl Monitor {
     }
 
     pub fn new(
-        name: Option<&String>,
+        name: Option<&str>,
         address: ServerAddr,
         tls: Option<Arc<TlsConfig>>,
         auth: ServerAuth,

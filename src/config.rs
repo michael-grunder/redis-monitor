@@ -9,6 +9,7 @@ use std::{
     collections::HashMap,
     convert::AsRef,
     env,
+    hash::{Hash, Hasher},
     iter::IntoIterator,
     option::Option,
     path::{Path, PathBuf},
@@ -28,6 +29,13 @@ pub struct DisplayColor(Color);
 pub struct ServerAuth {
     pub user: Option<String>,
     pub pass: Option<String>,
+}
+
+impl Hash for ServerAuth {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.user.hash(state);
+        self.pass.hash(state);
+    }
 }
 
 impl<'a> IntoIterator for &'a Map {
