@@ -144,6 +144,10 @@ impl Options {
             Ok(None)
         }
     }
+
+    fn get_server_auth(&self) -> ServerAuth {
+        ServerAuth::from_user_pass(self.user.as_deref(), self.pass.as_deref())
+    }
 }
 
 // Treat each instnace as a potential cluster seed. This means that if more than
@@ -351,9 +355,7 @@ async fn main() -> Result<()> {
     }
 
     let tls = opt.get_tls_config()?;
-
-    let auth =
-        ServerAuth::from_user_pass(opt.user.as_deref(), opt.pass.as_deref());
+    let auth = opt.get_server_auth();
 
     let seeds = if opt.cluster {
         process_cluster_instances(&opt, tls.as_ref(), &auth)
