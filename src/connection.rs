@@ -414,7 +414,7 @@ impl Monitor {
                         tls.map(Arc::new),
                         entry.get_auth(),
                         entry.get_color(),
-                        entry.format.clone(),
+                        entry.format.as_deref(),
                     )
                 })
                 .collect()
@@ -429,7 +429,7 @@ impl Monitor {
                         None, // TODO: TLS config
                         entry.get_auth(),
                         entry.get_color(),
-                        entry.format.clone(),
+                        entry.format.as_deref(),
                     )
                 })
                 .collect()
@@ -465,12 +465,12 @@ impl Monitor {
         tls: Option<Arc<TlsConfig>>,
         auth: ServerAuth,
         color: Option<Color>,
-        format: Option<String>,
+        format: Option<&str>,
     ) -> Self {
         let format = Self::make_format_string(
             name,
             &address,
-            &format.as_deref().unwrap_or(Self::DEFAULT_FORMAT),
+            &format.unwrap_or(Self::DEFAULT_FORMAT),
         );
 
         Self {

@@ -188,7 +188,7 @@ fn process_cluster_instances(
                             tls.cloned(),
                             auth.clone(),
                             None,
-                            opt.format.clone(),
+                            opt.format.as_deref(),
                         )
                     })
                 })
@@ -227,7 +227,7 @@ fn process_instances(
                                 tls.cloned(),
                                 auth.clone(),
                                 None,
-                                opt.format.clone(),
+                                opt.format.as_deref(),
                             );
 
                             vec![monitor]
