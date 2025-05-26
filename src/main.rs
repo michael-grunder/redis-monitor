@@ -426,14 +426,10 @@ async fn main() -> Result<()> {
         Box::new(|p| p.to_string().bold())
     };
 
-    let (mut stats, interval) = if let Some(interval) = opt.stats {
-        (
-            Some(stats::CommandStats::new()),
-            Duration::from_secs_f64(interval),
-        )
-    } else {
-        (None, Duration::from_secs(0))
-    };
+    let (mut stats, interval) = opt.stats.map_or_else(
+        || (None, Duration::from_secs(0)),
+        |i| (Some(stats::CommandStats::new()), Duration::from_secs_f64(i)),
+    );
 
     let mut tick = Instant::now();
 
