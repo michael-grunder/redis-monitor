@@ -409,7 +409,7 @@ impl Monitor {
                     });
 
                     Self::new(
-                        Some(&name.to_owned()),
+                        Some(name),
                         primary.addr.clone(),
                         tls.map(Arc::new),
                         entry.get_auth(),
@@ -424,7 +424,7 @@ impl Monitor {
                 .iter()
                 .map(|addr| {
                     Self::new(
-                        Some(&name.to_owned()),
+                        Some(name),
                         addr.to_owned(),
                         None, // TODO: TLS config
                         entry.get_auth(),
@@ -470,7 +470,7 @@ impl Monitor {
         let format = Self::make_format_string(
             name,
             &address,
-            &format.unwrap_or(Self::DEFAULT_FORMAT),
+            format.unwrap_or(Self::DEFAULT_FORMAT),
         );
 
         Self {

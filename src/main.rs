@@ -421,9 +421,9 @@ async fn main() -> Result<()> {
     }
 
     let format_prefix: Box<dyn Fn(&str) -> ColoredString> = if opt.no_color {
-        Box::new(|p| format!("{p}").normal())
+        Box::new(|p| p.to_string().normal())
     } else {
-        Box::new(|p| format!("{p}").bold())
+        Box::new(|p| p.to_string().bold())
     };
 
     let (mut stats, interval) = if let Some(interval) = opt.stats {
@@ -457,7 +457,7 @@ async fn main() -> Result<()> {
         if let Some(ref mut stats) = stats {
             stats.incr(parsed.cmd, line.len());
             if tick.elapsed() >= interval {
-                print_stats(&stats, opt.json);
+                print_stats(stats, opt.json);
                 tick = Instant::now();
             }
         }
