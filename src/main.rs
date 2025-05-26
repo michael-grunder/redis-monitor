@@ -426,11 +426,8 @@ async fn main() -> Result<()> {
         Box::new(|p| p.to_string().bold())
     };
 
-    let (mut stats, interval) = opt.stats.map_or_else(
-        || (None, Duration::from_secs(0)),
-        |i| (Some(stats::CommandStats::new()), Duration::from_secs_f64(i)),
-    );
-
+    let mut stats = opt.stats.map(|_| stats::CommandStats::new());
+    let interval = Duration::from_secs_f64(opt.stats.unwrap_or(1.0));
     let mut tick = Instant::now();
 
     while let Some(MonitorMessage { prefix, line, .. }) = rx.recv().await {
