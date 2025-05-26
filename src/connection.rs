@@ -403,7 +403,7 @@ impl Monitor {
                 .iter()
                 .map(|primary| {
                     let tls = entry.get_tls_config().unwrap_or_else(|e| {
-                        panic!("Failed to create TLS config: {e:?}")
+                        panic!("Failed to create TLS config: {e}")
                     });
 
                     Self::new(

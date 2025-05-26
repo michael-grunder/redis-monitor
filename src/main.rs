@@ -293,7 +293,6 @@ impl RetryBackoff {
 async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
     let prefix: Arc<str> = Arc::from(mon.format.clone());
     let address = Arc::new(mon.address.clone());
-
     let mut backoff = RetryBackoff::new();
 
     loop {
@@ -315,13 +314,13 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
                             };
                             if let Err(e) = tx.send(msg).await {
                                 eprintln!(
-                                    "[{prefix}] Failed to send message: {e:?}"
+                                    "[{prefix}] Failed to send message: {e}"
                                 );
                                 break;
                             }
                         }
                         Err(e) => {
-                            eprintln!("[{prefix}] Read error {e:?}");
+                            eprintln!("[{prefix}] Read error {e}");
                             break;
                         }
                     }
@@ -349,9 +348,6 @@ fn verseion_string() -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Print the size of Color
-    println!("Size of Color: {}", std::mem::size_of::<Color>());
-
     let opt: Options = Options::parse();
     let cfg = Map::load(opt.config_file.as_deref())?;
 
@@ -408,7 +404,7 @@ async fn main() -> Result<()> {
         let parsed = match Line::from_line(&line, opt.json) {
             Ok((_, line)) => line,
             Err(e) => {
-                eprintln!("Failed to parse line: {e:?} <- input: {line:?}");
+                eprintln!("Failed to parse line: {e} <- input: {line:?}");
                 continue;
             }
         };
