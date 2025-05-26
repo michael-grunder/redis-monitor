@@ -314,7 +314,7 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let opt: Options = Options::parse();
-    let cfg = Map::load(opt.config_file.as_ref().map(|p| p.as_path()))?;
+    let cfg = Map::load(opt.config_file.as_deref())?;
 
     if opt.version {
         let git_display = if GIT_DIRTY == "yes" {
