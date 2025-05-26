@@ -89,13 +89,7 @@ struct Options {
     #[arg(short, long, help = "Display the version and exit")]
     version: bool,
 
-    #[arg(
-        long,
-        value_name = "SECONDS",
-        num_args(0..=1),
-        default_missing_value = "1.0",
-        value_parser = validate_positive_f64,
-    )]
+    #[arg(long, value_parser = validate_positive_f64)]
     stats: Option<f64>,
 
     pub instances: Vec<String>,
