@@ -6,8 +6,13 @@ use redis::cmd;
 
 use serde::{Deserialize, Deserializer, de};
 use std::{
-    collections::HashMap, convert::AsRef, env, iter::IntoIterator,
-    option::Option, path::PathBuf, str::FromStr,
+    collections::HashMap,
+    convert::AsRef,
+    env,
+    iter::IntoIterator,
+    option::Option,
+    path::{Path, PathBuf},
+    str::FromStr,
 };
 
 const DEFAULT_CFGFILE_NAMES: &[&str] = &[".redis-monitor", "redis-monitor"];
@@ -161,14 +166,27 @@ impl Map {
         })
     }
 
-    pub fn load(path: Option<impl AsRef<str>>) -> Self {
-        let cfg = path.map_or_else(Self::from_default_toml_file, |path| {
-            Some(
-                Self::from_toml_file(path).expect("Failed to load config file"),
-            )
-        });
+    pub fn load(path: Option<&Path>) -> Result<Self> {
+        let cfg = match path {
+            Some(p) => {
+                let path_str = p.to_str().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Invalid UTF-8 in config file path: {:?}",
+                        p
+                    )
+                })?;
+                Some(Self::from_toml_file(path_str)?)
+            }
+            None => Self::from_default_toml_file(),
+        };
 
-        Self(cfg.unwrap_or_default())
+        //let cfg = path.map_or_else(Self::from_default_toml_file, |path| {
+        //    Some(
+        //        Self::from_toml_file(path).expect("Failed to load config file"),
+        //    )
+        //});
+
+        Ok(Self(cfg.unwrap_or_default()))
     }
 
     pub fn get<'a>(&'a self, name: &str) -> Option<&'a Entry> {
