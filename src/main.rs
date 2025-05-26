@@ -373,7 +373,13 @@ fn print_stats(stats: &stats::CommandStats, json: bool) {
             "[stats]: {}",
             stats
                 .iter()
-                .map(|s| format!("count={}, bytes={}", s.count, s.bytes))
+                .filter_map(|s| {
+                    if s.count > 0 {
+                        Some(format!("{}=[{}, {}]", s.name, s.count, s.bytes))
+                    } else {
+                        None
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         );
