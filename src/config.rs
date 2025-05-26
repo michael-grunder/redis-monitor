@@ -1,5 +1,5 @@
 use crate::connection::{ServerAddr, TlsConfig};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use colored::Color;
 use config::{Config, File, FileFormat};
 use redis::cmd;
