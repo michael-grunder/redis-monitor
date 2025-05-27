@@ -36,6 +36,10 @@ mod stats;
 struct CsvArgument(Vec<String>);
 
 #[derive(Parser, Debug)]
+#[command(
+    name = "redis-monitor",
+    about = "A utility to monitor one or more RESP compatible servers"
+)]
 #[allow(clippy::struct_excessive_bools)]
 struct Options {
     #[arg(short, long, help = "Treat each instance like its a cluster seed")]
