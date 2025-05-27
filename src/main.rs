@@ -334,13 +334,13 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
                             };
                             if let Err(e) = tx.send(msg).await {
                                 eprintln!(
-                                    "[{prefix}] Failed to send message: {e}"
+                                    "{prefix} Failed to send message: {e}"
                                 );
                                 break;
                             }
                         }
                         Err(e) => {
-                            eprintln!("[{prefix}] Read error {e}");
+                            eprintln!("{prefix} Read error {e}");
                             break;
                         }
                     }
@@ -348,7 +348,7 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
             }
             Err(e) => {
                 if backoff.retries == 0 {
-                    eprintln!("[{prefix}] Error connecting {e}");
+                    eprintln!("{prefix} Error connecting {e}");
                 }
             }
         }
