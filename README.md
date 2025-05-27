@@ -10,6 +10,8 @@ cd redis-monitor
 cargo build --release
 ```
 
+## Usage
+
 ```bash
 A utility to monitor one or more RESP compatible servers
 
