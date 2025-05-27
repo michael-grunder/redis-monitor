@@ -58,7 +58,7 @@ pub enum ServerAddr {
 }
 
 pub trait GetHost {
-    fn get_host(&self) -> String;
+    fn get_host(&self) -> &str;
 }
 
 pub trait GetPort {
@@ -205,10 +205,10 @@ impl std::fmt::Display for ServerAddr {
 }
 
 impl GetHost for ServerAddr {
-    fn get_host(&self) -> String {
+    fn get_host(&self) -> &str {
         match self {
-            Self::Tcp(host, _) => host.to_string(),
-            Self::Unix(path) => path.into(),
+            Self::Tcp(host, _) => host,
+            Self::Unix(path) => path,
         }
     }
 }
@@ -445,7 +445,7 @@ impl Monitor {
 
         let vars: &[(&'static str, Option<String>)] = &[
             ("%A", Some(address.to_string())),
-            ("%h", Some(address.get_host())),
+            ("%h", Some(address.get_host().into())),
             ("%p", address.get_port().map(|p| p.to_string())),
             ("%n", name.map(std::string::ToString::to_string)),
         ];
