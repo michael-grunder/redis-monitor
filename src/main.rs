@@ -38,7 +38,13 @@ struct CsvArgument(Vec<String>);
 #[derive(Parser, Debug)]
 #[command(
     name = "redis-monitor",
-    about = "A utility to monitor one or more RESP compatible servers"
+    about = "A utility to monitor one or more RESP compatible servers",
+    after_help = r#"
+Examples:
+  # Monitor a cluster expecting one node to be 127.0.0.1:6379
+  redis-monitor -c 6379
+  # Monitor two standalone instances
+  redis-monitor host1:6379 host2:6379"#
 )]
 #[allow(clippy::struct_excessive_bools)]
 struct Options {
