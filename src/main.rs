@@ -261,7 +261,7 @@ fn process_instances(
 }
 
 #[derive(Debug)]
-struct RetryBackoff {
+struct Backoff {
     retries: u32,
     max_delay: Duration,
 }
@@ -274,7 +274,7 @@ pub struct MonitorMessage {
     line: String,
 }
 
-impl RetryBackoff {
+impl Backoff {
     const MIN_DELAY: Duration = Duration::from_millis(50);
     const MAX_DELAY: Duration = Duration::from_secs(1);
 
@@ -313,7 +313,7 @@ impl RetryBackoff {
 async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
     let prefix: Arc<str> = Arc::from(mon.format.clone());
     let address = Arc::new(mon.address.clone());
-    let mut backoff = RetryBackoff::new();
+    let mut backoff = Backoff::new();
 
     loop {
         match mon.clone().connect().await {

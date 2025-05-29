@@ -451,9 +451,7 @@ impl Monitor {
         ];
 
         for (var, value) in vars {
-            if let Some(v) = value {
-                format = format.replace(var, v);
-            }
+            format = format.replace(var, value.as_deref().unwrap_or(""));
         }
 
         format
