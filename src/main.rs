@@ -43,8 +43,7 @@ struct CsvArgument(Vec<String>);
   %A  Full address (host:port or unix path)
   %h  Host part of the address
   %n  Name of the monitor if one exists
-  %p  Port number (if applicable)
-  %Bp Base path (for unix sockets, basename of the path)
+  %p  The 'short' name (port if TCP and basename(path) if a unix socket)
 
 Examples:
   # Monitor a cluster expecting one node to be 127.0.0.1:6379

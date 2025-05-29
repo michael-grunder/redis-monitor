@@ -249,17 +249,22 @@ impl ServerAddr {
         Ok(con)
     }
 
-    fn get_path(&self) -> Option<&str> {
+    // Get a "compact" version of the address. If it's TCP just the port
+    // and if a unix socket the basename of the path
+    fn get_short_name(&self) -> Option<String> {
         match self {
-            Self::Tcp(_, _) => None,
-            Self::Unix(path) => Some(path),
+            Self::Tcp(_, port) => Some(port.to_string()),
+            Self::Unix(path) => {
+                let path = path.as_str();
+                if path.is_empty() {
+                    None
+                } else {
+                    Some(
+                        path.split('/').next_back().unwrap_or(path).to_string(),
+                    )
+                }
+            }
         }
-    }
-
-    // Return the basename(path) assuming we are a unix socket path
-    fn get_base_path(&self) -> Option<String> {
-        self.get_path()
-            .map(|p| p.split('/').next_back().unwrap_or(p).to_string())
     }
 }
 
@@ -460,8 +465,7 @@ impl Monitor {
             ("%A", Some(address.to_string())),
             ("%h", Some(address.get_host().into())),
             ("%n", name.map(std::string::ToString::to_string)),
-            ("%p", address.get_port().map(|p| p.to_string())),
-            ("%Bp", address.get_base_path()),
+            ("%p", address.get_short_name()),
         ];
 
         for (var, value) in vars {
