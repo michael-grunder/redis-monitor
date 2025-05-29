@@ -242,9 +242,9 @@ impl ServerAddr {
         let uri = self.get_url_string();
         let cli = Client::open(&*uri)
             .with_context(|| format!("Failed to open connection to {uri}"))?;
-        let con = cli
-            .get_connection()
-            .context("Failed to get connection from client")?;
+        let con = cli.get_connection().map_err(|e| {
+            anyhow!("Failed to get connection from client: {e}")
+        })?;
 
         Ok(con)
     }
@@ -259,7 +259,7 @@ impl ServerAddr {
     // Return the basename(path) assuming we are a unix socket path
     fn get_base_path(&self) -> Option<String> {
         self.get_path()
-            .map(|p| p.split('/').last().unwrap_or(p).to_string())
+            .map(|p| p.split('/').next_back().unwrap_or(p).to_string())
     }
 }
 
@@ -573,13 +573,8 @@ impl Monitor {
             }
         };
 
-        Self::try_auth(&self.auth, &mut stream)
-            .await
-            .context("Failed to authenticate")?;
-
-        Self::try_monitor(&mut stream)
-            .await
-            .context("Failed to send MONITOR command")?;
+        Self::try_auth(&self.auth, &mut stream).await?;
+        Self::try_monitor(&mut stream).await?;
 
         Ok((self, BufReader::new(stream)))
     }
