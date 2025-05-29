@@ -248,6 +248,19 @@ impl ServerAddr {
 
         Ok(con)
     }
+
+    fn get_path(&self) -> Option<&str> {
+        match self {
+            Self::Tcp(_, _) => None,
+            Self::Unix(path) => Some(path),
+        }
+    }
+
+    // Return the basename(path) assuming we are a unix socket path
+    fn get_base_path(&self) -> Option<String> {
+        self.get_path()
+            .map(|p| p.split('/').last().unwrap_or(p).to_string())
+    }
 }
 
 impl std::str::FromStr for ServerAddr {
@@ -446,8 +459,9 @@ impl Monitor {
         let vars: &[(&'static str, Option<String>)] = &[
             ("%A", Some(address.to_string())),
             ("%h", Some(address.get_host().into())),
-            ("%p", address.get_port().map(|p| p.to_string())),
             ("%n", name.map(std::string::ToString::to_string)),
+            ("%p", address.get_port().map(|p| p.to_string())),
+            ("%Bp", address.get_base_path()),
         ];
 
         for (var, value) in vars {

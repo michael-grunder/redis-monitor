@@ -39,7 +39,13 @@ struct CsvArgument(Vec<String>);
 #[command(
     name = "redis-monitor",
     about = "A utility to monitor one or more RESP compatible servers",
-    after_help = r#"
+    after_help = r#"Format specifiers:
+  %A  Full address (host:port or unix path)
+  %h  Host part of the address
+  %n  Name of the monitor if one exists
+  %p  Port number (if applicable)
+  %Bp Base path (for unix sockets, basename of the path)
+
 Examples:
   # Monitor a cluster expecting one node to be 127.0.0.1:6379
   redis-monitor -c 6379
