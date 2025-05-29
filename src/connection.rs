@@ -506,16 +506,14 @@ impl Monitor {
     async fn read_line_reply(s: &mut Stream) -> Result<String> {
         let mut reader = BufReader::new(s);
         let mut line = String::new();
+
         reader.read_line(&mut line).await?;
 
-        if line.starts_with('+') {
-            Ok(line.strip_prefix('+').unwrap().trim_end().to_string())
-        } else if line.starts_with('-') {
-            Err(anyhow!(
-                line.strip_prefix('-').unwrap().trim_end().to_string()
-            ))
-        } else {
-            Err(anyhow!("Unexpected server reply: {}", line.trim_end()))
+        match line.chars().next() {
+            Some('+') => Ok(line[1..].to_string()),
+            Some('-') => Err(anyhow!("Server Error: {}", &line[1..])),
+            Some(c) => Err(anyhow!("Got reply-type byte '{c}': {line}",)),
+            _ => Err(anyhow!("Received empty line from server")),
         }
     }
 
