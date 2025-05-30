@@ -32,9 +32,6 @@ mod filter;
 mod monitor;
 mod stats;
 
-#[derive(Debug, Clone, Default)]
-struct CsvArgument(Vec<String>);
-
 #[derive(Parser, Debug)]
 #[command(
     name = "redis-monitor",
@@ -67,12 +64,6 @@ struct Options {
 
     #[arg(long, help = "Disable colored output")]
     no_color: bool,
-
-    #[arg(long, help = "Only include commands matching comma-separated list")]
-    include: Option<CsvArgument>,
-
-    #[arg(long, help = "Exclude commands matching comma-separated list")]
-    exclude: Option<CsvArgument>,
 
     #[arg(long, help = "Only show commands for a specific database")]
     db: Option<u64>,
@@ -119,41 +110,6 @@ fn validate_positive_f64(s: &str) -> Result<f64, String> {
         Ok(val) if val > 0.0 => Ok(val),
         Ok(_) => Err("Value must be positive".to_string()),
         Err(_) => Err("Invalid number".to_string()),
-    }
-}
-
-impl FromStr for CsvArgument {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut set: HashSet<String> = s
-            .split(',')
-            .filter_map(|s| {
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s.trim().to_owned())
-                }
-            })
-            .collect();
-
-        Ok(Self(set.drain().collect()))
-    }
-}
-
-impl From<CsvArgument> for Vec<String> {
-    fn from(arg: CsvArgument) -> Self {
-        arg.0
-    }
-}
-
-impl<'de> Deserialize<'de> for CsvArgument {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        FromStr::from_str(&s).map_err(de::Error::custom)
     }
 }
 
@@ -426,10 +382,6 @@ async fn main() -> Result<()> {
     };
 
     let (tx, mut rx) = mpsc::channel::<MonitorMessage>(1000);
-    let filter = Filter::from_args(
-        opt.include.unwrap_or_default().into(),
-        opt.exclude.unwrap_or_default().into(),
-    );
 
     let tasks = FuturesUnordered::new();
 
@@ -453,14 +405,6 @@ async fn main() -> Result<()> {
     let mut tick = Instant::now();
 
     while let Some(MonitorMessage { prefix, line, .. }) = rx.recv().await {
-        if stats.is_none()
-            && !opt.json
-            && (opt.db.is_none() && filter.is_empty())
-        {
-            println!("{} {}", format_prefix(&prefix), line);
-            continue;
-        }
-
         let parsed = match Line::from_line(&line, opt.json) {
             Ok((_, line)) => line,
             Err(e) => {
@@ -475,12 +419,6 @@ async fn main() -> Result<()> {
                 print_stats(stats, opt.json);
                 tick = Instant::now();
             }
-        }
-
-        if matches!(opt.db, Some(db) if db != parsed.db)
-            || filter.filter(parsed.cmd)
-        {
-            continue;
         }
 
         if opt.json {
