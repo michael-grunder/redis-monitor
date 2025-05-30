@@ -5,7 +5,7 @@ use crate::{
     config::{Map, ServerAuth},
     connection::Cluster,
     connection::Monitor,
-    filter::FilterArg,
+    filter::FilterPattern,
     monitor::Line,
 };
 use anyhow::Result;
@@ -75,8 +75,9 @@ struct Options {
     #[arg(short, long, help = "Redis password")]
     pass: Option<String>,
 
-    #[clap(long, action = clap::ArgAction::Append)]
-    filter: Vec<FilterArg>,
+    #[clap(long, action = clap::ArgAction::Append,
+           help = "One or more patterns to either filter out or in")]
+    filter: Vec<FilterPattern>,
 
     #[arg(short, long, help = "Output in JSON format")]
     json: bool,
