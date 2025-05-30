@@ -61,10 +61,6 @@ pub trait GetHost {
     fn get_host(&self) -> &str;
 }
 
-pub trait GetPort {
-    fn get_port(&self) -> Option<u16>;
-}
-
 #[derive(Debug, Eq, Clone)]
 pub struct ClusterNode {
     pub id: String,
@@ -209,15 +205,6 @@ impl GetHost for ServerAddr {
         match self {
             Self::Tcp(host, _) => host,
             Self::Unix(path) => path,
-        }
-    }
-}
-
-impl GetPort for ServerAddr {
-    fn get_port(&self) -> Option<u16> {
-        match self {
-            Self::Tcp(_, port) => Some(*port),
-            Self::Unix(_) => None,
         }
     }
 }

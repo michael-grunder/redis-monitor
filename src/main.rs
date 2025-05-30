@@ -5,19 +5,20 @@ use crate::{
     config::{Map, ServerAuth},
     connection::Cluster,
     connection::Monitor,
-    filter::Filter,
+    filter::FilterArg,
     monitor::Line,
 };
 use anyhow::Result;
 use clap::Parser;
 use colored::{Color, ColoredString, Colorize};
 use connection::{ServerAddr, TlsConfig};
+use filter::Filter;
 use futures::stream::FuturesUnordered;
 use rand::{Rng, rng};
-use serde::{Deserialize, Deserializer, de};
+//use serde::{Deserialize, Deserializer, de};
 use std::{
-    collections::HashSet, convert::From, default::Default, path::PathBuf,
-    str::FromStr, sync::Arc, time::Instant,
+    collections::HashSet, convert::From, path::PathBuf, str::FromStr,
+    sync::Arc, time::Instant,
 };
 use tokio::{
     io::AsyncBufReadExt,
@@ -73,6 +74,9 @@ struct Options {
 
     #[arg(short, long, help = "Redis password")]
     pass: Option<String>,
+
+    #[clap(long, action = clap::ArgAction::Append)]
+    filter: Vec<FilterArg>,
 
     #[arg(short, long, help = "Output in JSON format")]
     json: bool,
@@ -402,9 +406,14 @@ async fn main() -> Result<()> {
 
     let mut stats = opt.stats.map(|_| stats::CommandStats::new());
     let interval = Duration::from_secs_f64(opt.stats.unwrap_or(1.0));
+    let filter: Filter = opt.filter.into();
     let mut tick = Instant::now();
 
     while let Some(MonitorMessage { prefix, line, .. }) = rx.recv().await {
+        if !filter.check(&line) {
+            continue;
+        }
+
         let parsed = match Line::from_line(&line, opt.json) {
             Ok((_, line)) => line,
             Err(e) => {

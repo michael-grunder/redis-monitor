@@ -1,70 +1,48 @@
-use std::{
-    collections::HashSet,
-    hash::{Hash, Hasher},
-};
+use std::str::FromStr;
 
-#[derive(Debug, Clone, Eq)]
-struct FilterString(String);
+use regex::Regex;
+use serde::{Deserialize, Deserializer};
 
-#[derive(Debug)]
-pub struct Filter {
-    include: HashSet<FilterString>,
-    exclude: HashSet<FilterString>,
+#[derive(Debug, Clone)]
+pub enum FilterArg {
+    Literal(String),
+    Regex(regex::Regex),
 }
 
-impl From<&str> for FilterString {
-    fn from(s: &str) -> Self {
-        Self(s.to_ascii_lowercase())
-    }
-}
+pub struct Filter(Vec<FilterArg>);
 
-impl From<String> for FilterString {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
+impl FromStr for FilterArg {
+    type Err = String; // or a custom error if you prefer
 
-impl PartialEq for FilterString {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.eq_ignore_ascii_case(&other.0)
-    }
-}
-
-impl Hash for FilterString {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        for b in self.0.bytes() {
-            state.write_u8(b.to_ascii_lowercase());
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(re) = s.strip_prefix('/').and_then(|s| s.strip_suffix('/'))
+        {
+            Regex::new(re)
+                .map(FilterArg::Regex)
+                .map_err(|e| e.to_string())
+        } else {
+            Ok(FilterArg::Literal(s.to_string()))
         }
     }
 }
 
-impl std::borrow::Borrow<str> for FilterString {
-    fn borrow(&self) -> &str {
-        &self.0
+impl FilterArg {
+    fn check(&self, value: &str) -> bool {
+        match self {
+            FilterArg::Literal(literal) => value.contains(literal),
+            FilterArg::Regex(regex) => regex.is_match(value),
+        }
     }
 }
 
 impl Filter {
-    pub fn is_empty(&self) -> bool {
-        self.include.is_empty() && self.exclude.is_empty()
+    pub fn check(&self, value: &str) -> bool {
+        self.0.iter().any(|arg| arg.check(value))
     }
+}
 
-    fn should_include(&self, value: &str) -> bool {
-        self.include.is_empty() || self.include.contains(value)
-    }
-
-    fn should_exclude(&self, value: &str) -> bool {
-        !self.exclude.is_empty() && !self.exclude.contains(value)
-    }
-
-    pub fn filter(&self, value: &str) -> bool {
-        !self.should_include(value) || self.should_exclude(value)
-    }
-
-    pub fn from_args(include: Vec<String>, exclude: Vec<String>) -> Self {
-        Self {
-            include: include.into_iter().map(Into::into).collect(),
-            exclude: exclude.into_iter().map(Into::into).collect(),
-        }
+impl From<Vec<FilterArg>> for Filter {
+    fn from(args: Vec<FilterArg>) -> Self {
+        Filter(args)
     }
 }
