@@ -15,7 +15,6 @@ use connection::{ServerAddr, TlsConfig};
 use filter::Filter;
 use futures::stream::FuturesUnordered;
 use rand::{Rng, rng};
-//use serde::{Deserialize, Deserializer, de};
 use std::{
     collections::HashSet, convert::From, path::PathBuf, str::FromStr,
     sync::Arc, time::Instant,
