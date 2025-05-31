@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use regex::Regex;
 use std::str::FromStr;
 
