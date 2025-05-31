@@ -21,15 +21,15 @@ pub enum Pattern {
 impl Pattern {
     fn check(&self, value: &str) -> bool {
         match self {
-            Pattern::Literal(lit) => value.contains(lit),
-            Pattern::Regex(re) => re.is_match(value),
+            Self::Literal(lit) => value.contains(lit),
+            Self::Regex(re) => re.is_match(value),
         }
     }
 
     fn as_str(&self) -> &str {
         match self {
-            Pattern::Literal(lit) => lit,
-            Pattern::Regex(re) => re.as_str(),
+            Self::Literal(lit) => lit,
+            Self::Regex(re) => re.as_str(),
         }
     }
 }
@@ -52,11 +52,9 @@ impl FromStr for FilterPattern {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        let (negate, s) = if s.starts_with('!') {
-            (true, &s[1..])
-        } else {
-            (false, s)
-        };
+        let (negate, s) = s
+            .strip_prefix('!')
+            .map_or((false, s), |stripped| (true, stripped));
 
         let pattern = if let Some(inner) =
             s.strip_prefix('/').and_then(|s| s.strip_suffix('/'))
@@ -70,9 +68,9 @@ impl FromStr for FilterPattern {
         };
 
         Ok(if negate {
-            FilterPattern::Exclude(pattern)
+            Self::Exclude(pattern)
         } else {
-            FilterPattern::Include(pattern)
+            Self::Include(pattern)
         })
     }
 }
