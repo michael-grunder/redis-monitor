@@ -1,6 +1,10 @@
 use anyhow::Result;
 use regex::Regex;
-use std::str::FromStr;
+use std::{
+    collections::HashSet,
+    hash::{Hash, Hasher},
+    str::FromStr,
+};
 
 #[derive(Debug, Clone)]
 pub enum FilterPattern {
@@ -20,6 +24,27 @@ impl Pattern {
             Pattern::Literal(lit) => value.contains(lit),
             Pattern::Regex(re) => re.is_match(value),
         }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Pattern::Literal(lit) => lit,
+            Pattern::Regex(re) => re.as_str(),
+        }
+    }
+}
+
+impl PartialEq for Pattern {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for Pattern {}
+
+impl Hash for Pattern {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
     }
 }
 
@@ -65,6 +90,15 @@ impl From<Vec<FilterPattern>> for Filter {
 }
 
 impl Filter {
+    fn unique_patterns(patterns: &[Pattern]) -> Vec<Pattern> {
+        patterns
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     pub fn new(patterns: Vec<FilterPattern>) -> Self {
         let mut include = Vec::new();
         let mut exclude = Vec::new();
@@ -76,7 +110,10 @@ impl Filter {
             }
         }
 
-        Self { include, exclude }
+        Self {
+            include: Self::unique_patterns(&include),
+            exclude: Self::unique_patterns(&exclude),
+        }
     }
 
     pub fn check(&self, value: &str) -> bool {
