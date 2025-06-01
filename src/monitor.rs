@@ -241,8 +241,7 @@ impl<'a> Line<'a> {
     }
 
     fn write_bulk_string(writer: &mut dyn Write, string: &str) -> Result<()> {
-        write!(writer, "${}\r\n", string.len())?;
-        write!(writer, "{}\r\n", string)?;
+        write!(writer, "${}\r\n{string}\r\n", string.len())?;
         Ok(())
     }
 
@@ -256,7 +255,7 @@ impl<'a> Line<'a> {
 
         let total_count = 1 + args.len();
 
-        write!(writer, "*{}\r\n", total_count)?;
+        write!(writer, "*{total_count}\r\n")?;
 
         Self::write_bulk_string(writer, self.cmd)?;
 

@@ -16,7 +16,7 @@ use filter::Filter;
 use futures::stream::FuturesUnordered;
 use rand::{Rng, rng};
 use std::{
-    collections::HashSet, convert::From, io, path::PathBuf, str::FromStr,
+    collections::HashSet, convert::From, path::PathBuf, str::FromStr,
     sync::Arc, time::Instant,
 };
 use tokio::{
@@ -120,12 +120,12 @@ const GIT_DIRTY: &str = env!("GIT_DIRTY");
 impl FromStr for OutputKind {
     type Err = Error;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
-            "plain" => Ok(OutputKind::Plain),
-            "resp" => Ok(OutputKind::Resp),
-            "json" => Ok(OutputKind::Json),
-            "csv" => Ok(OutputKind::Csv),
+            "plain" => Ok(Self::Plain),
+            "resp" => Ok(Self::Resp),
+            "json" => Ok(Self::Json),
+            "csv" => Ok(Self::Csv),
             _ => Err(anyhow!(
                 "Invalid output format '{}'. Supported formats: json, text, xml",
                 s
@@ -134,17 +134,17 @@ impl FromStr for OutputKind {
     }
 }
 
-fn validate_positive_f64(s: &str) -> Result<f64, String> {
+fn validate_positive_f64(s: &str) -> Result<f64> {
     match s.parse::<f64>() {
         Ok(val) if val > 0.0 => Ok(val),
-        Ok(_) => Err("Value must be positive".to_string()),
-        Err(_) => Err("Invalid number".to_string()),
+        Ok(_) => Err(anyhow!("Value must be positive".to_string())),
+        Err(_) => Err(anyhow!("Invalid number".to_string())),
     }
 }
 
 impl OutputKind {
     fn need_args(self) -> bool {
-        return self != Self::Plain;
+        self != Self::Plain
     }
 }
 
@@ -441,13 +441,16 @@ async fn main() -> Result<()> {
         Box::new(|p| p.to_string().bold())
     };
 
-    let mut stats = opt.stats.map(|_| stats::CommandStats::new());
+    let mut stats = if opt.output == OutputKind::Plain {
+        opt.stats.map(|_| stats::CommandStats::new())
+    } else {
+        None
+    };
+
     let interval = Duration::from_secs_f64(opt.stats.unwrap_or(1.0));
     let filter: Filter = opt.filter.into();
     let mut tick = Instant::now();
     let mut csv_writer = csv::Writer::from_writer(std::io::stdout());
-    let stdout = io::stdout();
-    let mut io_writer = stdout.lock();
 
     while let Some(MonitorMessage { prefix, line, .. }) = rx.recv().await {
         if !filter.check(&line) {
@@ -472,16 +475,19 @@ async fn main() -> Result<()> {
 
         match opt.output {
             OutputKind::Plain => {
-                println!("{} {}", format_prefix(&prefix), line)
+                println!("{} {}", format_prefix(&prefix), line);
             }
             OutputKind::Csv => {
                 csv_writer
                     .serialize(parsed)
                     .unwrap_or_else(|e| eprintln!("Failed to write CSV: {e}"));
+                csv_writer.flush().unwrap_or_else(|e| {
+                    eprintln!("Failed to flush CSV writer: {e}");
+                });
             }
             OutputKind::Resp => {
                 parsed
-                    .write_resp(&mut io_writer)
+                    .write_resp(&mut std::io::stdout())
                     .unwrap_or_else(|e| eprintln!("Failed to write RESP: {e}"));
             }
             OutputKind::Json => {
