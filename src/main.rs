@@ -483,9 +483,9 @@ async fn main() -> Result<()> {
             OutputKind::Csv => {
                 csv_writer
                     .serialize(parsed)
-                    .and_then(|_| csv_writer.flush().map_err(|e| e.into()))
+                    .and_then(|()| csv_writer.flush().map_err(std::convert::Into::into))
                     .unwrap_or_else(|e| {
-                        eprintln!("Failed to write/flush CSV: {e}")
+                        eprintln!("Failed to write/flush CSV: {e}");
                     });
             }
             OutputKind::Resp => {
