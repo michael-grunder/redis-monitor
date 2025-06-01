@@ -1,5 +1,9 @@
+use anyhow::Result;
 use serde::Serialize;
-use std::net::{IpAddr, Ipv4Addr};
+use std::{
+    io::Write,
+    net::{IpAddr, Ipv4Addr},
+};
 
 use nom::{
     Err, IResult, Parser,
@@ -234,6 +238,33 @@ impl<'a> Line<'a> {
         };
 
         Ok((input, Self::new(timestamp, db, addr, cmd, args)))
+    }
+
+    fn write_bulk_string(writer: &mut dyn Write, string: &str) -> Result<()> {
+        write!(writer, "${}\r\n", string.len())?;
+        write!(writer, "{}\r\n", string)?;
+        Ok(())
+    }
+
+    pub fn write_resp(&self, writer: &mut dyn Write) -> Result<()> {
+        let args = match &self.args {
+            LineArgs::Parsed(v) => v,
+            LineArgs::Raw(_) => {
+                panic!("write_resp called with LineArgs::Raw");
+            }
+        };
+
+        let total_count = 1 + args.len();
+
+        write!(writer, "*{}\r\n", total_count)?;
+
+        Self::write_bulk_string(writer, self.cmd)?;
+
+        for arg in args {
+            Self::write_bulk_string(writer, arg)?;
+        }
+
+        Ok(())
     }
 
     pub const fn new(

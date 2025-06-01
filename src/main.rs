@@ -8,7 +8,7 @@ use crate::{
     filter::FilterPattern,
     monitor::Line,
 };
-use anyhow::Result;
+use anyhow::{Error, Result, anyhow};
 use clap::Parser;
 use colored::{Color, ColoredString, Colorize};
 use connection::{ServerAddr, TlsConfig};
@@ -16,7 +16,7 @@ use filter::Filter;
 use futures::stream::FuturesUnordered;
 use rand::{Rng, rng};
 use std::{
-    collections::HashSet, convert::From, path::PathBuf, str::FromStr,
+    collections::HashSet, convert::From, io, path::PathBuf, str::FromStr,
     sync::Arc, time::Instant,
 };
 use tokio::{
@@ -78,8 +78,8 @@ struct Options {
            help = "One or more patterns to either filter out or in")]
     filter: Vec<FilterPattern>,
 
-    #[arg(short, long, help = "Output in JSON format")]
-    json: bool,
+    #[arg(short, long, help = "How to format the output")]
+    output: OutputKind,
 
     #[arg(long, help = "Connect using TLS")]
     tls: bool,
@@ -105,15 +105,46 @@ struct Options {
     pub instances: Vec<String>,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum OutputKind {
+    Plain,
+    Json,
+    Csv,
+    Resp,
+}
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_HASH: &str = env!("GIT_HASH");
 const GIT_DIRTY: &str = env!("GIT_DIRTY");
+
+impl FromStr for OutputKind {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "plain" => Ok(OutputKind::Plain),
+            "resp" => Ok(OutputKind::Resp),
+            "json" => Ok(OutputKind::Json),
+            "csv" => Ok(OutputKind::Csv),
+            _ => Err(anyhow!(
+                "Invalid output format '{}'. Supported formats: json, text, xml",
+                s
+            )),
+        }
+    }
+}
 
 fn validate_positive_f64(s: &str) -> Result<f64, String> {
     match s.parse::<f64>() {
         Ok(val) if val > 0.0 => Ok(val),
         Ok(_) => Err("Value must be positive".to_string()),
         Err(_) => Err("Invalid number".to_string()),
+    }
+}
+
+impl OutputKind {
+    fn need_args(self) -> bool {
+        return self != Self::Plain;
     }
 }
 
@@ -331,11 +362,11 @@ fn verseion_string() -> String {
     format!("redis-monitor v{VERSION} (git {git_display})")
 }
 
-fn print_stats(stats: &stats::CommandStats, json: bool) {
+fn print_stats(stats: &stats::CommandStats, output: OutputKind) {
     let mut stats = stats.get_stats();
     stats.sort_by(|a, b| b.count.cmp(&a.count));
 
-    if json {
+    if output == OutputKind::Json {
         println!(
             "{}",
             serde_json::to_string(&stats).unwrap_or_else(|e| {
@@ -359,6 +390,16 @@ fn print_stats(stats: &stats::CommandStats, json: bool) {
                 .join(", ")
         );
     }
+}
+
+fn print_monitor_startup(monitor: &Monitor, output: OutputKind) -> Result<()> {
+    if output == OutputKind::Json {
+        println!("{}\n", serde_json::to_string(&monitor.address)?);
+    } else {
+        println!("MONITOR: {}", monitor.address);
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -390,11 +431,7 @@ async fn main() -> Result<()> {
     let tasks = FuturesUnordered::new();
 
     for mon in seeds {
-        if opt.json {
-            println!("{}\n", serde_json::to_string(&mon.address)?);
-        } else {
-            println!("MONITOR: {}", mon.address);
-        }
+        print_monitor_startup(&mon, opt.output)?;
         tasks.push(tokio::spawn(run_monitor(mon, tx.clone())));
     }
 
@@ -408,13 +445,16 @@ async fn main() -> Result<()> {
     let interval = Duration::from_secs_f64(opt.stats.unwrap_or(1.0));
     let filter: Filter = opt.filter.into();
     let mut tick = Instant::now();
+    let mut csv_writer = csv::Writer::from_writer(std::io::stdout());
+    let stdout = io::stdout();
+    let mut io_writer = stdout.lock();
 
     while let Some(MonitorMessage { prefix, line, .. }) = rx.recv().await {
         if !filter.check(&line) {
             continue;
         }
 
-        let parsed = match Line::from_line(&line, opt.json) {
+        let parsed = match Line::from_line(&line, opt.output.need_args()) {
             Ok((_, line)) => line,
             Err(e) => {
                 eprintln!("Failed to parse line: {e} <- input: {line:?}");
@@ -425,15 +465,31 @@ async fn main() -> Result<()> {
         if let Some(ref mut stats) = stats {
             stats.incr(parsed.cmd, line.len());
             if tick.elapsed() >= interval {
-                print_stats(stats, opt.json);
+                print_stats(stats, opt.output);
                 tick = Instant::now();
             }
         }
 
-        if opt.json {
-            println!("{}", serde_json::to_string(&parsed)?);
-        } else {
-            println!("{} {}", format_prefix(&prefix), line);
+        match opt.output {
+            OutputKind::Plain => {
+                println!("{} {}", format_prefix(&prefix), line)
+            }
+            OutputKind::Csv => {
+                csv_writer
+                    .serialize(parsed)
+                    .unwrap_or_else(|e| eprintln!("Failed to write CSV: {e}"));
+            }
+            OutputKind::Resp => {
+                parsed
+                    .write_resp(&mut io_writer)
+                    .unwrap_or_else(|e| eprintln!("Failed to write RESP: {e}"));
+            }
+            OutputKind::Json => {
+                serde_json::to_writer(std::io::stdout(), &parsed)
+                    .unwrap_or_else(|e| eprintln!("Failed to write JSON: {e}"));
+
+                println!();
+            }
         }
     }
 
