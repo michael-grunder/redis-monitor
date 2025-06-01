@@ -450,7 +450,10 @@ async fn main() -> Result<()> {
     let interval = Duration::from_secs_f64(opt.stats.unwrap_or(1.0));
     let filter: Filter = opt.filter.into();
     let mut tick = Instant::now();
-    let mut csv_writer = csv::Writer::from_writer(std::io::stdout());
+
+    let mut csv_writer = csv::WriterBuilder::new()
+        .flexible(true)
+        .from_writer(std::io::stdout());
 
     while let Some(MonitorMessage { prefix, line, .. }) = rx.recv().await {
         if !filter.check(&line) {
@@ -480,10 +483,10 @@ async fn main() -> Result<()> {
             OutputKind::Csv => {
                 csv_writer
                     .serialize(parsed)
-                    .unwrap_or_else(|e| eprintln!("Failed to write CSV: {e}"));
-                csv_writer.flush().unwrap_or_else(|e| {
-                    eprintln!("Failed to flush CSV writer: {e}");
-                });
+                    .and_then(|_| csv_writer.flush().map_err(|e| e.into()))
+                    .unwrap_or_else(|e| {
+                        eprintln!("Failed to write/flush CSV: {e}")
+                    });
             }
             OutputKind::Resp => {
                 parsed
