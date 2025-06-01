@@ -394,9 +394,9 @@ fn print_stats(stats: &stats::CommandStats, output: OutputKind) {
 
 fn print_monitor_startup(monitor: &Monitor, output: OutputKind) -> Result<()> {
     if output == OutputKind::Json {
-        println!("{}\n", serde_json::to_string(&monitor.address)?);
+        eprintln!("{}\n", serde_json::to_string(&monitor.address)?);
     } else {
-        println!("MONITOR: {}", monitor.address);
+        eprintln!("MONITOR: {}", monitor.address);
     }
 
     Ok(())
