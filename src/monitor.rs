@@ -44,6 +44,23 @@ enum StringFragment<'a> {
     EscapedChar(char),
 }
 
+impl<'a> std::fmt::Display for LineArgs<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LineArgs::Raw(raw) => write!(f, "{raw}"),
+            LineArgs::Parsed(args) => {
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 impl<'a> Line<'a> {
     fn parse_escaped_hex<E>(input: &'a str) -> IResult<&'a str, char, E>
     where

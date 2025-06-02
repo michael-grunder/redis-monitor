@@ -14,6 +14,7 @@ use colored::{Color, ColoredString, Colorize};
 use connection::{ServerAddr, TlsConfig};
 use filter::Filter;
 use futures::stream::FuturesUnordered;
+use output::OutputKind;
 use rand::{Rng, rng};
 use std::{
     collections::HashSet, convert::From, path::PathBuf, str::FromStr,
@@ -30,6 +31,7 @@ mod config;
 mod connection;
 mod filter;
 mod monitor;
+mod output;
 mod stats;
 
 #[derive(Parser, Debug)]
@@ -105,46 +107,15 @@ struct Options {
     pub instances: Vec<String>,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum OutputKind {
-    Plain,
-    Json,
-    Csv,
-    Resp,
-}
-
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_HASH: &str = env!("GIT_HASH");
 const GIT_DIRTY: &str = env!("GIT_DIRTY");
-
-impl FromStr for OutputKind {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "plain" => Ok(Self::Plain),
-            "resp" => Ok(Self::Resp),
-            "json" => Ok(Self::Json),
-            "csv" => Ok(Self::Csv),
-            _ => Err(anyhow!(
-                "Invalid output format '{}'. Supported formats: json, text, xml",
-                s
-            )),
-        }
-    }
-}
 
 fn validate_positive_f64(s: &str) -> Result<f64> {
     match s.parse::<f64>() {
         Ok(val) if val > 0.0 => Ok(val),
         Ok(_) => Err(anyhow!("Value must be positive".to_string())),
         Err(_) => Err(anyhow!("Invalid number".to_string())),
-    }
-}
-
-impl OutputKind {
-    fn need_args(self) -> bool {
-        self != Self::Plain
     }
 }
 
@@ -392,23 +363,13 @@ fn print_stats(stats: &stats::CommandStats, output: OutputKind) {
     }
 }
 
-fn print_monitor_startup(monitor: &Monitor, output: OutputKind) -> Result<()> {
-    if output == OutputKind::Json {
-        eprintln!("{}\n", serde_json::to_string(&monitor.address)?);
-    } else {
-        eprintln!("MONITOR: {}", monitor.address);
-    }
-
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let opt: Options = Options::parse();
     let cfg = Map::load(opt.config_file.as_deref())?;
 
     if opt.version {
-        println!("{}", verseion_string());
+        eprintln!("{}", verseion_string());
         return Ok(());
     }
 
@@ -430,8 +391,10 @@ async fn main() -> Result<()> {
 
     let tasks = FuturesUnordered::new();
 
+    let mut writer = opt.output.get_writer(std::io::stdout());
+
     for mon in seeds {
-        print_monitor_startup(&mon, opt.output)?;
+        writer.preamble(&mon)?;
         tasks.push(tokio::spawn(run_monitor(mon, tx.clone())));
     }
 
@@ -450,10 +413,6 @@ async fn main() -> Result<()> {
     let interval = Duration::from_secs_f64(opt.stats.unwrap_or(1.0));
     let filter: Filter = opt.filter.into();
     let mut tick = Instant::now();
-
-    let mut csv_writer = csv::WriterBuilder::new()
-        .flexible(true)
-        .from_writer(std::io::stdout());
 
     while let Some(MonitorMessage { prefix, line, .. }) = rx.recv().await {
         if !filter.check(&line) {
@@ -476,30 +435,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        match opt.output {
-            OutputKind::Plain => {
-                println!("{} {}", format_prefix(&prefix), line);
-            }
-            OutputKind::Csv => {
-                csv_writer
-                    .serialize(parsed)
-                    .and_then(|()| csv_writer.flush().map_err(std::convert::Into::into))
-                    .unwrap_or_else(|e| {
-                        eprintln!("Failed to write/flush CSV: {e}");
-                    });
-            }
-            OutputKind::Resp => {
-                parsed
-                    .write_resp(&mut std::io::stdout())
-                    .unwrap_or_else(|e| eprintln!("Failed to write RESP: {e}"));
-            }
-            OutputKind::Json => {
-                serde_json::to_writer(std::io::stdout(), &parsed)
-                    .unwrap_or_else(|e| eprintln!("Failed to write JSON: {e}"));
-
-                println!();
-            }
-        }
+        writer.write_line(&format_prefix(&prefix), &parsed)?;
     }
 
     Ok(())
