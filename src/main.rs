@@ -8,7 +8,7 @@ use crate::{
     filter::FilterPattern,
     monitor::Line,
 };
-use anyhow::{Error, Result, anyhow};
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use colored::{Color, ColoredString, Colorize};
 use connection::{ServerAddr, TlsConfig};
@@ -80,7 +80,12 @@ struct Options {
            help = "One or more patterns to either filter out or in")]
     filter: Vec<FilterPattern>,
 
-    #[arg(short, long, help = "How to format the output")]
+    #[arg(
+        short,
+        long,
+        default_value = "plain",
+        help = "How to format the output"
+    )]
     output: OutputKind,
 
     #[arg(long, help = "Connect using TLS")]
