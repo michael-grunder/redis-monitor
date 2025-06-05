@@ -151,9 +151,9 @@ fn process_cluster_instances(
     tls: Option<&Arc<TlsConfig>>,
     auth: &ServerAuth,
 ) -> Vec<Monitor> {
-    let addresses = opt.instances.iter().map(|i| {
-        ServerAddr::from_str(i).unwrap_or_else(|_| {
-            panic!("Unable to interpret '{i:?}' as a redis address");
+    let addresses = opt.instances.iter().map(|addr| {
+        ServerAddr::from_str(addr).unwrap_or_else(|_| {
+            panic!("Unable to interpret '{addr:?}' as a server address");
         })
     });
 
