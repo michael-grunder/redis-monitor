@@ -51,7 +51,7 @@ impl OutputKind {
 }
 
 pub trait OutputHandler {
-    fn preamble(&mut self, _monitor: &Monitor) -> Result<()> {
+    fn preamble(&mut self, _monitor: &[Monitor]) -> Result<()> {
         Ok(())
     }
 
@@ -79,8 +79,15 @@ struct RespWriter<W: Write> {
 }
 
 impl<W: Write> OutputHandler for PlainWriter<W> {
-    fn preamble(&mut self, monitor: &Monitor) -> Result<()> {
-        writeln!(self.writer, "MONITOR: {}", monitor.address)?;
+    fn preamble(&mut self, monitor: &[Monitor]) -> Result<()> {
+        let addresses = monitor
+            .iter()
+            .map(|m| m.address.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        writeln!(self.writer, "MONITOR: {addresses}")?;
+
         Ok(())
     }
 
@@ -99,8 +106,11 @@ impl<W: Write> OutputHandler for CsvWriter<W> {
 }
 
 impl<W: Write> OutputHandler for JsonWriter<W> {
-    fn preamble(&mut self, monitor: &Monitor) -> Result<()> {
-        serde_json::to_writer(&mut self.writer, &monitor.address)?;
+    fn preamble(&mut self, monitor: &[Monitor]) -> Result<()> {
+        let display: Vec<String> =
+            monitor.iter().map(|m| m.address.to_string()).collect();
+        serde_json::to_writer(&mut self.writer, &display)?;
+
         writeln!(&mut self.writer)?;
         Ok(())
     }
