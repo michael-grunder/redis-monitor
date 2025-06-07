@@ -73,7 +73,7 @@ struct Options {
     #[arg(short, long, help = "Redis user")]
     user: Option<String>,
 
-    #[arg(short, long, help = "Redis password")]
+    #[arg(short, long, short_alias = 'a', help = "Redis password")]
     pass: Option<String>,
 
     #[clap(long, action = clap::ArgAction::Append,
