@@ -398,10 +398,11 @@ async fn main() -> Result<()> {
 
     let mut writer = opt.output.get_writer(std::io::stdout());
 
-    for mon in seeds {
-        writer.preamble(&mon)?;
-        tasks.push(tokio::spawn(run_monitor(mon, tx.clone())));
-    }
+    writer.preamble(&seeds)?;
+
+    seeds
+        .into_iter()
+        .for_each(|mon| tasks.push(tokio::spawn(run_monitor(mon, tx.clone()))));
 
     let format_prefix: Box<dyn Fn(&str) -> ColoredString> = if opt.no_color {
         Box::new(|p| p.to_string().normal())
