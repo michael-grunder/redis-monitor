@@ -10,7 +10,7 @@ use nom::{
     branch::alt,
     bytes::complete::{is_not, tag, take_until, take_while_m_n},
     character::complete::{alpha1, char, digit1, space0},
-    combinator::{map, map_opt, map_res, opt, recognize, value, verify},
+    combinator::{map, map_opt, map_res, opt, peek, recognize, value, verify},
     error::{ErrorKind, FromExternalError, ParseError},
     multi::{fold_many0, many1, separated_list0},
     number::complete::double,
@@ -36,6 +36,7 @@ pub struct Line<'a> {
 pub enum ClientAddr<'a> {
     Path(&'a str),
     Tcp((IpAddr, u16)),
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +207,11 @@ impl<'a> Line<'a> {
         Ok((input, path))
     }
 
+    pub fn parse_unknown(input: &str) -> IResult<&str, &str> {
+        let (input, _) = peek(tag("]")).parse(input)?;
+        Ok((input, ""))
+    }
+
     fn parse_client(input: &str) -> IResult<&str, ClientAddr> {
         if let Ok((input, path)) = Self::parse_unix(input) {
             Ok((input, ClientAddr::from_path(path)))
@@ -213,6 +219,8 @@ impl<'a> Line<'a> {
             Ok((input, ClientAddr::from_addr(addr, port)))
         } else if let Ok((input, (addr, port))) = Self::parse_ipv6(input) {
             Ok((input, ClientAddr::from_addr(addr, port)))
+        } else if let Ok((input, _)) = Self::parse_unknown(input) {
+            Ok((input, ClientAddr::Unknown))
         } else {
             Err(Err::Error(ParseError::from_error_kind(
                 input,
