@@ -265,12 +265,14 @@ impl std::str::FromStr for ServerAddr {
                     Ok(Self::from_path(addr))
                 } else {
                     let v: Vec<&str> = addr.split(':').collect();
-                    if v.len() == 2 {
-                        let port = v[1].parse::<u16>().unwrap();
-                        Ok(Self::from_tcp_addr(v[0], port))
+
+                    let port = if v.len() == 2 {
+                        v[1].parse::<u16>()?
                     } else {
-                        Err(anyhow!("Don't know how to parse address"))
-                    }
+                        6379
+                    };
+
+                    Ok(Self::from_tcp_addr(v[0], port))
                 }
             },
             |port| Ok(Self::from_tcp_addr("127.0.0.1", port)),
