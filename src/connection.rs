@@ -527,9 +527,9 @@ impl Monitor {
     async fn try_auth(auth: &ServerAuth, s: &mut Stream) -> Result<()> {
         let resp = match (&auth.user, &auth.pass) {
             (Some(user), Some(pass)) => {
-                Self::to_resp(&[user.as_str(), pass.as_str()])
+                Self::to_resp(&["AUTH", user.as_str(), pass.as_str()])
             }
-            (None, Some(pass)) => Self::to_resp(&[pass.as_str()]),
+            (None, Some(pass)) => Self::to_resp(&["AUTH", pass.as_str()]),
             _ => return Ok(()),
         };
 
