@@ -212,7 +212,7 @@ impl<'a> Line<'a> {
         Ok((input, ""))
     }
 
-    fn parse_client(input: &str) -> IResult<&str, ClientAddr> {
+    fn parse_client(input: &str) -> IResult<&str, ClientAddr<'_>> {
         if let Ok((input, path)) = Self::parse_unix(input) {
             Ok((input, ClientAddr::from_path(path)))
         } else if let Ok((input, (addr, port))) = Self::parse_ipv4(input) {
@@ -229,7 +229,7 @@ impl<'a> Line<'a> {
         }
     }
 
-    fn parse_source(input: &str) -> IResult<&str, (u64, ClientAddr)> {
+    fn parse_source(input: &str) -> IResult<&str, (u64, ClientAddr<'_>)> {
         let (input, _) = tag("[")(input)?;
         let (input, db) = Self::parse_from_str::<u64>(input)?;
         let (input, _) = space0(input)?;
