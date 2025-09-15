@@ -400,9 +400,9 @@ async fn main() -> Result<()> {
 
     writer.preamble(&seeds)?;
 
-    seeds
-        .into_iter()
-        .for_each(|mon| tasks.push(tokio::spawn(run_monitor(mon, tx.clone()))));
+    for mon in seeds {
+        tasks.push(tokio::spawn(run_monitor(mon, tx.clone())));
+    }
 
     let format_prefix: Box<dyn Fn(&str) -> ColoredString> = if opt.no_color {
         Box::new(|p| p.to_string().normal())
