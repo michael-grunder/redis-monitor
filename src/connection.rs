@@ -348,10 +348,10 @@ impl Cluster {
 
     pub fn from_seeds(seeds: &[ServerAddr]) -> Result<Self> {
         for seed in seeds {
-            if let Ok(mut con) = seed.get_connection() {
-                if let Ok(primaries) = Self::exec_slots(&mut con) {
-                    return Ok(Self::new(primaries));
-                }
+            if let Ok(mut con) = seed.get_connection()
+                && let Ok(primaries) = Self::exec_slots(&mut con)
+            {
+                return Ok(Self::new(primaries));
             }
         }
 
