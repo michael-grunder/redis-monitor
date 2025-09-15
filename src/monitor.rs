@@ -45,7 +45,7 @@ enum StringFragment<'a> {
     EscapedChar(char),
 }
 
-impl<'a> std::fmt::Display for LineArgs<'a> {
+impl std::fmt::Display for LineArgs<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LineArgs::Raw(raw) => write!(f, "{raw}"),
