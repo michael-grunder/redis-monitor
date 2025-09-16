@@ -128,9 +128,7 @@ impl<'a> Line<'a> {
 
     /// Parse a string. Use a loop of `parse_fragment` and push all of the fragments
     /// into an output string.
-    pub fn parse_escaped_string<E>(
-        input: &'a str,
-    ) -> IResult<&'a str, String, E>
+    fn parse_escaped_string<E>(input: &'a str) -> IResult<&'a str, String, E>
     where
         E: ParseError<&'a str>
             + FromExternalError<&'a str, std::num::ParseIntError>,
@@ -166,7 +164,7 @@ impl<'a> Line<'a> {
     }
 
     // aaa.bbb.ccc.ddd (127.0.0.1)
-    pub fn parse_ipv4(input: &str) -> IResult<&str, (IpAddr, u16)> {
+    fn parse_ipv4(input: &str) -> IResult<&str, (IpAddr, u16)> {
         let (input, a) = Self::parse_from_str::<u8>(input)?;
         let (input, _) = tag(".")(input)?;
         let (input, b) = Self::parse_from_str::<u8>(input)?;
@@ -184,7 +182,7 @@ impl<'a> Line<'a> {
     }
 
     // [0 [::1]:53374]
-    pub fn parse_ipv6(input: &str) -> IResult<&str, (IpAddr, u16)> {
+    fn parse_ipv6(input: &str) -> IResult<&str, (IpAddr, u16)> {
         let (input, _) = tag("[")(input)?;
         let (input, ip) = take_until("]")(input)?;
         let (input, _) = tag("]")(input)?;
@@ -201,13 +199,13 @@ impl<'a> Line<'a> {
         Ok((input, (ip, port)))
     }
 
-    pub fn parse_unix(input: &str) -> IResult<&str, &str> {
+    fn parse_unix(input: &str) -> IResult<&str, &str> {
         let (input, _) = tag("unix:")(input)?;
         let (input, path) = take_until("]")(input)?;
         Ok((input, path))
     }
 
-    pub fn parse_unknown(input: &str) -> IResult<&str, &str> {
+    fn parse_unknown(input: &str) -> IResult<&str, &str> {
         let (input, _) = peek(tag("]")).parse(input)?;
         Ok((input, ""))
     }
