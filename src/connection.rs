@@ -238,7 +238,7 @@ impl ServerAddr {
 
     // Get a "compact" version of the address. If it's TCP just the port
     // and if a unix socket the basename of the path
-    fn get_short_name(&self) -> Option<String> {
+    pub fn get_short_name(&self) -> Option<String> {
         match self {
             Self::Tcp(_, port) => Some(port.to_string()),
             Self::Unix(path) => {

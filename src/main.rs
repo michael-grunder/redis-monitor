@@ -10,7 +10,7 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use colored::{Color, ColoredString, Colorize};
+use colored::Color;
 use connection::{ServerAddr, TlsConfig};
 use filter::Filter;
 use futures::stream::FuturesUnordered;
@@ -39,10 +39,19 @@ mod stats;
     name = "redis-monitor",
     about = "A utility to monitor one or more RESP compatible servers",
     after_help = r#"Format specifiers:
-  %A  Full address (host:port or unix path)
-  %h  Host part of the address
-  %n  Name of the monitor if one exists
-  %p  The 'short' name (port if TCP and basename(path) if a unix socket)
+  %sa  Full address of the server (host:port or unix path)
+  %sh  Host part of the server address
+  %sp  Port part of the server address (or basename of unix path)
+  %Sn  Name of the server instance if it is set
+  %ca  Full address of the client (ip:port or unix path)
+  %ch  Host part of the client address
+  %cp  Port part of the client address (or basename of unix path)
+  %d   The database number
+  %t   The timestamp as reported by MONITOR
+  %C   The command name
+  %A   The rest of the command arguments
+
+  The default format is: "[%sa %ca %d] %t - \"%C\" %a";
 
 Examples:
   # Monitor a cluster expecting one node to be 127.0.0.1:6379
@@ -115,6 +124,8 @@ struct Options {
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_HASH: &str = env!("GIT_HASH");
 const GIT_DIRTY: &str = env!("GIT_DIRTY");
+
+const DEFAULT_FORMAT: &'static str = "[%sA %cA %d] %t - \"%C\" %a";
 
 fn validate_positive_f64(s: &str) -> Result<f64> {
     match s.parse::<f64>() {
@@ -240,8 +251,7 @@ struct Backoff {
 
 #[derive(Debug)]
 pub struct MonitorMessage {
-    pub prefix: Arc<str>,
-    pub address: Arc<ServerAddr>,
+    pub server: Arc<ServerAddr>,
     pub color: Option<Color>,
     line: String,
 }
@@ -283,8 +293,7 @@ impl Backoff {
 }
 
 async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
-    let prefix: Arc<str> = Arc::from(mon.format.clone());
-    let address = Arc::new(mon.address.clone());
+    let server = Arc::new(mon.address.clone());
     let mut backoff = Backoff::new();
 
     loop {
@@ -299,20 +308,19 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
                         Ok(0) => break,
                         Ok(_) => {
                             let msg = MonitorMessage {
-                                prefix: prefix.clone(),
-                                address: address.clone(),
+                                server: server.clone(),
                                 color: mon.color,
                                 line: line[1..].trim_end().to_string(),
                             };
                             if let Err(e) = tx.send(msg).await {
                                 eprintln!(
-                                    "{prefix} Failed to send message: {e}"
+                                    "{server} Failed to send message: {e}"
                                 );
                                 break;
                             }
                         }
                         Err(e) => {
-                            eprintln!("{prefix} Read error {e}");
+                            eprintln!("{server} Read error {e}");
                             break;
                         }
                     }
@@ -320,7 +328,7 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
             }
             Err(e) => {
                 if backoff.retries == 0 {
-                    eprintln!("{prefix} Error connecting {e}");
+                    eprintln!("{server} Error connecting {e}");
                 }
             }
         }
@@ -396,19 +404,14 @@ async fn main() -> Result<()> {
 
     let tasks = FuturesUnordered::new();
 
-    let mut writer = opt.output.get_writer(std::io::stdout());
+    let format = opt.format.as_deref().unwrap_or(DEFAULT_FORMAT);
+    let mut writer = opt.output.get_writer(std::io::stdout(), format);
 
     writer.preamble(&seeds)?;
 
     for mon in seeds {
         tasks.push(tokio::spawn(run_monitor(mon, tx.clone())));
     }
-
-    let format_prefix: Box<dyn Fn(&str) -> ColoredString> = if opt.no_color {
-        Box::new(|p| p.to_string().normal())
-    } else {
-        Box::new(|p| p.to_string().bold())
-    };
 
     let mut stats = if opt.output == OutputKind::Plain {
         opt.stats.map(|_| stats::CommandStats::new())
@@ -420,7 +423,7 @@ async fn main() -> Result<()> {
     let filter: Filter = opt.filter.into();
     let mut tick = Instant::now();
 
-    while let Some(MonitorMessage { prefix, line, .. }) = rx.recv().await {
+    while let Some(MonitorMessage { server, line, .. }) = rx.recv().await {
         if !filter.check(&line) {
             continue;
         }
@@ -441,7 +444,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        writer.write_line(&format_prefix(&prefix), &parsed)?;
+        writer.write_line(&server, &parsed)?;
     }
 
     Ok(())
