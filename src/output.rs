@@ -123,17 +123,13 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
                 FormatToken::ClientAddress => match line.addr {
                     ClientAddr::Path(p) => w.write_all(p.as_bytes())?,
                     ClientAddr::Tcp((ip, port)) => {
-                        w.write_all(ip.to_string().as_bytes())?;
-                        w.write_all(b":")?;
-                        w.write_all(port.to_string().as_bytes())?;
+                        write!(w, "{}:{}", ip, port)?;
                     }
                     _ => w.write_all(b"-")?,
                 },
                 FormatToken::ClientHost => match line.addr {
                     ClientAddr::Path(p) => write!(w, "{}", p)?,
-                    ClientAddr::Tcp((ip, _port)) => {
-                        w.write_all(ip.to_string().as_bytes())?;
-                    }
+                    ClientAddr::Tcp((ip, _port)) => write!(w, "{}", ip)?,
                     _ => w.write_all(b"-")?,
                 },
                 FormatToken::ClientPort => match line.addr {
