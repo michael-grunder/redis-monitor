@@ -315,3 +315,13 @@ impl<'a> ClientAddr<'a> {
         Self::Tcp((addr, port))
     }
 }
+
+impl std::fmt::Display for ClientAddr<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientAddr::Path(path) => write!(f, "unix:{path}"),
+            ClientAddr::Tcp((addr, port)) => write!(f, "{addr}:{port}"),
+            ClientAddr::Unknown => write!(f, "unknown"),
+        }
+    }
+}

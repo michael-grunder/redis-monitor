@@ -402,7 +402,7 @@ impl Cluster {
 }
 
 impl Monitor {
-    const DEFAULT_FORMAT: &'static str = "[%A]";
+    const DEFAULT_FORMAT: &'static str = "%A";
 
     pub fn from_config_entry(name: &str, entry: &Entry) -> Vec<Self> {
         if entry.cluster {

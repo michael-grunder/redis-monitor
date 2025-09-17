@@ -92,7 +92,11 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
     }
 
     fn write_line(&mut self, prefix: &str, line: &Line) -> Result<()> {
-        writeln!(self.writer, "{} \"{}\" {}", prefix, line.cmd, line.args)?;
+        writeln!(
+            self.writer,
+            r#"[{} {}] {} - "{}" {}"#,
+            prefix, line.addr, line.timestamp, line.cmd, line.args
+        )?;
         Ok(())
     }
 }
