@@ -64,7 +64,12 @@ struct Options {
     #[arg(short, long, help = "Treat each instance like its a cluster seed")]
     cluster: bool,
 
-    #[arg(short, long, help = "How to format each MONITOR line")]
+    #[arg(
+        short,
+        long,
+        help = "How to format each MONITOR line",
+        default_value = r#"[%sa %ca %d] %t - "%C" %a"#
+    )]
     format: Option<String>,
 
     #[arg(short, long, help = "Also connect and MONITOR cluster replicas")]
@@ -124,8 +129,6 @@ struct Options {
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_HASH: &str = env!("GIT_HASH");
 const GIT_DIRTY: &str = env!("GIT_DIRTY");
-
-const DEFAULT_FORMAT: &'static str = "[%sA %cA %d] %t - \"%C\" %a";
 
 fn validate_positive_f64(s: &str) -> Result<f64> {
     match s.parse::<f64>() {
@@ -191,7 +194,6 @@ fn process_cluster_instances(
                             tls.cloned(),
                             auth.clone(),
                             None,
-                            opt.format.as_deref(),
                         )
                     })
                 })
@@ -230,7 +232,6 @@ fn process_instances(
                                 tls.cloned(),
                                 auth.clone(),
                                 None,
-                                opt.format.as_deref(),
                             );
 
                             vec![monitor]
@@ -404,7 +405,7 @@ async fn main() -> Result<()> {
 
     let tasks = FuturesUnordered::new();
 
-    let format = opt.format.as_deref().unwrap_or(DEFAULT_FORMAT);
+    let format = opt.format.as_deref().unwrap();
     let mut writer = opt.output.get_writer(std::io::stdout(), format);
 
     writer.preamble(&seeds)?;

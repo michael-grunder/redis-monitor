@@ -48,7 +48,6 @@ pub struct Monitor {
     pub tls: Option<Arc<TlsConfig>>,
     pub auth: ServerAuth,
     pub color: Option<Color>,
-    pub format: String,
 }
 
 #[derive(Debug, Eq, Clone, Serialize)]
@@ -402,8 +401,6 @@ impl Cluster {
 }
 
 impl Monitor {
-    const DEFAULT_FORMAT: &'static str = "%A";
-
     pub fn from_config_entry(name: &str, entry: &Entry) -> Vec<Self> {
         if entry.cluster {
             let c = Cluster::from_seeds(&entry.get_addresses())
@@ -421,7 +418,6 @@ impl Monitor {
                         tls.map(Arc::new),
                         entry.get_auth(),
                         entry.get_color(),
-                        entry.format.as_deref(),
                     )
                 })
                 .collect()
@@ -436,32 +432,10 @@ impl Monitor {
                         None, // TODO: TLS config
                         entry.get_auth(),
                         entry.get_color(),
-                        entry.format.as_deref(),
                     )
                 })
                 .collect()
         }
-    }
-
-    fn make_format_string(
-        name: Option<&str>,
-        address: &ServerAddr,
-        format: &str,
-    ) -> String {
-        let mut format = format.to_owned();
-
-        let vars: &[(&'static str, Option<String>)] = &[
-            ("%A", Some(address.to_string())),
-            ("%h", Some(address.get_host().into())),
-            ("%n", name.map(std::string::ToString::to_string)),
-            ("%p", address.get_short_name()),
-        ];
-
-        for (var, value) in vars {
-            format = format.replace(var, value.as_deref().unwrap_or(""));
-        }
-
-        format
     }
 
     pub fn new(
@@ -470,20 +444,12 @@ impl Monitor {
         tls: Option<Arc<TlsConfig>>,
         auth: ServerAuth,
         color: Option<Color>,
-        format: Option<&str>,
     ) -> Self {
-        let format = Self::make_format_string(
-            name,
-            &address,
-            format.unwrap_or(Self::DEFAULT_FORMAT),
-        );
-
         Self {
             address,
             tls,
             auth,
             color,
-            format,
         }
     }
 

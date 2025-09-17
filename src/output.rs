@@ -16,7 +16,7 @@ pub enum OutputKind {
 }
 
 #[derive(Debug, Clone)]
-enum LineOutput {
+enum FormatToken {
     Literal(Vec<u8>),
     ServerAddress,
     ServerHost,
@@ -80,7 +80,7 @@ pub trait OutputHandler {
 #[derive(Debug)]
 struct PlainWriter<W: Write> {
     writer: W,
-    format: Vec<LineOutput>,
+    format: Vec<FormatToken>,
 }
 
 #[derive(Debug)]
@@ -116,11 +116,11 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
 
         for f in format {
             match f {
-                LineOutput::Literal(v) => w.write_all(&v)?,
-                LineOutput::ServerAddress => write!(w, "{}", server)?,
-                LineOutput::ServerHost => Self::w_host(w, server)?,
-                LineOutput::ServerPort => Self::w_port(w, server)?,
-                LineOutput::ClientAddress => match line.addr {
+                FormatToken::Literal(v) => w.write_all(&v)?,
+                FormatToken::ServerAddress => write!(w, "{}", server)?,
+                FormatToken::ServerHost => Self::w_host(w, server)?,
+                FormatToken::ServerPort => Self::w_port(w, server)?,
+                FormatToken::ClientAddress => match line.addr {
                     ClientAddr::Path(p) => w.write_all(p.as_bytes())?,
                     ClientAddr::Tcp((ip, port)) => {
                         w.write_all(ip.to_string().as_bytes())?;
@@ -129,26 +129,26 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
                     }
                     _ => w.write_all(b"-")?,
                 },
-                LineOutput::ClientHost => match line.addr {
+                FormatToken::ClientHost => match line.addr {
                     ClientAddr::Path(p) => write!(w, "{}", p)?,
                     ClientAddr::Tcp((ip, _port)) => {
                         w.write_all(ip.to_string().as_bytes())?;
                     }
                     _ => w.write_all(b"-")?,
                 },
-                LineOutput::ClientPort => match line.addr {
+                FormatToken::ClientPort => match line.addr {
                     ClientAddr::Path(_) => w.write_all(b"-")?,
                     ClientAddr::Tcp((_ip, port)) => {
                         write!(w, "{}", port)?;
                     }
                     _ => w.write_all(b"-")?,
                 },
-                LineOutput::Timestamp => {
+                FormatToken::Timestamp => {
                     write!(w, "{}", line.timestamp)?;
                 }
-                LineOutput::Database => write!(w, "{}", line.db)?,
-                LineOutput::Command => write!(w, "{}", line.cmd)?,
-                LineOutput::Arguments => write!(w, "{}", line.args)?,
+                FormatToken::Database => write!(w, "{}", line.db)?,
+                FormatToken::Command => write!(w, "{}", line.cmd)?,
+                FormatToken::Arguments => write!(w, "{}", line.args)?,
             }
         }
 
@@ -159,13 +159,13 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
 }
 
 impl<W: Write> PlainWriter<W> {
-    fn push_literal(v: &mut Vec<LineOutput>, lit: &mut Vec<u8>) {
+    fn push_literal(v: &mut Vec<FormatToken>, lit: &mut Vec<u8>) {
         if !lit.is_empty() {
-            v.push(LineOutput::Literal(std::mem::take(lit)));
+            v.push(FormatToken::Literal(std::mem::take(lit)));
         }
     }
 
-    fn compile_format(fmt: &str) -> Vec<LineOutput> {
+    fn compile_format(fmt: &str) -> Vec<FormatToken> {
         let mut res = vec![];
         let mut it = fmt.as_bytes().iter().copied().peekable();
         let mut lit = vec![];
@@ -175,7 +175,7 @@ impl<W: Write> PlainWriter<W> {
                 lit.push(b);
                 continue;
             }
-            if it.next() == Some(b'%') {
+            if it.peek() == Some(&b'%') {
                 lit.push(b'%');
                 continue;
             }
@@ -184,9 +184,9 @@ impl<W: Write> PlainWriter<W> {
 
             let o = match it.next() {
                 Some(b's') => match it.next() {
-                    Some(b'a') => LineOutput::ServerAddress,
-                    Some(b'h') => LineOutput::ServerHost,
-                    Some(b'p') => LineOutput::ServerPort,
+                    Some(b'a') => FormatToken::ServerAddress,
+                    Some(b'h') => FormatToken::ServerHost,
+                    Some(b'p') => FormatToken::ServerPort,
                     Some(x) => {
                         lit.extend_from_slice(&[b'%', b's', x]);
                         continue;
@@ -197,9 +197,9 @@ impl<W: Write> PlainWriter<W> {
                     }
                 },
                 Some(b'c') => match it.next() {
-                    Some(b'a') => LineOutput::ClientAddress,
-                    Some(b'h') => LineOutput::ClientHost,
-                    Some(b'p') => LineOutput::ClientPort,
+                    Some(b'a') => FormatToken::ClientAddress,
+                    Some(b'h') => FormatToken::ClientHost,
+                    Some(b'p') => FormatToken::ClientPort,
                     Some(x) => {
                         lit.extend_from_slice(&[b'%', b'c', x]);
                         continue;
@@ -209,10 +209,10 @@ impl<W: Write> PlainWriter<W> {
                         continue;
                     }
                 },
-                Some(b't') => LineOutput::Timestamp,
-                Some(b'd') => LineOutput::Database,
-                Some(b'C') => LineOutput::Command,
-                Some(b'a') => LineOutput::Arguments,
+                Some(b't') => FormatToken::Timestamp,
+                Some(b'd') => FormatToken::Database,
+                Some(b'C') => FormatToken::Command,
+                Some(b'a') => FormatToken::Arguments,
                 Some(x) => {
                     lit.extend_from_slice(&[b'%', x]);
                     continue;
