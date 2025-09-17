@@ -14,7 +14,7 @@ lazy_static = "1.5.0"
 nom = "8.0.0"
 prettytable-rs = "0.10.0"
 rand = "0.9.2"
-redis = { version = "0.31.0", features = ["tls", "tokio-native-tls-comp", "aio", "connection-manager", "tokio-comp"] }
+redis = { version = "0.32.5", features = ["tls", "tokio-native-tls-comp", "aio", "connection-manager", "tokio-comp"] }
 regex = "1.11.2"
 rustls = "0.23.31"
 rustls-native-certs = "0.8.1"
