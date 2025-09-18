@@ -44,6 +44,7 @@ pub struct TlsConfig {
 
 #[derive(Debug, Clone)]
 pub struct Monitor {
+    pub name: Option<String>,
     pub address: ServerAddr,
     pub tls: Option<Arc<TlsConfig>>,
     pub auth: ServerAuth,
@@ -446,6 +447,7 @@ impl Monitor {
         color: Option<Color>,
     ) -> Self {
         Self {
+            name: name.map(|s| s.to_string()),
             address,
             tls,
             auth,

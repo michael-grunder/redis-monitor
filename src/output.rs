@@ -19,6 +19,7 @@ pub enum OutputKind {
 enum FormatToken {
     Literal(Vec<u8>),
     ServerAddress,
+    ServerName,
     ServerHost,
     ServerPort,
     ClientAddress,
@@ -74,7 +75,12 @@ pub trait OutputHandler {
         Ok(())
     }
 
-    fn write_line(&mut self, server: &ServerAddr, line: &Line) -> Result<()>;
+    fn write_line(
+        &mut self,
+        server: &ServerAddr,
+        name: Option<&str>,
+        line: &Line,
+    ) -> Result<()>;
 }
 
 #[derive(Debug)]
@@ -111,12 +117,20 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
         Ok(())
     }
 
-    fn write_line(&mut self, server: &ServerAddr, line: &Line) -> Result<()> {
+    fn write_line(
+        &mut self,
+        server: &ServerAddr,
+        name: Option<&str>,
+        line: &Line,
+    ) -> Result<()> {
         let (w, format) = (&mut self.writer, &self.format);
 
         for f in format {
             match f {
                 FormatToken::Literal(v) => w.write_all(&v)?,
+                FormatToken::ServerName => {
+                    write!(w, "{}", name.unwrap_or("-"))?
+                }
                 FormatToken::ServerAddress => write!(w, "{}", server)?,
                 FormatToken::ServerHost => Self::w_host(w, server)?,
                 FormatToken::ServerPort => Self::w_port(w, server)?,
@@ -183,6 +197,7 @@ impl<W: Write> PlainWriter<W> {
                     Some(b'a') => FormatToken::ServerAddress,
                     Some(b'h') => FormatToken::ServerHost,
                     Some(b'p') => FormatToken::ServerPort,
+                    Some(b'n') => FormatToken::ServerName,
                     Some(x) => {
                         lit.extend_from_slice(&[b'%', b's', x]);
                         continue;
@@ -250,7 +265,12 @@ impl<W: Write> PlainWriter<W> {
 }
 
 impl<W: Write> OutputHandler for CsvWriter<W> {
-    fn write_line(&mut self, _server: &ServerAddr, line: &Line) -> Result<()> {
+    fn write_line(
+        &mut self,
+        _server: &ServerAddr,
+        _name: Option<&str>,
+        line: &Line,
+    ) -> Result<()> {
         self.writer.serialize(line)?;
         self.writer.flush()?;
         Ok(())
@@ -270,6 +290,7 @@ impl<W: Write> OutputHandler for JsonWriter<W> {
     fn write_line(
         &mut self,
         _server: &ServerAddr,
+        _name: Option<&str>,
         parsed: &Line,
     ) -> Result<()> {
         serde_json::to_writer(&mut self.writer, parsed)?;
@@ -282,6 +303,7 @@ impl<W: Write> OutputHandler for RespWriter<W> {
     fn write_line(
         &mut self,
         _server: &ServerAddr,
+        _name: Option<&str>,
         parsed: &Line,
     ) -> Result<()> {
         parsed.write_resp(&mut self.writer)?;

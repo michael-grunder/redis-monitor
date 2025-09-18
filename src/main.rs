@@ -253,6 +253,7 @@ struct Backoff {
 #[derive(Debug)]
 pub struct MonitorMessage {
     pub server: Arc<ServerAddr>,
+    pub name: Arc<Option<String>>,
     pub color: Option<Color>,
     line: String,
 }
@@ -295,6 +296,7 @@ impl Backoff {
 
 async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
     let server = Arc::new(mon.address.clone());
+    let name = Arc::new(mon.name.clone());
     let mut backoff = Backoff::new();
 
     loop {
@@ -310,6 +312,7 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
                         Ok(_) => {
                             let msg = MonitorMessage {
                                 server: server.clone(),
+                                name: name.clone(),
                                 color: mon.color,
                                 line: line[1..].trim_end().to_string(),
                             };
@@ -424,7 +427,10 @@ async fn main() -> Result<()> {
     let filter: Filter = opt.filter.into();
     let mut tick = Instant::now();
 
-    while let Some(MonitorMessage { server, line, .. }) = rx.recv().await {
+    while let Some(MonitorMessage {
+        server, name, line, ..
+    }) = rx.recv().await
+    {
         if !filter.check(&line) {
             continue;
         }
@@ -445,7 +451,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        writer.write_line(&server, &parsed)?;
+        writer.write_line(&server, name.as_ref().as_deref(), &parsed)?;
     }
 
     Ok(())
