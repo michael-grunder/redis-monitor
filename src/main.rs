@@ -49,9 +49,9 @@ mod stats;
   %d   The database number
   %t   The timestamp as reported by MONITOR
   %C   The command name
-  %A   The rest of the command arguments
+  %a   The rest of the command arguments
 
-  The default format is: "[%sa %ca %d] %t - \"%C\" %a";
+  The default format is: "%t [%sa %ca %d] \"%C\" %a";
 
 Examples:
   # Monitor a cluster expecting one node to be 127.0.0.1:6379
@@ -68,7 +68,7 @@ struct Options {
         short,
         long,
         help = "How to format each MONITOR line",
-        default_value = r#"[%sa %ca %d] %t - "%C" %a"#
+        default_value = r#"%t [%sa %ca %d] "%C" %a"#
     )]
     format: Option<String>,
 
