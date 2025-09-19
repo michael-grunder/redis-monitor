@@ -129,7 +129,7 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
 
         for f in format {
             match f {
-                FormatToken::Literal(v) => w.write_all(&v)?,
+                FormatToken::Literal(v) => w.write_all(v)?,
                 FormatToken::ClientServerShort => {
                     Self::w_client_server_short(w, server, &line.addr)?;
                 }

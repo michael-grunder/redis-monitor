@@ -186,7 +186,10 @@ impl Map {
         let cfg = match path {
             Some(p) => {
                 let path_str = p.to_str().ok_or_else(|| {
-                    anyhow!("Invalid UTF-8 in config file path: {p:?}")
+                    anyhow!(
+                        "Invalid UTF-8 in config file path: {}",
+                        p.display()
+                    )
                 })?;
                 Some(Self::from_toml_file(path_str)?)
             }

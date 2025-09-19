@@ -59,9 +59,8 @@ impl FromStr for FilterPattern {
         let pattern = if let Some(inner) =
             s.strip_prefix('/').and_then(|s| s.strip_suffix('/'))
         {
-            let re = Regex::new(inner).map_err(|e| {
-                anyhow::anyhow!("Invalid regex '{}': {}", inner, e)
-            })?;
+            let re = Regex::new(inner)
+                .map_err(|e| anyhow::anyhow!("Invalid regex '{inner}': {e}"))?;
             Pattern::Regex(re)
         } else {
             Pattern::Literal(s.to_string())
