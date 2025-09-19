@@ -314,14 +314,34 @@ impl<'a> ClientAddr<'a> {
     pub const fn from_addr(addr: IpAddr, port: u16) -> Self {
         Self::Tcp((addr, port))
     }
+
+    pub fn get_short_name(&self) -> String {
+        match self {
+            ClientAddr::Path(p) => std::path::Path::new(p)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("-")
+                .to_string(),
+            ClientAddr::Tcp((_ip, port)) => port.to_string(),
+            ClientAddr::Unknown => "-".to_string(),
+        }
+    }
+
+    pub fn get_host(&self) -> String {
+        match self {
+            ClientAddr::Path(_) => "-".to_string(),
+            ClientAddr::Tcp((ip, _port)) => ip.to_string(),
+            ClientAddr::Unknown => "-".to_string(),
+        }
+    }
 }
 
 impl std::fmt::Display for ClientAddr<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClientAddr::Path(path) => write!(f, "unix:{path}"),
+            ClientAddr::Path(path) => write!(f, "{path}"),
             ClientAddr::Tcp((addr, port)) => write!(f, "{addr}:{port}"),
-            ClientAddr::Unknown => write!(f, "unknown"),
+            ClientAddr::Unknown => write!(f, "-"),
         }
     }
 }

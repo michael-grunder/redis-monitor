@@ -39,6 +39,7 @@ mod stats;
     name = "redis-monitor",
     about = "A utility to monitor one or more RESP compatible servers",
     after_help = r#"Format specifiers:
+  %S   Short form of server and client address
   %sa  Full address of the server (host:port or unix path)
   %sh  Host part of the server address
   %sp  Port part of the server address (or basename of unix path)
@@ -68,9 +69,9 @@ struct Options {
         short,
         long,
         help = "How to format each MONITOR line",
-        default_value = r#"%t [%sa %ca %d] "%C" %a"#
+        default_value = r#"%t [%S %d] "%C" %a"#
     )]
-    format: Option<String>,
+    format: String,
 
     #[arg(short, long, help = "Also connect and MONITOR cluster replicas")]
     replicas: bool,
@@ -408,8 +409,7 @@ async fn main() -> Result<()> {
 
     let tasks = FuturesUnordered::new();
 
-    let format = opt.format.as_deref().unwrap();
-    let mut writer = opt.output.get_writer(std::io::stdout(), format);
+    let mut writer = opt.output.get_writer(std::io::stdout(), &opt.format);
 
     writer.preamble(&seeds)?;
 

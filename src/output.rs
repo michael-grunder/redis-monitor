@@ -18,6 +18,7 @@ pub enum OutputKind {
 #[derive(Debug, Clone)]
 enum FormatToken {
     Literal(Vec<u8>),
+    ClientServerShort,
     ServerAddress,
     ServerName,
     ServerHost,
@@ -128,31 +129,22 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
         for f in format {
             match f {
                 FormatToken::Literal(v) => w.write_all(&v)?,
+                FormatToken::ClientServerShort => {
+                    Self::w_client_server_short(w, server, &line.addr)?
+                }
                 FormatToken::ServerName => {
                     write!(w, "{}", name.unwrap_or("-"))?
                 }
                 FormatToken::ServerAddress => write!(w, "{}", server)?,
                 FormatToken::ServerHost => Self::w_host(w, server)?,
                 FormatToken::ServerPort => Self::w_port(w, server)?,
-                FormatToken::ClientAddress => match line.addr {
-                    ClientAddr::Path(p) => w.write_all(p.as_bytes())?,
-                    ClientAddr::Tcp((ip, port)) => {
-                        write!(w, "{}:{}", ip, port)?;
-                    }
-                    _ => w.write_all(b"-")?,
-                },
-                FormatToken::ClientHost => match line.addr {
-                    ClientAddr::Path(p) => write!(w, "{}", p)?,
-                    ClientAddr::Tcp((ip, _port)) => write!(w, "{}", ip)?,
-                    _ => w.write_all(b"-")?,
-                },
-                FormatToken::ClientPort => match line.addr {
-                    ClientAddr::Path(_) => w.write_all(b"-")?,
-                    ClientAddr::Tcp((_ip, port)) => {
-                        write!(w, "{}", port)?;
-                    }
-                    _ => w.write_all(b"-")?,
-                },
+                FormatToken::ClientAddress => write!(w, "{}", line.addr)?,
+                FormatToken::ClientHost => {
+                    write!(w, "{}", line.addr.get_host())?
+                }
+                FormatToken::ClientPort => {
+                    write!(w, "{}", line.addr.get_short_name())?
+                }
                 FormatToken::Timestamp => {
                     write!(w, "{}", line.timestamp)?;
                 }
@@ -220,6 +212,7 @@ impl<W: Write> PlainWriter<W> {
                         continue;
                     }
                 },
+                Some(b'S') => FormatToken::ClientServerShort,
                 Some(b't') => FormatToken::Timestamp,
                 Some(b'd') => FormatToken::Database,
                 Some(b'C') => FormatToken::Command,
@@ -240,6 +233,25 @@ impl<W: Write> PlainWriter<W> {
         Self::push_literal(&mut res, &mut lit);
 
         res
+    }
+
+    fn w_client_server_short(
+        writer: &mut W,
+        server: &ServerAddr,
+        client: &ClientAddr,
+    ) -> Result<()> {
+        if let ServerAddr::Tcp(shost, sport) = server
+            && let ClientAddr::Tcp((chost, cport)) = client
+        {
+            if shost == &chost.to_string() {
+                write!(writer, "{sport} {cport}")?;
+                return Ok(());
+            }
+        }
+
+        write!(writer, "{} {}", server, client)?;
+
+        Ok(())
     }
 
     fn w_host(writer: &mut W, server: &ServerAddr) -> Result<()> {
