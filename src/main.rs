@@ -49,10 +49,13 @@ mod stats;
   %cp  Port part of the client address (or basename of unix path)
   %d   The database number
   %t   The timestamp as reported by MONITOR
-  %C   The command name
-  %a   The rest of the command arguments
+  %l   The full command and all arguments
+  %C   Argument 0 (the command)
+  %a   Arguments 1..N
 
-  The default format is: "%t [%sa %ca %d] %l";
+  The default formats are:
+    Single instance:    "%t [%d %ca] %l";
+    Multiple Instances: "%t [%S %d] %l";
 
 Examples:
   # Monitor a cluster expecting one node to be 127.0.0.1:6379
@@ -65,13 +68,8 @@ struct Options {
     #[arg(short, long, help = "Treat each instance like its a cluster seed")]
     cluster: bool,
 
-    #[arg(
-        short,
-        long,
-        help = "How to format each MONITOR line",
-        default_value = r#"%t [%S %d] %l"#
-    )]
-    format: String,
+    #[arg(short, long, help = "How to format each MONITOR line")]
+    format: Option<String>,
 
     #[arg(short, long, help = "Also connect and MONITOR cluster replicas")]
     replicas: bool,
@@ -130,6 +128,9 @@ struct Options {
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_HASH: &str = env!("GIT_HASH");
 const GIT_DIRTY: &str = env!("GIT_DIRTY");
+
+const DEFAULT_SINGLE_FORMAT: &str = "%t [%d %ca] %l";
+const DEFAULT_MULTI_FORMAT: &str = "%t [%S %d] %l";
 
 fn validate_positive_f64(s: &str) -> Result<f64> {
     match s.parse::<f64>() {
@@ -409,7 +410,15 @@ async fn main() -> Result<()> {
 
     let tasks = FuturesUnordered::new();
 
-    let mut writer = opt.output.get_writer(std::io::stdout(), &opt.format);
+    let format = opt.format.clone().unwrap_or_else(|| {
+        if seeds.len() > 1 {
+            DEFAULT_MULTI_FORMAT.to_string()
+        } else {
+            DEFAULT_SINGLE_FORMAT.to_string()
+        }
+    });
+
+    let mut writer = opt.output.get_writer(std::io::stdout(), &format);
 
     writer.preamble(&seeds)?;
 
