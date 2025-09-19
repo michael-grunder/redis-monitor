@@ -117,10 +117,9 @@ impl ServerAuth {
 
         match command.query_async(con).await {
             Ok(redis::Value::Okay) => Ok(()),
-            other => bail!(
-                "AUTH failed: unexpected response from Redis: {:?}",
-                other
-            ),
+            other => {
+                bail!("AUTH failed: unexpected response from Redis: {other:?}",)
+            }
         }
     }
 }
@@ -187,7 +186,7 @@ impl Map {
         let cfg = match path {
             Some(p) => {
                 let path_str = p.to_str().ok_or_else(|| {
-                    anyhow!("Invalid UTF-8 in config file path: {p:?}",)
+                    anyhow!("Invalid UTF-8 in config file path: {p:?}")
                 })?;
                 Some(Self::from_toml_file(path_str)?)
             }

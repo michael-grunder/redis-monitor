@@ -131,20 +131,20 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
             match f {
                 FormatToken::Literal(v) => w.write_all(&v)?,
                 FormatToken::ClientServerShort => {
-                    Self::w_client_server_short(w, server, &line.addr)?
+                    Self::w_client_server_short(w, server, &line.addr)?;
                 }
                 FormatToken::ServerName => {
-                    write!(w, "{}", name.unwrap_or("-"))?
+                    write!(w, "{}", name.unwrap_or("-"))?;
                 }
                 FormatToken::ServerAddress => write!(w, "{server}")?,
                 FormatToken::ServerHost => Self::w_host(w, server)?,
                 FormatToken::ServerPort => Self::w_port(w, server)?,
                 FormatToken::ClientAddress => write!(w, "{}", line.addr)?,
                 FormatToken::ClientHost => {
-                    write!(w, "{}", line.addr.get_host())?
+                    write!(w, "{}", line.addr.get_host())?;
                 }
                 FormatToken::ClientPort => {
-                    write!(w, "{}", line.addr.get_short_name())?
+                    write!(w, "{}", line.addr.get_short_name())?;
                 }
                 FormatToken::Timestamp => {
                     write!(w, "{}", line.timestamp)?;
@@ -153,7 +153,7 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
                 FormatToken::Command => write!(w, "{}", line.cmd)?,
                 FormatToken::Arguments => write!(w, "{}", line.args)?,
                 FormatToken::FullLine => {
-                    write!(w, r#""{}" {}"#, line.cmd, line.args)?
+                    write!(w, r#""{}" {}"#, line.cmd, line.args)?;
                 }
             }
         }
@@ -199,7 +199,7 @@ impl<W: Write> PlainWriter<W> {
                         continue;
                     }
                     None => {
-                        lit.extend_from_slice(&[b'%', b's']);
+                        lit.extend_from_slice(b"%s");
                         continue;
                     }
                 },
@@ -212,7 +212,7 @@ impl<W: Write> PlainWriter<W> {
                         continue;
                     }
                     None => {
-                        lit.extend_from_slice(&[b'%', b'c']);
+                        lit.extend_from_slice(b"%c");
                         continue;
                     }
                 },

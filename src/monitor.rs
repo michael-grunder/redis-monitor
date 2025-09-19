@@ -329,9 +329,8 @@ impl<'a> ClientAddr<'a> {
 
     pub fn get_host(&self) -> String {
         match self {
-            ClientAddr::Path(_) => "-".to_string(),
             ClientAddr::Tcp(ip, _port) => ip.to_string(),
-            ClientAddr::Unknown => "-".to_string(),
+            _ => "-".to_string(),
         }
     }
 }

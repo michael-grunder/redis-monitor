@@ -10,6 +10,7 @@ use rustls::{
 use serde::Serialize;
 
 use serde::{Deserialize, Deserializer, de};
+use std::string::ToString;
 use std::{
     collections::HashSet,
     convert::AsRef,
@@ -447,7 +448,7 @@ impl Monitor {
         color: Option<Color>,
     ) -> Self {
         Self {
-            name: name.map(|s| s.to_string()),
+            name: name.map(ToString::to_string),
             address,
             tls,
             auth,
