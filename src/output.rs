@@ -30,6 +30,7 @@ enum FormatToken {
     Database,
     Command,
     Arguments,
+    FullLine,
 }
 
 impl FromStr for OutputKind {
@@ -151,6 +152,9 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
                 FormatToken::Database => write!(w, "{}", line.db)?,
                 FormatToken::Command => write!(w, "{}", line.cmd)?,
                 FormatToken::Arguments => write!(w, "{}", line.args)?,
+                FormatToken::FullLine => {
+                    write!(w, r#""{}" {}"#, line.cmd, line.args)?
+                }
             }
         }
 
@@ -217,6 +221,7 @@ impl<W: Write> PlainWriter<W> {
                 Some(b'd') => FormatToken::Database,
                 Some(b'C') => FormatToken::Command,
                 Some(b'a') => FormatToken::Arguments,
+                Some(b'l') => FormatToken::FullLine,
                 Some(x) => {
                     lit.extend_from_slice(&[b'%', x]);
                     continue;
