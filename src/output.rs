@@ -136,7 +136,7 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
                 FormatToken::ServerName => {
                     write!(w, "{}", name.unwrap_or("-"))?
                 }
-                FormatToken::ServerAddress => write!(w, "{}", server)?,
+                FormatToken::ServerAddress => write!(w, "{server}")?,
                 FormatToken::ServerHost => Self::w_host(w, server)?,
                 FormatToken::ServerPort => Self::w_port(w, server)?,
                 FormatToken::ClientAddress => write!(w, "{}", line.addr)?,
@@ -246,15 +246,14 @@ impl<W: Write> PlainWriter<W> {
         client: &ClientAddr,
     ) -> Result<()> {
         if let ServerAddr::Tcp(shost, sport) = server
-            && let ClientAddr::Tcp((chost, cport)) = client
+            && let ClientAddr::Tcp(chost, cport) = client
+            && shost == &chost.to_string()
         {
-            if shost == &chost.to_string() {
-                write!(writer, "{sport} {cport}")?;
-                return Ok(());
-            }
+            write!(writer, "{sport} {cport}")?;
+            return Ok(());
         }
 
-        write!(writer, "{} {}", server, client)?;
+        write!(writer, "{server} {client}")?;
 
         Ok(())
     }

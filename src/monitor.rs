@@ -35,7 +35,7 @@ pub struct Line<'a> {
 #[derive(Debug, Serialize)]
 pub enum ClientAddr<'a> {
     Path(&'a str),
-    Tcp((IpAddr, u16)),
+    Tcp(IpAddr, u16),
     Unknown,
 }
 
@@ -312,7 +312,7 @@ impl<'a> ClientAddr<'a> {
     }
 
     pub const fn from_addr(addr: IpAddr, port: u16) -> Self {
-        Self::Tcp((addr, port))
+        Self::Tcp(addr, port)
     }
 
     pub fn get_short_name(&self) -> String {
@@ -322,7 +322,7 @@ impl<'a> ClientAddr<'a> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("-")
                 .to_string(),
-            ClientAddr::Tcp((_ip, port)) => port.to_string(),
+            ClientAddr::Tcp(_ip, port) => port.to_string(),
             ClientAddr::Unknown => "-".to_string(),
         }
     }
@@ -330,7 +330,7 @@ impl<'a> ClientAddr<'a> {
     pub fn get_host(&self) -> String {
         match self {
             ClientAddr::Path(_) => "-".to_string(),
-            ClientAddr::Tcp((ip, _port)) => ip.to_string(),
+            ClientAddr::Tcp(ip, _port) => ip.to_string(),
             ClientAddr::Unknown => "-".to_string(),
         }
     }
@@ -340,7 +340,7 @@ impl std::fmt::Display for ClientAddr<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClientAddr::Path(path) => write!(f, "{path}"),
-            ClientAddr::Tcp((addr, port)) => write!(f, "{addr}:{port}"),
+            ClientAddr::Tcp(addr, port) => write!(f, "{addr}:{port}"),
             ClientAddr::Unknown => write!(f, "-"),
         }
     }
