@@ -134,7 +134,7 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
                     Self::w_client_server_short(w, server, &line.addr)?;
                 }
                 FormatToken::ServerName => {
-                    write!(w, "{}", name.unwrap_or("-"))?;
+                    w.write_all(name.unwrap_or("-").as_bytes())?;
                 }
                 FormatToken::ServerAddress => write!(w, "{server}")?,
                 FormatToken::ServerHost => Self::w_host(w, server)?,

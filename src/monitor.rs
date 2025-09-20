@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::Serialize;
 use std::{
+    borrow::Cow,
     io::Write,
     net::{IpAddr, Ipv4Addr},
 };
@@ -315,15 +316,14 @@ impl<'a> ClientAddr<'a> {
         Self::Tcp(addr, port)
     }
 
-    pub fn get_short_name(&self) -> String {
+    pub fn get_short_name(&self) -> Cow<'_, str> {
         match self {
-            ClientAddr::Path(p) => std::path::Path::new(p)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("-")
-                .to_string(),
-            ClientAddr::Tcp(_ip, port) => port.to_string(),
-            ClientAddr::Unknown => "-".to_string(),
+            Self::Path(p) => match p.rsplit('/').next() {
+                Some(name) if !name.is_empty() => Cow::Borrowed(name),
+                _ => Cow::Borrowed("-"),
+            },
+            Self::Tcp(_, port) => Cow::Owned(port.to_string()),
+            Self::Unknown => Cow::Borrowed("-"),
         }
     }
 
