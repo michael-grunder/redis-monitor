@@ -171,8 +171,6 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
                             }
                         }
                     }
-
-                    // write!(w, r#""{}" {}"#, line.cmd, line.args)?;
                 }
             }
         }
