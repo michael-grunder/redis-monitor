@@ -4,7 +4,7 @@ use anyhow::{Error, Result, anyhow};
 
 use crate::{
     connection::{GetHost, Monitor, ServerAddr},
-    monitor::{ClientAddr, Line},
+    monitor::{ClientAddr, Line, LineArgs},
 };
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -145,10 +145,10 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
                 }
                 FormatToken::ClientAddress => write!(w, "{}", line.addr)?,
                 FormatToken::ClientHost => {
-                    write!(w, "{}", line.addr.get_host())?;
+                    w.write_all(line.addr.get_host().as_bytes())?;
                 }
                 FormatToken::ClientPort => {
-                    write!(w, "{}", line.addr.get_short_name())?;
+                    w.write_all(line.addr.get_short_name().as_bytes())?;
                 }
                 FormatToken::Timestamp => {
                     write!(w, "{}", line.timestamp)?;
@@ -157,7 +157,22 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
                 FormatToken::Command => write!(w, "{}", line.cmd)?,
                 FormatToken::Arguments => write!(w, "{}", line.args)?,
                 FormatToken::FullLine => {
-                    write!(w, r#""{}" {}"#, line.cmd, line.args)?;
+                    w.write_all(b"\"")?;
+                    w.write_all(line.cmd.as_bytes())?;
+                    w.write_all(b"\"")?;
+
+                    match &line.args {
+                        LineArgs::Raw(s) => w.write_all(s.as_bytes())?,
+                        LineArgs::Parsed(v) => {
+                            for arg in v {
+                                w.write_all(b" \"")?;
+                                w.write_all(arg.as_bytes())?;
+                                w.write_all(b"\"")?;
+                            }
+                        }
+                    }
+
+                    // write!(w, r#""{}" {}"#, line.cmd, line.args)?;
                 }
             }
         }
@@ -177,8 +192,9 @@ impl<W: Write> PlainWriter<W> {
 
     fn compile_format(fmt: &str) -> Vec<FormatToken> {
         let mut res = vec![];
-        let mut it = fmt.as_bytes().iter().copied().peekable();
         let mut lit = vec![];
+
+        let mut it = fmt.as_bytes().iter().copied().peekable();
 
         while let Some(b) = it.next() {
             if b != b'%' {
