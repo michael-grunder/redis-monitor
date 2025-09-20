@@ -137,8 +137,12 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
                     w.write_all(name.unwrap_or("-").as_bytes())?;
                 }
                 FormatToken::ServerAddress => write!(w, "{server}")?,
-                FormatToken::ServerHost => Self::w_host(w, server)?,
-                FormatToken::ServerPort => Self::w_port(w, server)?,
+                FormatToken::ServerHost => {
+                    w.write_all(server.get_host().as_bytes())?;
+                }
+                FormatToken::ServerPort => {
+                    w.write_all(server.get_short_name().as_bytes())?;
+                }
                 FormatToken::ClientAddress => write!(w, "{}", line.addr)?,
                 FormatToken::ClientHost => {
                     write!(w, "{}", line.addr.get_host())?;
@@ -254,20 +258,6 @@ impl<W: Write> PlainWriter<W> {
         }
 
         write!(writer, "{server} {client}")?;
-
-        Ok(())
-    }
-
-    fn w_host(writer: &mut W, server: &ServerAddr) -> Result<()> {
-        writer.write_all(server.get_host().as_bytes())?;
-        Ok(())
-    }
-
-    fn w_port(writer: &mut W, server: &ServerAddr) -> Result<()> {
-        match server.get_short_name() {
-            Some(s) => writer.write_all(s.as_bytes())?,
-            None => writer.write_all(b"")?,
-        }
 
         Ok(())
     }

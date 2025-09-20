@@ -10,6 +10,7 @@ use rustls::{
 use serde::Serialize;
 
 use serde::{Deserialize, Deserializer, de};
+use std::borrow::Cow;
 use std::string::ToString;
 use std::{
     collections::HashSet,
@@ -237,20 +238,11 @@ impl ServerAddr {
         Ok(con)
     }
 
-    // Get a "compact" version of the address. If it's TCP just the port
-    // and if a unix socket the basename of the path
-    pub fn get_short_name(&self) -> Option<String> {
+    pub fn get_short_name(&self) -> Cow<'_, str> {
         match self {
-            Self::Tcp(_, port) => Some(port.to_string()),
+            Self::Tcp(_, port) => Cow::Owned(port.to_string()),
             Self::Unix(path) => {
-                let path = path.as_str();
-                if path.is_empty() {
-                    None
-                } else {
-                    Some(
-                        path.split('/').next_back().unwrap_or(path).to_string(),
-                    )
-                }
+                Cow::Borrowed(path.rsplit('/').next().unwrap_or(path.as_str()))
             }
         }
     }
