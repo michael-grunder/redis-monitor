@@ -43,6 +43,19 @@ impl CommandStats {
         }
     }
 
+    pub fn try_incr(&mut self, line: &str, bytes: usize) {
+        if let Some(cmd) = self.find_cmd(line) {
+            self.incr(cmd, bytes);
+        }
+    }
+
+    fn find_cmd<'a>(&mut self, s: &'a str) -> Option<&'a str> {
+        let i = s.find('"')?;
+        let r = &s[i + 1..];
+        let j = r.find('"')?;
+        Some(&r[..j])
+    }
+
     pub fn get_stats(&self) -> Vec<CommandStat> {
         self.0
             .iter()

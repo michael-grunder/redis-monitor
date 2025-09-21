@@ -260,6 +260,30 @@ pub struct MonitorMessage {
     line: String,
 }
 
+#[derive(Debug)]
+enum IoMessage {
+    Message(MonitorMessage),
+    Shutdown,
+}
+
+struct IoSender(std::sync::mpsc::SyncSender<IoMessage>);
+
+impl IoSender {
+    fn shutdown(self) -> Result<()> {
+        self.0
+            .send(IoMessage::Shutdown)
+            .map_err(|_| anyhow!("Failed to send IO shutdown message"))
+    }
+}
+
+impl std::ops::Deref for IoSender {
+    type Target = std::sync::mpsc::SyncSender<IoMessage>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl Backoff {
     const MIN_DELAY: Duration = Duration::from_millis(50);
     const MAX_DELAY: Duration = Duration::from_secs(1);
@@ -343,6 +367,50 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
     }
 }
 
+fn start_io_thread(
+    output_kind: OutputKind,
+    format: &str,
+    size: usize,
+) -> (IoSender, std::thread::JoinHandle<Result<()>>) {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<IoMessage>(size);
+
+    let fmt = format.to_string();
+    let need_args = output_kind.need_args();
+
+    let jh = std::thread::spawn(move || -> Result<()> {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let mut writer = output_kind.get_writer(&mut out, &fmt);
+
+        for msg in rx {
+            match msg {
+                IoMessage::Message(m) => {
+                    let parsed = match Line::from_line(&m.line, need_args) {
+                        Ok((_, line)) => line,
+                        Err(e) => {
+                            eprintln!(
+                                "Failed to parse line: {e} <- input: {m:?}"
+                            );
+                            continue;
+                        }
+                    };
+
+                    writer.write_line(
+                        &m.server,
+                        m.name.as_ref().as_deref(),
+                        &parsed,
+                    )?;
+                }
+                IoMessage::Shutdown => break,
+            }
+        }
+
+        Ok(())
+    });
+
+    (IoSender(tx), jh)
+}
+
 fn verseion_string() -> String {
     let git_display = format!(
         "{GIT_HASH}{}",
@@ -382,7 +450,7 @@ fn print_stats(stats: &stats::CommandStats, output: OutputKind) {
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let opt: Options = Options::parse();
     let cfg = Map::load(opt.config_file.as_deref())?;
@@ -436,31 +504,44 @@ async fn main() -> Result<()> {
     let filter: Filter = opt.filter.into();
     let mut tick = Instant::now();
 
-    while let Some(MonitorMessage {
-        server, name, line, ..
-    }) = rx.recv().await
-    {
-        if !filter.check(&line) {
+    let (io_tx, io_jh) = start_io_thread(opt.output, &format, 1000);
+
+    while let Some(message) = rx.recv().await {
+        if !filter.check(&message.line) {
             continue;
         }
 
-        let parsed = match Line::from_line(&line, opt.output.need_args()) {
-            Ok((_, line)) => line,
-            Err(e) => {
-                eprintln!("Failed to parse line: {e} <- input: {line:?}");
-                continue;
-            }
-        };
-
         if let Some(ref mut stats) = stats {
-            stats.incr(parsed.cmd, line.len());
+            stats.try_incr(&message.line, message.line.len());
             if tick.elapsed() >= interval {
                 print_stats(stats, opt.output);
                 tick = Instant::now();
             }
         }
 
-        writer.write_line(&server, name.as_ref().as_deref(), &parsed)?;
+        let mut msg = IoMessage::Message(message);
+
+        loop {
+            match io_tx.try_send(msg) {
+                Ok(_) => break,
+                Err(std::sync::mpsc::TrySendError::Full(m)) => {
+                    tokio::task::yield_now().await;
+                    msg = m;
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    eprintln!("io thread disconnected");
+                    break;
+                }
+            }
+        }
+    }
+
+    io_tx.shutdown()?;
+    if let Err(e) = io_jh
+        .join()
+        .unwrap_or_else(|e| Err(anyhow!("IO thread panicked: {e:?}")))
+    {
+        eprintln!("IO thread error: {e}");
     }
 
     Ok(())
