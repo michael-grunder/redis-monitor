@@ -5,6 +5,7 @@ use anyhow::{Error, Result, anyhow};
 use crate::{
     connection::{GetHost, Monitor, ServerAddr},
     monitor::{ClientAddr, Line, LineArgs},
+    stats::CommandStat,
 };
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -83,6 +84,25 @@ pub trait OutputHandler {
         name: Option<&str>,
         line: &Line,
     ) -> Result<()>;
+
+    fn write_stats(&mut self, stats: &[CommandStat]) -> Result<()> {
+        eprintln!(
+            "[stats]: {}",
+            stats
+                .iter()
+                .filter_map(|s| {
+                    if s.count > 0 {
+                        Some(format!("{}=[{}, {}]", s.name, s.count, s.bytes))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -295,7 +315,6 @@ impl<W: Write> OutputHandler for CsvWriter<W> {
         line: &Line,
     ) -> Result<()> {
         self.writer.serialize(line)?;
-        self.writer.flush()?;
         Ok(())
     }
 }
@@ -319,6 +338,18 @@ impl<W: Write> OutputHandler for JsonWriter<W> {
         serde_json::to_writer(&mut self.writer, parsed)?;
         writeln!(&mut self.writer)?;
         Ok(())
+    }
+
+    fn write_stats(&mut self, stats: &[CommandStat]) -> Result<()> {
+        writeln!(
+            &mut self.writer,
+            "{}",
+            serde_json::to_string(&stats).unwrap_or_else(|e| {
+                eprintln!("Failed to serialize stats to JSON: {e}");
+                "[]".to_string()
+            })
+        )
+        .map_err(|e| anyhow!(e))
     }
 }
 

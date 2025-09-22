@@ -3,10 +3,10 @@
 //#![allow(clippy::must_use_candidate)]
 use crate::{
     config::{Map, ServerAuth},
-    connection::Cluster,
-    connection::Monitor,
+    connection::{Cluster, Monitor},
     filter::FilterPattern,
     monitor::Line,
+    stats::CommandStat,
 };
 use anyhow::{Result, anyhow};
 use clap::Parser;
@@ -264,7 +264,7 @@ pub struct MonitorMessage {
 enum IoMessage {
     Preamble(Arc<[Monitor]>),
     Warning(String),
-    Stats(String),
+    Stats(Vec<CommandStat>),
     Message(MonitorMessage),
     Shutdown,
 }
@@ -391,7 +391,7 @@ fn start_io_thread(
                     writer.preamble(&servers)?;
                 }
                 IoMessage::Stats(s) => {
-                    eprintln!("[STATS]: {s}");
+                    writer.write_stats(&s)?;
                 }
                 IoMessage::Warning(w) => {
                     eprintln!("[WARNING]: {w}");
@@ -430,36 +430,6 @@ fn verseion_string() -> String {
     );
 
     format!("redis-monitor v{VERSION} (git {git_display})")
-}
-
-fn render_stats(stats: &stats::CommandStats, output: OutputKind) -> String {
-    let mut stats = stats.get_stats();
-    stats.sort_by(|a, b| b.count.cmp(&a.count));
-
-    if output == OutputKind::Json {
-        format!(
-            "{}",
-            serde_json::to_string(&stats).unwrap_or_else(|e| {
-                eprintln!("Failed to serialize stats to JSON: {e}");
-                "[]".to_string()
-            })
-        )
-    } else {
-        format!(
-            "[stats]: {}",
-            stats
-                .iter()
-                .filter_map(|s| {
-                    if s.count > 0 {
-                        Some(format!("{}=[{}, {}]", s.name, s.count, s.bytes))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
 }
 
 fn now_f64() -> f64 {
@@ -535,7 +505,7 @@ async fn main() -> Result<()> {
         if let Some(ref mut stats) = stats {
             stats.try_incr(&message.line, message.line.len());
             if tick.elapsed() >= interval {
-                let s = render_stats(stats, opt.output);
+                let s = stats.get_stats();
                 io_tx.send(IoMessage::Stats(s)).unwrap_or_else(|e| {
                     eprintln!("Failed to send stats: {e}");
                 });
