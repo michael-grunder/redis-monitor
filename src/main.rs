@@ -263,6 +263,8 @@ pub struct MonitorMessage {
 #[derive(Debug)]
 enum IoMessage {
     Preamble(Arc<[Monitor]>),
+    Warning(String),
+    Stats(String),
     Message(MonitorMessage),
     Shutdown,
 }
@@ -388,6 +390,12 @@ fn start_io_thread(
                 IoMessage::Preamble(servers) => {
                     writer.preamble(&servers)?;
                 }
+                IoMessage::Stats(s) => {
+                    println!("[STATS]: {s}");
+                }
+                IoMessage::Warning(w) => {
+                    eprintln!("[WARNING]: {w}");
+                }
                 IoMessage::Message(m) => {
                     let parsed = match Line::from_line(&m.line, need_args) {
                         Ok((_, line)) => line,
@@ -424,20 +432,20 @@ fn verseion_string() -> String {
     format!("redis-monitor v{VERSION} (git {git_display})")
 }
 
-fn print_stats(stats: &stats::CommandStats, output: OutputKind) {
+fn render_stats(stats: &stats::CommandStats, output: OutputKind) -> String {
     let mut stats = stats.get_stats();
     stats.sort_by(|a, b| b.count.cmp(&a.count));
 
     if output == OutputKind::Json {
-        println!(
+        format!(
             "{}",
             serde_json::to_string(&stats).unwrap_or_else(|e| {
                 eprintln!("Failed to serialize stats to JSON: {e}");
                 "[]".to_string()
             })
-        );
+        )
     } else {
-        println!(
+        format!(
             "[stats]: {}",
             stats
                 .iter()
@@ -450,10 +458,18 @@ fn print_stats(stats: &stats::CommandStats, output: OutputKind) {
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
-        );
+        )
     }
 }
 
+fn now_f64() -> f64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0));
+    now.as_secs_f64()
+}
+
+//#[tokio::main(flavor = "current_thread")]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let opt: Options = Options::parse();
@@ -478,7 +494,7 @@ async fn main() -> Result<()> {
         process_instances(&cfg, &opt, tls.as_ref(), &auth)
     };
 
-    let (tx, mut rx) = mpsc::channel::<MonitorMessage>(1000);
+    let (tx, mut rx) = mpsc::channel::<MonitorMessage>(8192);
 
     let tasks = FuturesUnordered::new();
 
@@ -500,7 +516,7 @@ async fn main() -> Result<()> {
     let filter: Filter = opt.filter.into();
     let mut tick = Instant::now();
 
-    let (io_tx, io_jh) = start_io_thread(opt.output, &format, 1000);
+    let (io_tx, io_jh) = start_io_thread(opt.output, &format, 8292);
 
     let preamble: Arc<[Monitor]> = Arc::from(seeds);
     io_tx.send(IoMessage::Preamble(Arc::clone(&preamble)))?;
@@ -518,15 +534,24 @@ async fn main() -> Result<()> {
         if let Some(ref mut stats) = stats {
             stats.try_incr(&message.line, message.line.len());
             if tick.elapsed() >= interval {
-                print_stats(stats, opt.output);
-                if yields > 0 {
-                    eprintln!(
-                        "Warning: had to yield {yields} times to keep up"
-                    );
-                    yields = 0;
-                }
+                let s = render_stats(stats, opt.output);
+                io_tx.send(IoMessage::Stats(s)).unwrap_or_else(|e| {
+                    eprintln!("Failed to send stats: {e}");
+                });
                 tick = Instant::now();
             }
+        }
+
+        if yields > 0 && yields % 10 == 0 {
+            let now = now_f64();
+            io_tx
+                .send(IoMessage::Warning(format!(
+                    "{now} Dropped messages due to backpressure: {yields}"
+                )))
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to send warning: {e}");
+                });
+            yields = 0;
         }
 
         let mut msg = IoMessage::Message(message);
