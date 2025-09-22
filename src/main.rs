@@ -391,7 +391,7 @@ fn start_io_thread(
                     writer.preamble(&servers)?;
                 }
                 IoMessage::Stats(s) => {
-                    println!("[STATS]: {s}");
+                    eprintln!("[STATS]: {s}");
                 }
                 IoMessage::Warning(w) => {
                     eprintln!("[WARNING]: {w}");
@@ -494,7 +494,7 @@ async fn main() -> Result<()> {
         process_instances(&cfg, &opt, tls.as_ref(), &auth)
     };
 
-    let (tx, mut rx) = mpsc::channel::<MonitorMessage>(8192);
+    let (tx, mut rx) = mpsc::channel::<MonitorMessage>(16384);
 
     let tasks = FuturesUnordered::new();
 
@@ -516,7 +516,7 @@ async fn main() -> Result<()> {
     let filter: Filter = opt.filter.into();
     let mut tick = Instant::now();
 
-    let (io_tx, io_jh) = start_io_thread(opt.output, &format, 8292);
+    let (io_tx, io_jh) = start_io_thread(opt.output, &format, 16384);
 
     let preamble: Arc<[Monitor]> = Arc::from(seeds);
     io_tx.send(IoMessage::Preamble(Arc::clone(&preamble)))?;
@@ -525,6 +525,7 @@ async fn main() -> Result<()> {
     }
 
     let mut yields = 0;
+    let mut total_yields = 0;
 
     while let Some(message) = rx.recv().await {
         if !filter.check(&message.line) {
@@ -546,11 +547,11 @@ async fn main() -> Result<()> {
             let now = now_f64();
             io_tx
                 .send(IoMessage::Warning(format!(
-                    "{now} Dropped messages due to backpressure: {yields}"
-                )))
+                    "{now} Dropped {yields} messages due to backpressure (total {total_yields}")))
                 .unwrap_or_else(|e| {
                     eprintln!("Failed to send warning: {e}");
                 });
+            total_yields += yields;
             yields = 0;
         }
 
