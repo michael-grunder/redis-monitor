@@ -262,6 +262,7 @@ pub struct MonitorMessage {
 
 #[derive(Debug)]
 enum IoMessage {
+    Preamble(Vec<Monitor>),
     Message(MonitorMessage),
     Shutdown,
 }
@@ -384,6 +385,9 @@ fn start_io_thread(
 
         for msg in rx {
             match msg {
+                IoMessage::Preamble(servers) => {
+                    writer.preamble(&servers)?;
+                }
                 IoMessage::Message(m) => {
                     let parsed = match Line::from_line(&m.line, need_args) {
                         Ok((_, line)) => line,
@@ -486,14 +490,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    let mut writer = opt.output.get_writer(std::io::stdout(), &format);
-
-    writer.preamble(&seeds)?;
-
-    for mon in seeds {
-        tasks.push(tokio::spawn(run_monitor(mon, tx.clone())));
-    }
-
     let mut stats = if opt.output == OutputKind::Plain {
         opt.stats.map(|_| stats::CommandStats::new())
     } else {
@@ -505,6 +501,11 @@ async fn main() -> Result<()> {
     let mut tick = Instant::now();
 
     let (io_tx, io_jh) = start_io_thread(opt.output, &format, 1000);
+
+    io_tx.send(IoMessage::Preamble(seeds.iter().cloned().collect()))?;
+    for mon in seeds {
+        tasks.push(tokio::spawn(run_monitor(mon, tx.clone())));
+    }
 
     let mut yields = 0;
 
