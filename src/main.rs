@@ -506,6 +506,8 @@ async fn main() -> Result<()> {
 
     let (io_tx, io_jh) = start_io_thread(opt.output, &format, 1000);
 
+    let mut yields = 0;
+
     while let Some(message) = rx.recv().await {
         if !filter.check(&message.line) {
             continue;
@@ -515,6 +517,12 @@ async fn main() -> Result<()> {
             stats.try_incr(&message.line, message.line.len());
             if tick.elapsed() >= interval {
                 print_stats(stats, opt.output);
+                if yields > 0 {
+                    eprintln!(
+                        "Warning: had to yield {yields} times to keep up"
+                    );
+                    yields = 0;
+                }
                 tick = Instant::now();
             }
         }
@@ -525,6 +533,7 @@ async fn main() -> Result<()> {
             match io_tx.try_send(msg) {
                 Ok(_) => break,
                 Err(std::sync::mpsc::TrySendError::Full(m)) => {
+                    yields += 1;
                     tokio::task::yield_now().await;
                     msg = m;
                 }
