@@ -262,7 +262,7 @@ pub struct MonitorMessage {
 
 #[derive(Debug)]
 enum IoMessage {
-    Preamble(Vec<Monitor>),
+    Preamble(Arc<[Monitor]>),
     Message(MonitorMessage),
     Shutdown,
 }
@@ -502,9 +502,10 @@ async fn main() -> Result<()> {
 
     let (io_tx, io_jh) = start_io_thread(opt.output, &format, 1000);
 
-    io_tx.send(IoMessage::Preamble(seeds.iter().cloned().collect()))?;
-    for mon in seeds {
-        tasks.push(tokio::spawn(run_monitor(mon, tx.clone())));
+    let preamble: Arc<[Monitor]> = Arc::from(seeds);
+    io_tx.send(IoMessage::Preamble(Arc::clone(&preamble)))?;
+    for mon in &*preamble {
+        tasks.push(tokio::spawn(run_monitor(mon.clone(), tx.clone())));
     }
 
     let mut yields = 0;
