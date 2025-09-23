@@ -370,11 +370,17 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
     }
 }
 
+#[derive(Debug)]
+enum Control {
+    Shutdown,
+    Continue,
+}
+
 fn handle_msg(
     w: &mut dyn OutputHandler,
     msg: IoMessage,
     need_args: bool,
-) -> Result<()> {
+) -> Result<Control> {
     match msg {
         IoMessage::Preamble(servers) => {
             w.preamble(&servers)?;
@@ -391,17 +397,16 @@ fn handle_msg(
             let parsed = match Line::from_line_bytes(&m.line, need_args) {
                 Ok((_, line)) => line,
                 Err(e) => {
-                    eprintln!("Failed to parse line: {e} <- input: {m:?}");
-                    return Ok(());
+                    return Err(anyhow!("Failed to parse line: {e}"));
                 }
             };
 
             w.write_line(&m.server, m.name.as_ref().as_deref(), &parsed)?;
         }
-        IoMessage::Shutdown => return Err(anyhow!("__shutdown__")),
+        IoMessage::Shutdown => return Ok(Control::Shutdown),
     }
 
-    Ok(())
+    Ok(Control::Continue)
 }
 
 fn start_io_thread(
@@ -429,21 +434,24 @@ fn start_io_thread(
                 Err(_) => break,
             };
 
-            shutdown = matches!(first, IoMessage::Shutdown);
-            if !shutdown {
-                if let Err(e) = handle_msg(writer.as_mut(), first, need_args) {
+            match handle_msg(writer.as_mut(), first, need_args) {
+                Ok(Control::Shutdown) => break,
+                Ok(Control::Continue) => {}
+                Err(e) => {
                     eprintln!("Error handling message: {e}");
-                };
-            }
+                }
+            };
 
             for msg in rx.try_iter().take(BATCH_MAX - 1) {
-                if matches!(msg, IoMessage::Shutdown) {
-                    shutdown = true;
-                    break;
-                }
-
-                if let Err(e) = handle_msg(writer.as_mut(), msg, need_args) {
-                    eprintln!("Error handling message: {e}");
+                match handle_msg(writer.as_mut(), msg, need_args) {
+                    Ok(Control::Shutdown) => {
+                        shutdown = true;
+                        break;
+                    }
+                    Ok(Control::Continue) => {}
+                    Err(e) => {
+                        eprintln!("Error handling message: {e}");
+                    }
                 }
             }
 
