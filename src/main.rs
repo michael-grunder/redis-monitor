@@ -378,9 +378,11 @@ fn handle_msg(
     match msg {
         IoMessage::Preamble(servers) => {
             w.preamble(&servers)?;
+            w.flush()?;
         }
         IoMessage::Stats(s) => {
             w.write_stats(&s)?;
+            w.flush()?;
         }
         IoMessage::Warning(w) => {
             eprintln!("[WARNING]: {w}");
