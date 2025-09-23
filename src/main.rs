@@ -14,6 +14,7 @@ use clap::Parser;
 use colored::Color;
 use connection::{ServerAddr, TlsConfig};
 use filter::Filter;
+use flume;
 use futures::stream::FuturesUnordered;
 use output::OutputKind;
 use rand::{Rng, rng};
@@ -261,6 +262,9 @@ pub struct MonitorMessage {
     line: Bytes,
 }
 
+type IoSender = flume::Sender<IoMessage>;
+//type IoReceiver = flume::Receiver<IoMessage>;
+
 #[derive(Debug)]
 enum IoMessage {
     Preamble(Arc<[Monitor]>),
@@ -268,24 +272,6 @@ enum IoMessage {
     Stats(Vec<CommandStat>),
     Message(MonitorMessage),
     Shutdown,
-}
-
-struct IoSender(std::sync::mpsc::SyncSender<IoMessage>);
-
-impl IoSender {
-    fn shutdown(self) -> Result<()> {
-        self.0
-            .send(IoMessage::Shutdown)
-            .map_err(|_| anyhow!("Failed to send IO shutdown message"))
-    }
-}
-
-impl std::ops::Deref for IoSender {
-    type Target = std::sync::mpsc::SyncSender<IoMessage>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
 }
 
 impl Backoff {
@@ -388,17 +374,19 @@ fn start_io_thread(
     format: &str,
     size: usize,
 ) -> (IoSender, std::thread::JoinHandle<Result<()>>) {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<IoMessage>(size);
+    let (tx, rx) = flume::bounded(size);
 
     let fmt = format.to_string();
     let need_args = output_kind.need_args();
+
+    const BATCH_MAX: usize = 1024;
 
     let jh = std::thread::spawn(move || -> Result<()> {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
         let mut writer = output_kind.get_writer(&mut out, &fmt);
 
-        for msg in rx {
+        let mut handle_msg = |msg: IoMessage| -> Result<()> {
             match msg {
                 IoMessage::Preamble(servers) => {
                     writer.preamble(&servers)?;
@@ -417,7 +405,7 @@ fn start_io_thread(
                             eprintln!(
                                 "Failed to parse line: {e} <- input: {m:?}"
                             );
-                            continue;
+                            return Ok(());
                         }
                     };
 
@@ -427,14 +415,36 @@ fn start_io_thread(
                         &parsed,
                     )?;
                 }
-                IoMessage::Shutdown => break,
+                IoMessage::Shutdown => return Err(anyhow!("__shutdown__")),
+            }
+            Ok(())
+        };
+
+        loop {
+            let first = match rx.recv() {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+
+            if let Err(e) = handle_msg(first) {
+                if e.to_string() == "__shutdown__" {
+                    break;
+                }
+            };
+
+            for msg in rx.try_iter().take(BATCH_MAX - 1) {
+                if let Err(e) = handle_msg(msg) {
+                    if e.to_string() == "__shutdown__" {
+                        return Ok(());
+                    }
+                }
             }
         }
 
         Ok(())
     });
 
-    (IoSender(tx), jh)
+    (tx, jh)
 }
 
 fn verseion_string() -> String {
@@ -454,7 +464,7 @@ fn now_f64() -> f64 {
 }
 
 //#[tokio::main(flavor = "current_thread")]
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<()> {
     let opt: Options = Options::parse();
     let cfg = Map::load(opt.config_file.as_deref())?;
@@ -500,7 +510,7 @@ async fn main() -> Result<()> {
     let filter: Filter = opt.filter.into();
     let mut tick = Instant::now();
 
-    let (io_tx, io_jh) = start_io_thread(opt.output, &format, 16384);
+    let (io_tx, io_jh) = start_io_thread(opt.output, &format, 65536);
 
     let preamble: Arc<[Monitor]> = Arc::from(seeds);
     io_tx.send(IoMessage::Preamble(Arc::clone(&preamble)))?;
@@ -527,7 +537,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        if yields > 0 && yields % 10 == 0 {
+        if yields > 0 && yields % 1000 == 0 {
             let now = now_f64();
             io_tx
                 .send(IoMessage::Warning(format!(
@@ -544,12 +554,12 @@ async fn main() -> Result<()> {
         loop {
             match io_tx.try_send(msg) {
                 Ok(_) => break,
-                Err(std::sync::mpsc::TrySendError::Full(m)) => {
+                Err(flume::TrySendError::Full(m)) => {
                     yields += 1;
                     tokio::task::yield_now().await;
                     msg = m;
                 }
-                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                Err(flume::TrySendError::Disconnected(_m)) => {
                     eprintln!("io thread disconnected");
                     break;
                 }
@@ -557,7 +567,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    io_tx.shutdown()?;
+    let _ = io_tx.send(IoMessage::Shutdown);
     if let Err(e) = io_jh
         .join()
         .unwrap_or_else(|e| Err(anyhow!("IO thread panicked: {e:?}")))
