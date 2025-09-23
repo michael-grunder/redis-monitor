@@ -103,6 +103,8 @@ pub trait OutputHandler {
 
         Ok(())
     }
+
+    fn flush(&mut self) -> Result<()>;
 }
 
 #[derive(Debug)]
@@ -201,6 +203,10 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
         self.writer.write_all(b"\n")?;
 
         Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.writer.flush().map_err(|e| anyhow!(e))
     }
 }
 
@@ -317,6 +323,10 @@ impl<W: Write> OutputHandler for CsvWriter<W> {
         self.writer.serialize(line)?;
         Ok(())
     }
+
+    fn flush(&mut self) -> Result<()> {
+        self.writer.flush().map_err(|e| anyhow!(e))
+    }
 }
 
 impl<W: Write> OutputHandler for JsonWriter<W> {
@@ -351,6 +361,10 @@ impl<W: Write> OutputHandler for JsonWriter<W> {
         )
         .map_err(|e| anyhow!(e))
     }
+
+    fn flush(&mut self) -> Result<()> {
+        self.writer.flush().map_err(|e| anyhow!(e))
+    }
 }
 
 impl<W: Write> OutputHandler for RespWriter<W> {
@@ -362,5 +376,9 @@ impl<W: Write> OutputHandler for RespWriter<W> {
     ) -> Result<()> {
         parsed.write_resp(&mut self.writer)?;
         Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.writer.flush().map_err(|e| anyhow!(e))
     }
 }

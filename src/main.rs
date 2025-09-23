@@ -383,7 +383,7 @@ fn start_io_thread(
 
     let jh = std::thread::spawn(move || -> Result<()> {
         let stdout = std::io::stdout();
-        let mut out = stdout.lock();
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, stdout.lock());
         let mut writer = output_kind.get_writer(&mut out, &fmt);
 
         let mut handle_msg = |msg: IoMessage| -> Result<()> {
@@ -440,6 +440,8 @@ fn start_io_thread(
                 }
             }
         }
+
+        writer.flush()?;
 
         Ok(())
     });

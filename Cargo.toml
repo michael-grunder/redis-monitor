@@ -27,3 +27,8 @@ serde_json = "1.0.145"
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-rustls = "0.26.3"
 url = "2.5.7"
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
