@@ -42,6 +42,7 @@ pub struct Line<'a> {
     pub db: u64,
     pub addr: ClientAddr<'a>,
     pub cmd: &'a str,
+    #[serde(serialize_with = "serialize_args_as_strings")]
     pub args: LineArgs<'a>,
 }
 
@@ -456,6 +457,47 @@ impl<'a> Serialize for ClientAddr<'a> {
                 serializer.serialize_str(&format!("{ip}:{port}"))
             }
             Self::Unknown => serializer.serialize_str("-"),
+        }
+    }
+}
+
+fn json_escape_lossless(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x08 => out.push_str("\\b"),
+            0x0C => out.push_str("\\f"),
+            0x20..=0x21 | 0x23..=0x5B | 0x5D..=0x7E => out.push(b as char),
+            _ => {
+                use core::fmt::Write as _;
+                let _ = write!(out, "\\u00{:02X}", b);
+            }
+        }
+    }
+    out
+}
+
+fn serialize_args_as_strings<S>(
+    args: &LineArgs<'_>,
+    s: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match args {
+        LineArgs::Parsed(v) => {
+            let strs: Vec<String> =
+                v.iter().map(|a| json_escape_lossless(a)).collect();
+            strs.serialize(s)
+        }
+        LineArgs::Raw(raw) => {
+            let s1 = json_escape_lossless(raw);
+            s.serialize_str(&s1)
         }
     }
 }
