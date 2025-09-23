@@ -10,9 +10,9 @@ use nom::{
     Err, IResult, Parser,
     branch::alt,
     bytes::complete::{is_not, tag, take_until, take_while, take_while_m_n},
-    combinator::{map, map_res, opt, peek, recognize, value, verify},
+    combinator::{map, map_res, opt, peek, value, verify},
     error::{ErrorKind, FromExternalError, ParseError},
-    multi::{fold_many0, many1, separated_list0},
+    multi::{fold_many0, separated_list0},
     sequence::preceded,
 };
 
@@ -234,18 +234,18 @@ impl<'a> Line<'a> {
         Ok((input, bytes))
     }
 
-    fn parse_u8_from_bytes<T: std::str::FromStr>(
-        input: &[u8],
-    ) -> IResult<&[u8], T> {
-        map_res(
-            recognize(many1(|i| digit1b(i))),
-            |s: &[u8]| -> Result<T, T::Err> {
-                let strv = unsafe { std::str::from_utf8_unchecked(s) };
-                strv.parse::<T>()
-            },
-        )
-        .parse(input)
-    }
+    //fn parse_u8_from_bytes<T: std::str::FromStr>(
+    //    input: &[u8],
+    //) -> IResult<&[u8], T> {
+    //    map_res(
+    //        recognize(many1(|i| digit1b(i))),
+    //        |s: &[u8]| -> Result<T, T::Err> {
+    //            let strv = unsafe { std::str::from_utf8_unchecked(s) };
+    //            strv.parse::<T>()
+    //        },
+    //    )
+    //    .parse(input)
+    //}
 
     // aaa.bbb.ccc.ddd:port
     fn parse_ipv4(input: &[u8]) -> IResult<&[u8], (IpAddr, u16)> {

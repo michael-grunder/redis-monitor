@@ -1,5 +1,6 @@
 use anyhow::Result;
-use regex::Regex;
+use memchr::memmem;
+use regex::bytes::Regex;
 use std::{
     collections::HashSet,
     hash::{Hash, Hasher},
@@ -14,21 +15,26 @@ pub enum FilterPattern {
 
 #[derive(Debug, Clone)]
 pub enum Pattern {
+    // Keep String so equality/hash use the exact user text.
     Literal(String),
+    // Bytes regex engine for matching on &[u8].
     Regex(Regex),
 }
 
 impl Pattern {
-    fn check(&self, value: &str) -> bool {
+    #[inline]
+    fn check(&self, value: &[u8]) -> bool {
         match self {
-            Self::Literal(lit) => value.contains(lit),
+            Self::Literal(lit) => memmem::find(value, lit.as_bytes()).is_some(),
             Self::Regex(re) => re.is_match(value),
         }
     }
 
+    #[inline]
     fn as_str(&self) -> &str {
         match self {
-            Self::Literal(lit) => lit,
+            Self::Literal(lit) => lit.as_str(),
+            // regex::bytes::Regex still exposes pattern text as &str
             Self::Regex(re) => re.as_str(),
         }
     }
@@ -113,7 +119,8 @@ impl Filter {
         }
     }
 
-    pub fn check(&self, value: &str) -> bool {
+    #[inline]
+    pub fn check(&self, value: &[u8]) -> bool {
         if self.exclude.iter().any(|p| p.check(value)) {
             return false;
         }

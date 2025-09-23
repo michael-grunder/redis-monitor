@@ -22,7 +22,7 @@ use std::{
     sync::Arc, time::Instant,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt},
+    io::AsyncReadExt,
     sync::mpsc,
     time::{Duration, sleep},
 };
@@ -509,9 +509,9 @@ async fn main() -> Result<()> {
     let mut total_yields = 0;
 
     while let Some(message) = rx.recv().await {
-        //if !filter.check(&message.line) {
-        //    continue;
-        //}
+        if !filter.check(&message.line) {
+            continue;
+        }
 
         if let Some(ref mut stats) = stats {
             stats.try_incr(&message.line, message.line.len());
