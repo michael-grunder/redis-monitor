@@ -29,6 +29,15 @@ tokio-rustls = "0.26.3"
 url = "2.5.7"
 
 [profile.release]
-opt-level = "z"
-lto = true
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+incremental = false
 panic = "abort"
+
+[profile.release.package.memchr]
+opt-level = 3
+
+[build]
+rustflags = ["-C", "target-cpu=native"]
+

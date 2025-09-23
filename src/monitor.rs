@@ -1,5 +1,6 @@
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
+//use serde::ser::{Serialize, Serializer};
 use std::{
     borrow::Cow,
     io::Write,
@@ -44,7 +45,7 @@ pub struct Line<'a> {
     pub args: LineArgs<'a>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub enum ClientAddr<'a> {
     Path(&'a str),
     Tcp(IpAddr, u16),
@@ -440,6 +441,21 @@ impl std::fmt::Display for ClientAddr<'_> {
             ClientAddr::Path(path) => write!(f, "{path}"),
             ClientAddr::Tcp(addr, port) => write!(f, "{addr}:{port}"),
             ClientAddr::Unknown => write!(f, "-"),
+        }
+    }
+}
+
+impl<'a> Serialize for ClientAddr<'a> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Path(p) => serializer.serialize_str(p),
+            Self::Tcp(ip, port) => {
+                serializer.serialize_str(&format!("{ip}:{port}"))
+            }
+            Self::Unknown => serializer.serialize_str("-"),
         }
     }
 }
