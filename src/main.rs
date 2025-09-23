@@ -421,18 +421,18 @@ fn start_io_thread(
         let mut out = std::io::BufWriter::with_capacity(1 << 20, stdout.lock());
         let mut writer = output_kind.get_writer(&mut out, &fmt);
 
-        loop {
+        let mut shutdown = false;
+
+        while !shutdown {
             let first = match rx.recv() {
                 Ok(m) => m,
                 Err(_) => break,
             };
 
-            let mut shutdown = matches!(first, IoMessage::Shutdown);
+            shutdown = matches!(first, IoMessage::Shutdown);
             if !shutdown {
                 if let Err(e) = handle_msg(writer.as_mut(), first, need_args) {
-                    if e.to_string() == "__shutdown__" {
-                        shutdown = true;
-                    }
+                    eprintln!("Error handling message: {e}");
                 };
             }
 
@@ -443,17 +443,11 @@ fn start_io_thread(
                 }
 
                 if let Err(e) = handle_msg(writer.as_mut(), msg, need_args) {
-                    if e.to_string() == "__shutdown__" {
-                        shutdown = true;
-                        break;
-                    }
+                    eprintln!("Error handling message: {e}");
                 }
             }
 
             writer.flush()?;
-            if shutdown {
-                break;
-            }
         }
 
         Ok(())
