@@ -345,6 +345,9 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
                         if line.ends_with(&[b'\r']) {
                             line.truncate(line.len() - 1);
                         }
+                        if line.starts_with(&[b'+']) {
+                            line = line.slice(1..);
+                        }
 
                         let msg = MonitorMessage {
                             server: Arc::clone(&server),
