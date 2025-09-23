@@ -6,6 +6,7 @@ use crate::{
     connection::{Cluster, Monitor},
     filter::FilterPattern,
     monitor::Line,
+    output::OutputHandler,
     stats::CommandStat,
 };
 use anyhow::{Result, anyhow};
@@ -369,6 +370,38 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
     }
 }
 
+fn handle_msg(
+    w: &mut dyn OutputHandler,
+    msg: IoMessage,
+    need_args: bool,
+) -> Result<()> {
+    match msg {
+        IoMessage::Preamble(servers) => {
+            w.preamble(&servers)?;
+        }
+        IoMessage::Stats(s) => {
+            w.write_stats(&s)?;
+        }
+        IoMessage::Warning(w) => {
+            eprintln!("[WARNING]: {w}");
+        }
+        IoMessage::Message(m) => {
+            let parsed = match Line::from_line_bytes(&m.line, need_args) {
+                Ok((_, line)) => line,
+                Err(e) => {
+                    eprintln!("Failed to parse line: {e} <- input: {m:?}");
+                    return Ok(());
+                }
+            };
+
+            w.write_line(&m.server, m.name.as_ref().as_deref(), &parsed)?;
+        }
+        IoMessage::Shutdown => return Err(anyhow!("__shutdown__")),
+    }
+
+    Ok(())
+}
+
 fn start_io_thread(
     output_kind: OutputKind,
     format: &str,
@@ -386,62 +419,40 @@ fn start_io_thread(
         let mut out = std::io::BufWriter::with_capacity(1 << 20, stdout.lock());
         let mut writer = output_kind.get_writer(&mut out, &fmt);
 
-        let mut handle_msg = |msg: IoMessage| -> Result<()> {
-            match msg {
-                IoMessage::Preamble(servers) => {
-                    writer.preamble(&servers)?;
-                }
-                IoMessage::Stats(s) => {
-                    writer.write_stats(&s)?;
-                }
-                IoMessage::Warning(w) => {
-                    eprintln!("[WARNING]: {w}");
-                }
-                IoMessage::Message(m) => {
-                    let parsed = match Line::from_line_bytes(&m.line, need_args)
-                    {
-                        Ok((_, line)) => line,
-                        Err(e) => {
-                            eprintln!(
-                                "Failed to parse line: {e} <- input: {m:?}"
-                            );
-                            return Ok(());
-                        }
-                    };
-
-                    writer.write_line(
-                        &m.server,
-                        m.name.as_ref().as_deref(),
-                        &parsed,
-                    )?;
-                }
-                IoMessage::Shutdown => return Err(anyhow!("__shutdown__")),
-            }
-            Ok(())
-        };
-
         loop {
             let first = match rx.recv() {
                 Ok(m) => m,
                 Err(_) => break,
             };
 
-            if let Err(e) = handle_msg(first) {
-                if e.to_string() == "__shutdown__" {
-                    break;
-                }
-            };
+            let mut shutdown = matches!(first, IoMessage::Shutdown);
+            if !shutdown {
+                if let Err(e) = handle_msg(writer.as_mut(), first, need_args) {
+                    if e.to_string() == "__shutdown__" {
+                        shutdown = true;
+                    }
+                };
+            }
 
             for msg in rx.try_iter().take(BATCH_MAX - 1) {
-                if let Err(e) = handle_msg(msg) {
+                if matches!(msg, IoMessage::Shutdown) {
+                    shutdown = true;
+                    break;
+                }
+
+                if let Err(e) = handle_msg(writer.as_mut(), msg, need_args) {
                     if e.to_string() == "__shutdown__" {
-                        return Ok(());
+                        shutdown = true;
+                        break;
                     }
                 }
             }
-        }
 
-        writer.flush()?;
+            writer.flush()?;
+            if shutdown {
+                break;
+            }
+        }
 
         Ok(())
     });
