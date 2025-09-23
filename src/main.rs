@@ -9,6 +9,7 @@ use crate::{
     stats::CommandStat,
 };
 use anyhow::{Result, anyhow};
+use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use colored::Color;
 use connection::{ServerAddr, TlsConfig};
@@ -21,7 +22,7 @@ use std::{
     sync::Arc, time::Instant,
 };
 use tokio::{
-    io::AsyncBufReadExt,
+    io::{AsyncBufReadExt, AsyncReadExt},
     sync::mpsc,
     time::{Duration, sleep},
 };
@@ -257,7 +258,7 @@ pub struct MonitorMessage {
     pub server: Arc<ServerAddr>,
     pub name: Arc<Option<String>>,
     pub color: Option<Color>,
-    line: String,
+    line: Bytes,
 }
 
 #[derive(Debug)]
@@ -333,27 +334,36 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
             Ok((_, mut reader)) => {
                 backoff.reset();
 
-                let mut line = String::new();
+                let mut buf = BytesMut::with_capacity(16 * 1024);
+
                 loop {
-                    line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let msg = MonitorMessage {
-                                server: server.clone(),
-                                name: name.clone(),
-                                color: mon.color,
-                                line: line[1..].trim_end().to_string(),
-                            };
-                            if let Err(e) = tx.send(msg).await {
-                                eprintln!(
-                                    "{server} Failed to send message: {e}"
-                                );
-                                break;
-                            }
+                    while let Some(nl) = memchr::memchr(b'\n', &buf) {
+                        let mut line = buf.split_to(nl + 1).freeze();
+                        if line.ends_with(&[b'\n']) {
+                            line.truncate(line.len() - 1);
                         }
+                        if line.ends_with(&[b'\r']) {
+                            line.truncate(line.len() - 1);
+                        }
+
+                        let msg = MonitorMessage {
+                            server: Arc::clone(&server),
+                            name: Arc::clone(&name),
+                            color: mon.color,
+                            line,
+                        };
+
+                        if let Err(e) = tx.send(msg).await {
+                            eprintln!("{server} tx.send failure: {e}");
+                            break;
+                        }
+                    }
+
+                    match reader.read_buf(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(_) => continue,
                         Err(e) => {
-                            eprintln!("{server} Read error {e}");
+                            eprintln!("{server} read error {e}");
                             break;
                         }
                     }
@@ -397,7 +407,8 @@ fn start_io_thread(
                     eprintln!("[WARNING]: {w}");
                 }
                 IoMessage::Message(m) => {
-                    let parsed = match Line::from_line(&m.line, need_args) {
+                    let parsed = match Line::from_line_bytes(&m.line, need_args)
+                    {
                         Ok((_, line)) => line,
                         Err(e) => {
                             eprintln!(
@@ -498,9 +509,9 @@ async fn main() -> Result<()> {
     let mut total_yields = 0;
 
     while let Some(message) = rx.recv().await {
-        if !filter.check(&message.line) {
-            continue;
-        }
+        //if !filter.check(&message.line) {
+        //    continue;
+        //}
 
         if let Some(ref mut stats) = stats {
             stats.try_incr(&message.line, message.line.len());

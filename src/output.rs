@@ -184,12 +184,12 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
                     match &line.args {
                         LineArgs::Raw(s) => {
                             w.write_all(b" ")?;
-                            w.write_all(s.as_bytes())?;
+                            w.write_all(s)?;
                         }
                         LineArgs::Parsed(v) => {
                             for arg in v {
                                 w.write_all(b" \"")?;
-                                w.write_all(arg.as_bytes())?;
+                                w.write_all(arg)?;
                                 w.write_all(b"\"")?;
                             }
                         }
