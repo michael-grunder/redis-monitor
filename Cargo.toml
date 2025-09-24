@@ -37,7 +37,3 @@ panic = "abort"
 
 [profile.release.package.memchr]
 opt-level = 3
-
-[build]
-rustflags = ["-C", "target-cpu=native"]
-
