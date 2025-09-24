@@ -351,15 +351,13 @@ impl<W: Write> OutputHandler for JsonWriter<W> {
     }
 
     fn write_stats(&mut self, stats: &[CommandStat]) -> Result<()> {
-        writeln!(
-            &mut self.writer,
-            "{}",
-            serde_json::to_string(&stats).unwrap_or_else(|e| {
-                eprintln!("Failed to serialize stats to JSON: {e}");
-                "[]".to_string()
-            })
-        )
-        .map_err(|e| anyhow!(e))
+        let data = serde_json::to_value(stats)
+            .map_err(|e| anyhow!("Failed to serialize stats to JSON: {e}"))?;
+
+        self.writer.write_all(data.to_string().as_bytes())?;
+        self.writer.write_all(b"\n")?;
+
+        Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
