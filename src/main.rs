@@ -161,7 +161,7 @@ impl Options {
     }
 }
 
-// Treat each instnace as a potential cluster seed. This means that if more than
+// Treat each instance as a potential cluster seed. This means that if more than
 // one seeds of the same cluster are passed we may map the same keyspace more than
 // once. This is fine, but we should be aware of it.
 fn process_cluster_instances(
@@ -209,7 +209,7 @@ fn process_cluster_instances(
 }
 
 // Take the array of instances provided on the command line and attempt to map
-// them to one ore more instances. These can either be named instances like
+// them to one or more instances. These can either be named instances like
 // mycluster` which were loaded from our config file, or be in some parsable
 // form like "host:port", or "redis://...".
 fn process_instances(
@@ -487,7 +487,7 @@ fn start_io_thread(
     (tx, jh)
 }
 
-fn verseion_string() -> String {
+fn version_string() -> String {
     let git_display = format!(
         "{GIT_HASH}{}",
         if GIT_DIRTY == "yes" { "-dirty" } else { "" }
@@ -503,7 +503,7 @@ async fn main() -> Result<()> {
     let cfg = Map::load(opt.config_file.as_deref())?;
 
     if opt.version {
-        eprintln!("{}", verseion_string());
+        eprintln!("{}", version_string());
         return Ok(());
     }
 
