@@ -15,7 +15,6 @@ use clap::Parser;
 use colored::Color;
 use connection::{ServerAddr, TlsConfig};
 use filter::Filter;
-use flume;
 use futures::stream::FuturesUnordered;
 use output::OutputKind;
 use rand::{Rng, rng};
