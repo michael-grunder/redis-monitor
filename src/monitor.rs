@@ -277,13 +277,13 @@ impl<'a> Line<'a> {
         let (input, _) = tag(":")(input)?;
         let (input, port) =
             map_res(digit1b, lexical_core::parse::<u16>).parse(input)?;
-        let ips = std::str::from_utf8(ipb).map_err(|_| {
+        let addrs = std::str::from_utf8(ipb).map_err(|_| {
             Err::Error(ParseError::from_error_kind(
                 input,
                 nom::error::ErrorKind::Tag,
             ))
         })?;
-        let ip = ips.parse().map_err(|_| {
+        let ip = addrs.parse().map_err(|_| {
             Err::Error(ParseError::from_error_kind(
                 input,
                 nom::error::ErrorKind::Tag,
