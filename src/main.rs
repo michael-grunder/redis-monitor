@@ -469,13 +469,6 @@ fn verseion_string() -> String {
     format!("redis-monitor v{VERSION} (git {git_display})")
 }
 
-fn now_f64() -> f64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0));
-    now.as_secs_f64()
-}
-
 //#[tokio::main(flavor = "current_thread")]
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -522,6 +515,7 @@ async fn main() -> Result<()> {
     let interval = Duration::from_secs_f64(opt.stats.unwrap_or(1.0));
     let filter: Filter = opt.filter.into();
     let mut tick = Instant::now();
+    let mut last_warn = Instant::now();
 
     let (io_tx, io_jh) = start_io_thread(opt.output, &format, 65536);
 
@@ -531,8 +525,8 @@ async fn main() -> Result<()> {
         tasks.push(tokio::spawn(run_monitor(mon.clone(), tx.clone())));
     }
 
-    let mut yields = 0;
-    let mut total_yields = 0;
+    let mut stalls = 0;
+    let mut total_stalls = 0;
 
     while let Some(message) = rx.recv().await {
         if !filter.check(&message.line) {
@@ -550,16 +544,17 @@ async fn main() -> Result<()> {
             }
         }
 
-        if yields > 0 && yields % 1000 == 0 {
-            let now = now_f64();
+        if stalls > 0 && last_warn.elapsed() >= Duration::from_secs(1) {
             io_tx
                 .send(IoMessage::Warning(format!(
-                    "{now} Dropped {yields} messages due to backpressure (total {total_yields}")))
+                   "Stalled {stalls} times due to backpressure (total {total_stalls}")))
                 .unwrap_or_else(|e| {
-                    eprintln!("Failed to send warning: {e}");
+                   eprintln!("Failed to send warning: {e}");
                 });
-            total_yields += yields;
-            yields = 0;
+
+            last_warn = Instant::now();
+            total_stalls += stalls;
+            stalls = 0;
         }
 
         let mut msg = IoMessage::Message(message);
@@ -568,7 +563,7 @@ async fn main() -> Result<()> {
             match io_tx.try_send(msg) {
                 Ok(()) => break,
                 Err(flume::TrySendError::Full(m)) => {
-                    yields += 1;
+                    stalls += 1;
                     tokio::task::yield_now().await;
                     msg = m;
                 }
