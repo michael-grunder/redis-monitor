@@ -18,17 +18,19 @@ use filter::Filter;
 use futures::stream::FuturesUnordered;
 use output::OutputKind;
 use rand::{Rng, rng};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::{
     collections::HashSet, convert::From, path::PathBuf, str::FromStr,
-    sync::Arc, time::Instant,
+    time::Instant,
 };
 use tokio::{
     io::AsyncReadExt,
     sync::mpsc,
     time::{Duration, sleep},
 };
-
-//mod commands;
 mod config;
 mod connection;
 mod filter;
@@ -248,13 +250,6 @@ fn process_instances(
         .collect()
 }
 
-#[derive(Debug, Copy, Clone)]
-struct Stalls {
-    count: u64,
-    total: u64,
-    last_time: Instant,
-}
-
 #[derive(Debug)]
 struct Backoff {
     retries: u32,
@@ -271,37 +266,18 @@ struct MonitorMessage {
 
 type IoSender = flume::Sender<IoMessage>;
 
+#[derive(Debug, Clone)]
+struct IoHandle {
+    tx: IoSender,
+    stalls: Arc<AtomicU64>,
+}
+
 #[derive(Debug)]
 enum IoMessage {
     Preamble(Arc<[Monitor]>),
-    Backpressure(Stalls),
     Stats(Vec<CommandStat>),
     Message(MonitorMessage),
     Shutdown,
-}
-
-impl Stalls {
-    pub fn new() -> Self {
-        Self {
-            count: 0,
-            total: 0,
-            last_time: Instant::now(),
-        }
-    }
-
-    const fn incr(&mut self) {
-        self.count += 1;
-    }
-
-    fn flush(&mut self) {
-        self.total += self.count;
-        self.count = 0;
-        self.last_time = Instant::now();
-    }
-
-    fn ready_to_emit(&mut self) -> bool {
-        self.count > 0 && self.last_time.elapsed() >= Duration::from_secs(1)
-    }
 }
 
 impl Backoff {
@@ -422,13 +398,6 @@ fn handle_msg(
             w.write_stats(&s)?;
             w.flush()?;
         }
-        IoMessage::Backpressure(s) => {
-            eprintln!(
-                "[WARNING]: Stalled {} times due to backpressure (total {})",
-                s.count,
-                s.total + s.count
-            );
-        }
         IoMessage::Message(m) => {
             let parsed = match Line::from_line_bytes(&m.line, need_args) {
                 Ok((_, line)) => line,
@@ -449,19 +418,22 @@ fn start_io_thread(
     output_kind: OutputKind,
     format: &str,
     size: usize,
-) -> (IoSender, std::thread::JoinHandle<Result<()>>) {
+) -> (IoHandle, std::thread::JoinHandle<Result<()>>) {
     const BATCH_MAX: usize = 1024;
 
     let (tx, rx) = flume::bounded(size);
 
     let fmt = format.to_string();
     let need_args = output_kind.need_args();
+    let stalls = Arc::new(AtomicU64::new(0));
+    let stalls_io = Arc::clone(&stalls);
 
     let jh = std::thread::spawn(move || -> Result<()> {
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::with_capacity(1 << 20, stdout.lock());
         let mut writer = output_kind.get_writer(&mut out, &fmt);
-
+        let mut last = Instant::now();
+        let mut total = 0u64;
         let mut shutdown = false;
 
         while !shutdown {
@@ -488,13 +460,25 @@ fn start_io_thread(
                 }
             }
 
+            if last.elapsed() >= Duration::from_secs(1) {
+                let n = stalls_io.swap(0, Ordering::Relaxed);
+                if n > 0 {
+                    total = total.saturating_add(n);
+                    eprintln!(
+                        "[WARNING] Stalled {n} times due to backpressure (total {total})",
+                    );
+                }
+
+                last = Instant::now();
+            }
+
             writer.flush()?;
         }
 
         Ok(())
     });
 
-    (tx, jh)
+    (IoHandle { tx, stalls }, jh)
 }
 
 fn version_string() -> String {
@@ -556,12 +540,10 @@ async fn main() -> Result<()> {
     let (io_tx, io_jh) = start_io_thread(opt.output, &format, 65536);
 
     let preamble: Arc<[Monitor]> = Arc::from(seeds);
-    io_tx.send(IoMessage::Preamble(Arc::clone(&preamble)))?;
+    io_tx.tx.send(IoMessage::Preamble(Arc::clone(&preamble)))?;
     for mon in &*preamble {
         tasks.push(tokio::spawn(run_monitor(mon.clone(), tx.clone())));
     }
-
-    let mut stalls = Stalls::new();
 
     while let Some(message) = rx.recv().await {
         if !filter.check(&message.line) {
@@ -572,30 +554,20 @@ async fn main() -> Result<()> {
             stats.try_incr(&message.line, message.line.len());
             if tick.elapsed() >= interval {
                 let s = stats.get_stats();
-                io_tx.send(IoMessage::Stats(s)).unwrap_or_else(|e| {
+                io_tx.tx.send(IoMessage::Stats(s)).unwrap_or_else(|e| {
                     eprintln!("Failed to send stats: {e}");
                 });
                 tick = Instant::now();
             }
         }
 
-        if stalls.ready_to_emit() {
-            io_tx
-                .send(IoMessage::Backpressure(stalls))
-                .unwrap_or_else(|e| {
-                    eprintln!("Failed to send warning: {e}");
-                });
-
-            stalls.flush();
-        }
-
         let mut msg = IoMessage::Message(message);
 
         loop {
-            match io_tx.try_send(msg) {
+            match io_tx.tx.try_send(msg) {
                 Ok(()) => break,
                 Err(flume::TrySendError::Full(m)) => {
-                    stalls.incr();
+                    io_tx.stalls.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
                     msg = m;
                 }
@@ -607,7 +579,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let _ = io_tx.send(IoMessage::Shutdown);
+    let _ = io_tx.tx.send(IoMessage::Shutdown);
     if let Err(e) = io_jh
         .join()
         .unwrap_or_else(|e| Err(anyhow!("IO thread panicked: {e:?}")))
