@@ -248,7 +248,7 @@ fn process_instances(
         .collect()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 struct Stalls {
     count: u64,
     total: u64,
@@ -262,7 +262,7 @@ struct Backoff {
 }
 
 #[derive(Debug)]
-pub struct MonitorMessage {
+struct MonitorMessage {
     pub server: Arc<ServerAddr>,
     pub name: Arc<Option<String>>,
     pub color: Option<Color>,
@@ -270,12 +270,11 @@ pub struct MonitorMessage {
 }
 
 type IoSender = flume::Sender<IoMessage>;
-//type IoReceiver = flume::Receiver<IoMessage>;
 
 #[derive(Debug)]
 enum IoMessage {
     Preamble(Arc<[Monitor]>),
-    Warning(String),
+    Backpressure(Stalls),
     Stats(Vec<CommandStat>),
     Message(MonitorMessage),
     Shutdown,
@@ -298,6 +297,10 @@ impl Stalls {
         self.total += self.count;
         self.count = 0;
         self.last_time = Instant::now();
+    }
+
+    fn ready_to_emit(&mut self) -> bool {
+        self.count > 0 && self.last_time.elapsed() >= Duration::from_secs(1)
     }
 }
 
@@ -419,8 +422,12 @@ fn handle_msg(
             w.write_stats(&s)?;
             w.flush()?;
         }
-        IoMessage::Warning(w) => {
-            eprintln!("[WARNING]: {w}");
+        IoMessage::Backpressure(s) => {
+            eprintln!(
+                "[WARNING]: Stalled {} times due to backpressure (total {})",
+                s.count,
+                s.total + s.count
+            );
         }
         IoMessage::Message(m) => {
             let parsed = match Line::from_line_bytes(&m.line, need_args) {
@@ -572,15 +579,9 @@ async fn main() -> Result<()> {
             }
         }
 
-        if stalls.count > 0
-            && stalls.last_time.elapsed() >= Duration::from_secs(5)
-        {
+        if stalls.ready_to_emit() {
             io_tx
-                .send(IoMessage::Warning(format!(
-                    "Stalled {} times due to backpressure (total {})",
-                    stalls.count,
-                    stalls.total + stalls.count
-                )))
+                .send(IoMessage::Backpressure(stalls))
                 .unwrap_or_else(|e| {
                     eprintln!("Failed to send warning: {e}");
                 });
