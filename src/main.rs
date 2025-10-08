@@ -376,7 +376,10 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
                     }
 
                     match reader.read_buf(&mut buf).await {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            eprintln!("{server} connection closed");
+                            break;
+                        }
                         Ok(_) => {}
                         Err(e) => {
                             eprintln!("{server} read error {e}");
