@@ -44,13 +44,13 @@ impl CommandStats {
     }
 
     pub fn try_incr(&mut self, line: &[u8], bytes: usize) {
-        if let Some(cmd) = self.find_cmd(line) {
+        if let Some(cmd) = Self::find_cmd(line) {
             let cmd = std::str::from_utf8(cmd).unwrap_or("unknown");
             self.incr(cmd, bytes);
         }
     }
 
-    fn find_cmd<'a>(&mut self, s: &'a [u8]) -> Option<&'a [u8]> {
+    fn find_cmd(s: &[u8]) -> Option<&[u8]> {
         let i = memchr::memchr(b'"', s)?;
         let r = &s[i + 1..];
         let j = memchr::memchr(b'"', r)?;

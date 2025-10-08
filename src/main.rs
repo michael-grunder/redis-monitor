@@ -325,13 +325,13 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
                 loop {
                     while let Some(nl) = memchr::memchr(b'\n', &buf) {
                         let mut line = buf.split_to(nl + 1).freeze();
-                        if line.ends_with(&[b'\n']) {
+                        if line.ends_with(b"\n") {
                             line.truncate(line.len() - 1);
                         }
-                        if line.ends_with(&[b'\r']) {
+                        if line.ends_with(b"\r") {
                             line.truncate(line.len() - 1);
                         }
-                        if line.starts_with(&[b'+']) {
+                        if line.starts_with(b"+") {
                             line = line.slice(1..);
                         }
 
@@ -350,7 +350,7 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
 
                     match reader.read_buf(&mut buf).await {
                         Ok(0) => break,
-                        Ok(_) => continue,
+                        Ok(_) => {}
                         Err(e) => {
                             eprintln!("{server} read error {e}");
                             break;
@@ -413,12 +413,12 @@ fn start_io_thread(
     format: &str,
     size: usize,
 ) -> (IoSender, std::thread::JoinHandle<Result<()>>) {
+    const BATCH_MAX: usize = 1024;
+
     let (tx, rx) = flume::bounded(size);
 
     let fmt = format.to_string();
     let need_args = output_kind.need_args();
-
-    const BATCH_MAX: usize = 1024;
 
     let jh = std::thread::spawn(move || -> Result<()> {
         let stdout = std::io::stdout();
@@ -428,10 +428,7 @@ fn start_io_thread(
         let mut shutdown = false;
 
         while !shutdown {
-            let first = match rx.recv() {
-                Ok(m) => m,
-                Err(_) => break,
-            };
+            let Ok(first) = rx.recv() else { break };
 
             match handle_msg(writer.as_mut(), first, need_args) {
                 Ok(Control::Shutdown) => break,
@@ -439,7 +436,7 @@ fn start_io_thread(
                 Err(e) => {
                     eprintln!("Error handling message: {e}");
                 }
-            };
+            }
 
             for msg in rx.try_iter().take(BATCH_MAX - 1) {
                 match handle_msg(writer.as_mut(), msg, need_args) {
@@ -569,7 +566,7 @@ async fn main() -> Result<()> {
 
         loop {
             match io_tx.try_send(msg) {
-                Ok(_) => break,
+                Ok(()) => break,
                 Err(flume::TrySendError::Full(m)) => {
                     yields += 1;
                     tokio::task::yield_now().await;

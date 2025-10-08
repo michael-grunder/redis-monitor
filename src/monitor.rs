@@ -141,7 +141,14 @@ fn parse_f64(i: &[u8]) -> IResult<&[u8], f64> {
         ))
     })?;
 
-    let scale = 10f64.powi(frac_bytes.len() as i32);
+    // Mother of god, Rust sometimes...
+    let len_clamped = frac_bytes.len().min(i32::MAX as usize);
+    let exp = i32::try_from(len_clamped).unwrap_or(i32::MAX);
+    let scale = 10f64.powi(exp);
+
+    debug_assert!(int <= (1u64 << 53));
+
+    #[allow(clippy::cast_precision_loss)]
     let val = (int as f64) + (frac as f64) / scale;
 
     Ok((i, val))
@@ -446,7 +453,7 @@ impl std::fmt::Display for ClientAddr<'_> {
     }
 }
 
-impl<'a> Serialize for ClientAddr<'a> {
+impl Serialize for ClientAddr<'_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -475,7 +482,7 @@ fn json_escape_lossless(bytes: &[u8]) -> String {
             0x20..=0x21 | 0x23..=0x5B | 0x5D..=0x7E => out.push(b as char),
             _ => {
                 use core::fmt::Write as _;
-                let _ = write!(out, "\\u00{:02X}", b);
+                let _ = write!(out, "\\u00{b:02X}");
             }
         }
     }
