@@ -249,6 +249,13 @@ fn process_instances(
 }
 
 #[derive(Debug)]
+struct Stalls {
+    count: u64,
+    total: u64,
+    last_time: Instant,
+}
+
+#[derive(Debug)]
 struct Backoff {
     retries: u32,
     max_delay: Duration,
@@ -272,6 +279,26 @@ enum IoMessage {
     Stats(Vec<CommandStat>),
     Message(MonitorMessage),
     Shutdown,
+}
+
+impl Stalls {
+    pub fn new() -> Self {
+        Self {
+            count: 0,
+            total: 0,
+            last_time: Instant::now(),
+        }
+    }
+
+    const fn incr(&mut self) {
+        self.count += 1;
+    }
+
+    fn flush(&mut self) {
+        self.total += self.count;
+        self.count = 0;
+        self.last_time = Instant::now();
+    }
 }
 
 impl Backoff {
@@ -515,7 +542,6 @@ async fn main() -> Result<()> {
     let interval = Duration::from_secs_f64(opt.stats.unwrap_or(1.0));
     let filter: Filter = opt.filter.into();
     let mut tick = Instant::now();
-    let mut last_warn = Instant::now();
 
     let (io_tx, io_jh) = start_io_thread(opt.output, &format, 65536);
 
@@ -525,8 +551,7 @@ async fn main() -> Result<()> {
         tasks.push(tokio::spawn(run_monitor(mon.clone(), tx.clone())));
     }
 
-    let mut stalls = 0;
-    let mut total_stalls = 0;
+    let mut stalls = Stalls::new();
 
     while let Some(message) = rx.recv().await {
         if !filter.check(&message.line) {
@@ -544,17 +569,20 @@ async fn main() -> Result<()> {
             }
         }
 
-        if stalls > 0 && last_warn.elapsed() >= Duration::from_secs(1) {
+        if stalls.count > 0
+            && stalls.last_time.elapsed() >= Duration::from_secs(5)
+        {
             io_tx
                 .send(IoMessage::Warning(format!(
-                   "Stalled {stalls} times due to backpressure (total {total_stalls}")))
+                    "Stalled {} times due to backpressure (total {})",
+                    stalls.count,
+                    stalls.total + stalls.count
+                )))
                 .unwrap_or_else(|e| {
-                   eprintln!("Failed to send warning: {e}");
+                    eprintln!("Failed to send warning: {e}");
                 });
 
-            last_warn = Instant::now();
-            total_stalls += stalls;
-            stalls = 0;
+            stalls.flush();
         }
 
         let mut msg = IoMessage::Message(message);
@@ -563,7 +591,7 @@ async fn main() -> Result<()> {
             match io_tx.try_send(msg) {
                 Ok(()) => break,
                 Err(flume::TrySendError::Full(m)) => {
-                    stalls += 1;
+                    stalls.incr();
                     tokio::task::yield_now().await;
                     msg = m;
                 }
