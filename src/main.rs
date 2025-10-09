@@ -68,7 +68,6 @@ Examples:
   # Monitor two standalone instances
   redis-monitor host1:6379 host2:6379"#
 )]
-#[command(name = "redis-monitor")]
 #[allow(clippy::struct_excessive_bools)]
 struct Options {
     #[command(subcommand)]
