@@ -11,7 +11,8 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 use bytes::{Bytes, BytesMut};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::{Shell, generate};
 use colored::Color;
 use connection::{ServerAddr, TlsConfig};
 use filter::Filter;
@@ -67,8 +68,12 @@ Examples:
   # Monitor two standalone instances
   redis-monitor host1:6379 host2:6379"#
 )]
+#[command(name = "redis-monitor")]
 #[allow(clippy::struct_excessive_bools)]
 struct Options {
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+
     #[arg(short, long, help = "Treat each instance like its a cluster seed")]
     cluster: bool,
 
@@ -127,6 +132,15 @@ struct Options {
     stats: Option<f64>,
 
     pub instances: Vec<String>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Cmd {
+    #[command(about = "Generate shell completion scripts")]
+    Completions {
+        #[arg(value_enum, help = "The shell to generate completions for")]
+        shell: Shell,
+    },
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -494,6 +508,13 @@ fn version_string() -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     let opt: Options = Options::parse();
+
+    if let Some(Cmd::Completions { shell }) = opt.cmd {
+        let mut cmd = Options::command();
+        generate(shell, &mut cmd, "redis-monitor", &mut std::io::stdout());
+        return Ok(());
+    }
+
     let cfg = Map::load(opt.config_file.as_deref())?;
 
     if opt.version {
