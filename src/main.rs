@@ -413,34 +413,36 @@ enum Control {
     Continue,
 }
 
-fn handle_msg(
-    w: &mut dyn OutputHandler,
-    msg: IoMessage,
-    need_args: bool,
-) -> Result<Control> {
-    match msg {
-        IoMessage::Preamble(servers) => {
-            w.preamble(&servers)?;
-            w.flush()?;
-        }
-        IoMessage::Stats(s) => {
-            w.write_stats(&s)?;
-            w.flush()?;
-        }
-        IoMessage::Message(m) => {
-            let parsed = match Line::from_line_bytes(&m.line, need_args) {
-                Ok((_, line)) => line,
-                Err(e) => {
-                    return Err(anyhow!("Failed to parse line: {e}"));
-                }
-            };
+impl IoMessage {
+    fn process(
+        self,
+        w: &mut dyn OutputHandler,
+        need_args: bool,
+    ) -> Result<Control> {
+        match self {
+            Self::Preamble(servers) => {
+                w.preamble(&servers)?;
+                w.flush()?;
+            }
+            Self::Stats(s) => {
+                w.write_stats(&s)?;
+                w.flush()?;
+            }
+            Self::Message(m) => {
+                let parsed = match Line::from_line_bytes(&m.line, need_args) {
+                    Ok((_, line)) => line,
+                    Err(e) => {
+                        return Err(anyhow!("Failed to parse line: {e}"));
+                    }
+                };
 
-            w.write_line(&m.server, m.name.as_ref().as_deref(), &parsed)?;
+                w.write_line(&m.server, m.name.as_ref().as_deref(), &parsed)?;
+            }
+            Self::Shutdown => return Ok(Control::Shutdown),
         }
-        IoMessage::Shutdown => return Ok(Control::Shutdown),
+
+        Ok(Control::Continue)
     }
-
-    Ok(Control::Continue)
 }
 
 fn start_io_thread(
@@ -450,7 +452,7 @@ fn start_io_thread(
 ) -> (IoHandle, std::thread::JoinHandle<Result<()>>) {
     const BATCH_MAX: usize = 1024;
 
-    let (tx, rx) = flume::bounded(size);
+    let (tx, rx) = flume::bounded::<IoMessage>(size);
 
     let fmt = format.to_string();
     let need_args = output_kind.need_args();
@@ -468,7 +470,7 @@ fn start_io_thread(
         while !shutdown {
             let Ok(first) = rx.recv() else { break };
 
-            match handle_msg(writer.as_mut(), first, need_args) {
+            match first.process(writer.as_mut(), need_args) {
                 Ok(Control::Shutdown) => break,
                 Ok(Control::Continue) => {}
                 Err(e) => {
@@ -477,7 +479,7 @@ fn start_io_thread(
             }
 
             for msg in rx.try_iter().take(BATCH_MAX - 1) {
-                match handle_msg(writer.as_mut(), msg, need_args) {
+                match msg.process(writer.as_mut(), need_args) {
                     Ok(Control::Shutdown) => {
                         shutdown = true;
                         break;
