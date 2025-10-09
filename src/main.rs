@@ -293,6 +293,22 @@ enum IoMessage {
     Shutdown,
 }
 
+impl MonitorMessage {
+    const fn new(
+        server: Arc<ServerAddr>,
+        name: Arc<Option<String>>,
+        color: Option<Color>,
+        line: Bytes,
+    ) -> Self {
+        Self {
+            server,
+            name,
+            color,
+            line,
+        }
+    }
+}
+
 impl Backoff {
     const MIN_DELAY: Duration = Duration::from_millis(50);
     const MAX_DELAY: Duration = Duration::from_secs(1);
@@ -354,12 +370,12 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
                             line = line.slice(1..);
                         }
 
-                        let msg = MonitorMessage {
-                            server: Arc::clone(&server),
-                            name: Arc::clone(&name),
-                            color: mon.color,
+                        let msg = MonitorMessage::new(
+                            Arc::clone(&server),
+                            Arc::clone(&name),
+                            mon.color,
                             line,
-                        };
+                        );
 
                         if let Err(e) = tx.send(msg).await {
                             eprintln!("{server} tx.send failure: {e}");
