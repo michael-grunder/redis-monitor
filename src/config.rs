@@ -16,8 +16,7 @@ use std::{
     str::FromStr,
 };
 
-const DEFAULT_CFGFILE_NAMES: &[&str] =
-    &[".redis-monitor", ".redis-monitor.toml"];
+const DEFAULT_CFGFILE_NAMES: &[&str] = &[".redis-monitor"];
 const DEFAULT_CFGFILE_EXT: &[&str] = &["", "toml"];
 
 #[derive(Debug)]
