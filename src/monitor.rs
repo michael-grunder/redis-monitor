@@ -9,7 +9,10 @@ use std::{
 use nom::{
     Err, IResult, Parser,
     branch::alt,
-    bytes::complete::{is_not, tag, take_until, take_while, take_while_m_n},
+    bytes::{
+        complete::{is_not, tag, take_until, take_while, take_while_m_n},
+        take_while1,
+    },
     combinator::{map, map_res, opt, peek, value, verify},
     error::{ErrorKind, FromExternalError, ParseError},
     multi::{fold_many0, separated_list0},
@@ -79,8 +82,6 @@ impl std::fmt::Display for LineArgs<'_> {
     }
 }
 
-/* ----------------------------- bytes helpers ---------------------------- */
-
 #[inline]
 fn space0b(i: &[u8]) -> IResult<&[u8], &[u8]> {
     take_while(|b| matches!(b, b' ' | b'\t'))(i)
@@ -93,20 +94,6 @@ fn digit1b(i: &[u8]) -> IResult<&[u8], &[u8]> {
             Err(nom::Err::Error(nom::error::Error::new(
                 i,
                 nom::error::ErrorKind::Digit,
-            )))
-        } else {
-            Ok((r, s))
-        }
-    })
-}
-
-#[inline]
-fn alpha1b(i: &[u8]) -> IResult<&[u8], &[u8]> {
-    take_while(|b| (b as char).is_ascii_alphabetic())(i).and_then(|(r, s)| {
-        if s.is_empty() {
-            Err(nom::Err::Error(nom::error::Error::new(
-                i,
-                nom::error::ErrorKind::Alpha,
             )))
         } else {
             Ok((r, s))
@@ -242,19 +229,6 @@ impl<'a> Line<'a> {
         Ok((input, bytes))
     }
 
-    //fn parse_u8_from_bytes<T: std::str::FromStr>(
-    //    input: &[u8],
-    //) -> IResult<&[u8], T> {
-    //    map_res(
-    //        recognize(many1(|i| digit1b(i))),
-    //        |s: &[u8]| -> Result<T, T::Err> {
-    //            let strv = unsafe { std::str::from_utf8_unchecked(s) };
-    //            strv.parse::<T>()
-    //        },
-    //    )
-    //    .parse(input)
-    //}
-
     // aaa.bbb.ccc.ddd:port
     fn parse_ipv4(input: &[u8]) -> IResult<&[u8], (IpAddr, u16)> {
         let (input, a) =
@@ -342,9 +316,19 @@ impl<'a> Line<'a> {
     }
 
     #[inline]
+    fn is_cmd_char(b: u8) -> bool {
+        matches!(b,
+            b'A'..=b'Z' |
+            b'a'..=b'z' |
+            b'0'..=b'9' |
+            b'_'
+        )
+    }
+
+    #[inline]
     fn parse_quoted_ascii_cmd(input: &[u8]) -> IResult<&[u8], &str> {
         let (input, _) = tag("\"")(input)?;
-        let (input, cmd_bytes) = alpha1b(input)?;
+        let (input, cmd_bytes) = take_while1(Self::is_cmd_char).parse(input)?;
         let (input, _) = tag("\"")(input)?;
         // Safe: ASCII verified
         let cmd = unsafe { std::str::from_utf8_unchecked(cmd_bytes) };
