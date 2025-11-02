@@ -596,11 +596,14 @@ async fn run_stdin(opt: Options) -> Result<()> {
     );
 
     let preamble: Arc<[Monitor]> = Arc::from(vec![pseudo]);
+
     io_tx.tx.send(IoMessage::Preamble(Arc::clone(&preamble)))?;
 
     let (tx, mut rx) = mpsc::channel::<MonitorMessage>(16384);
 
-    tokio::spawn(run_stdin_shim(tx.clone()));
+    tokio::spawn(async move {
+        run_stdin_shim(tx).await;
+    });
 
     let filter: Filter = opt.filter.into();
 
