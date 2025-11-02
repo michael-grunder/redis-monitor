@@ -52,6 +52,7 @@ pub struct Line<'a> {
 pub enum ClientAddr<'a> {
     Path(&'a str),
     Tcp(IpAddr, u16),
+    Lua,
     Unknown,
 }
 
@@ -284,9 +285,16 @@ impl<'a> Line<'a> {
         Ok((input, paths))
     }
 
+    #[inline]
     fn parse_unknown(input: &[u8]) -> IResult<&[u8], &str> {
         let (input, _) = peek(tag("]")).parse(input)?;
         Ok((input, ""))
+    }
+
+    #[inline]
+    fn parse_lua(input: &[u8]) -> IResult<&[u8], ()> {
+        let (input, _) = tag("lua").parse(input)?;
+        Ok((input, ()))
     }
 
     fn parse_client(input: &[u8]) -> IResult<&[u8], ClientAddr<'_>> {
@@ -296,6 +304,8 @@ impl<'a> Line<'a> {
             Ok((input, ClientAddr::from_addr(addr, port)))
         } else if let Ok((input, (addr, port))) = Self::parse_ipv6(input) {
             Ok((input, ClientAddr::from_addr(addr, port)))
+        } else if let Ok((input, _)) = Self::parse_lua(input) {
+            Ok((input, ClientAddr::Lua))
         } else if let Ok((input, _)) = Self::parse_unknown(input) {
             Ok((input, ClientAddr::Unknown))
         } else {
@@ -414,6 +424,7 @@ impl<'a> ClientAddr<'a> {
                 _ => Cow::Borrowed("-"),
             },
             Self::Tcp(_, port) => Cow::Owned(port.to_string()),
+            Self::Lua => Cow::Borrowed("lua"),
             Self::Unknown => Cow::Borrowed("-"),
         }
     }
@@ -431,6 +442,7 @@ impl std::fmt::Display for ClientAddr<'_> {
         match self {
             ClientAddr::Path(path) => write!(f, "{path}"),
             ClientAddr::Tcp(addr, port) => write!(f, "{addr}:{port}"),
+            ClientAddr::Lua => write!(f, "lua"),
             ClientAddr::Unknown => write!(f, "-"),
         }
     }
@@ -446,6 +458,7 @@ impl Serialize for ClientAddr<'_> {
             Self::Tcp(ip, port) => {
                 serializer.serialize_str(&format!("{ip}:{port}"))
             }
+            Self::Lua => serializer.serialize_str("lua"),
             Self::Unknown => serializer.serialize_str("-"),
         }
     }
