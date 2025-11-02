@@ -34,8 +34,8 @@ Options:
   -u, --user <USER>                Redis user
   -p, --pass <PASS>                Redis password
       --filter <FILTER>            One or more patterns to either filter out or in
-  -o, --output <OUTPUT>            How to serialize the output. Values: plain, json, csv,
-                                   resp [default: plain]
+  -o, --output <OUTPUT>            How to serialize the output. Values: plain, json, php,
+                                   csv, resp [default: plain]
       --tls                        Connect using TLS
       --insecure                   Disable TLS certificate verification
       --tls-ca <TLS_CA>            Path to CA cert for TLS
