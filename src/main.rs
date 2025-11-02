@@ -683,9 +683,15 @@ async fn run_wire(opt: Options) -> Result<()> {
 
     let preamble: Arc<[Monitor]> = Arc::from(seeds);
     io_tx.tx.send(IoMessage::Preamble(Arc::clone(&preamble)))?;
-    for mon in &*preamble {
-        tasks.push(tokio::spawn(run_monitor(mon.clone(), tx.clone())));
+
+    for mon in preamble.iter().cloned() {
+        let tx_task = tx.clone();
+        tasks.push(tokio::spawn(async move {
+            run_monitor(mon, tx_task).await;
+        }));
     }
+
+    drop(tx);
 
     while let Some(message) = rx.recv().await {
         if !filter.check(&message.line) {
