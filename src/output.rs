@@ -113,10 +113,6 @@ impl OutputKind {
 }
 
 pub trait OutputHandler {
-    fn preamble(&mut self, _monitor: &[Monitor]) -> Result<()> {
-        Ok(())
-    }
-
     fn write_line(
         &mut self,
         server: &ServerAddr,
@@ -173,18 +169,6 @@ struct PhpWriter<W: Write> {
 }
 
 impl<W: Write> OutputHandler for PlainWriter<W> {
-    fn preamble(&mut self, monitor: &[Monitor]) -> Result<()> {
-        let addresses = monitor
-            .iter()
-            .map(|m| m.address.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-
-        writeln!(self.writer, "MONITOR: {addresses}")?;
-
-        Ok(())
-    }
-
     fn write_line(
         &mut self,
         server: &ServerAddr,
@@ -374,15 +358,6 @@ impl<W: Write> OutputHandler for CsvWriter<W> {
 }
 
 impl<W: Write> OutputHandler for JsonWriter<W> {
-    fn preamble(&mut self, monitor: &[Monitor]) -> Result<()> {
-        let display: Vec<String> =
-            monitor.iter().map(|m| m.address.to_string()).collect();
-        serde_json::to_writer(&mut self.writer, &display)?;
-
-        writeln!(&mut self.writer)?;
-        Ok(())
-    }
-
     fn write_line(
         &mut self,
         _server: &ServerAddr,
@@ -426,15 +401,6 @@ impl<W: Write> OutputHandler for RespWriter<W> {
 }
 
 impl<W: Write> OutputHandler for PhpWriter<W> {
-    fn preamble(&mut self, monitor: &[Monitor]) -> Result<()> {
-        let addrs: Vec<String> =
-            monitor.iter().map(|m| m.address.to_string()).collect();
-        let buf = php::to_vec(&addrs)?;
-        self.writer.write_all(&buf)?;
-        self.writer.write_all(b"\n")?;
-        Ok(())
-    }
-
     fn write_line(
         &mut self,
         _server: &ServerAddr,

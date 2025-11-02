@@ -479,8 +479,7 @@ impl IoMessage {
     ) -> Result<Control> {
         match self {
             Self::Preamble(servers) => {
-                w.preamble(&servers)?;
-                w.flush()?;
+                eprintln!("{}", format_preamble(&servers));
             }
             Self::Stats(s) => {
                 w.write_stats(&s)?;
@@ -504,6 +503,16 @@ impl IoMessage {
 
         Ok(Control::Continue)
     }
+}
+
+fn format_preamble(monitor: &[Monitor]) -> String {
+    let addresses = monitor
+        .iter()
+        .map(|m| m.address.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!("MONITOR: {addresses}")
 }
 
 fn start_io_thread(
