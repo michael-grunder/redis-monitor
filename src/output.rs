@@ -8,12 +8,20 @@ use crate::{
     stats::CommandStat,
 };
 
+use serde_php as php;
+
+use serde::{Serialize, Serializer, ser::SerializeStruct};
+use serde_bytes::{ByteBuf as SerByteBuf, Bytes as SerBytes};
+
+struct PhpLine<'a>(&'a Line<'a>);
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum OutputKind {
     Plain,
     Json,
     Csv,
     Resp,
+    Php,
 }
 
 #[derive(Debug, Clone)]
@@ -43,13 +51,43 @@ impl FromStr for OutputKind {
             "resp" => Ok(Self::Resp),
             "json" => Ok(Self::Json),
             "csv" => Ok(Self::Csv),
+            "php" => Ok(Self::Php),
             _ => Err(anyhow!(
-                "Invalid output format '{s}'. Supported formats: plain, resp, json, xml",
+                "Invalid output format '{s}'. Supported: \
+                 plain, resp, json, csv, php"
             )),
         }
     }
 }
 
+impl Serialize for PhpLine<'_> {
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let l = self.0;
+        let mut st = s.serialize_struct("Line", 5)?;
+        st.serialize_field("timestamp", &l.timestamp)?;
+        st.serialize_field("db", &l.db)?;
+        st.serialize_field("addr", &l.addr)?;
+        st.serialize_field("cmd", &l.cmd)?;
+
+        match &l.args {
+            LineArgs::Parsed(v) => {
+                // Vec<Vec<u8>> -> Vec<ByteBuf>
+                let vb: Vec<SerByteBuf> =
+                    v.iter().map(|b| SerByteBuf::from(b.clone())).collect();
+                st.serialize_field("args", &vb)?;
+            }
+            LineArgs::Raw(raw) => {
+                // Borrowed bytes are fine as &Bytes.
+                st.serialize_field("args", &SerBytes::new(raw))?;
+            }
+        }
+
+        st.end()
+    }
+}
 impl OutputKind {
     pub fn need_args(self) -> bool {
         self != Self::Plain
@@ -68,6 +106,7 @@ impl OutputKind {
                     .from_writer(writer),
             }),
             Self::Json => Box::new(JsonWriter { writer }),
+            Self::Php => Box::new(PhpWriter { writer }),
             Self::Resp => Box::new(RespWriter { writer }),
         }
     }
@@ -125,6 +164,11 @@ struct JsonWriter<W: Write> {
 
 #[derive(Debug)]
 struct RespWriter<W: Write> {
+    writer: W,
+}
+
+#[derive(Debug)]
+struct PhpWriter<W: Write> {
     writer: W,
 }
 
@@ -373,6 +417,40 @@ impl<W: Write> OutputHandler for RespWriter<W> {
         parsed: &Line,
     ) -> Result<()> {
         parsed.write_resp(&mut self.writer)?;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.writer.flush().map_err(|e| anyhow!(e))
+    }
+}
+
+impl<W: Write> OutputHandler for PhpWriter<W> {
+    fn preamble(&mut self, monitor: &[Monitor]) -> Result<()> {
+        let addrs: Vec<String> =
+            monitor.iter().map(|m| m.address.to_string()).collect();
+        let buf = php::to_vec(&addrs)?;
+        self.writer.write_all(&buf)?;
+        self.writer.write_all(b"\n")?;
+        Ok(())
+    }
+
+    fn write_line(
+        &mut self,
+        _server: &ServerAddr,
+        _name: Option<&str>,
+        parsed: &Line,
+    ) -> Result<()> {
+        let buf = php::to_vec(&PhpLine(parsed))?;
+        self.writer.write_all(&buf)?;
+        self.writer.write_all(b"\n")?;
+        Ok(())
+    }
+
+    fn write_stats(&mut self, stats: &[CommandStat]) -> Result<()> {
+        let buf = php::to_vec(stats)?;
+        self.writer.write_all(&buf)?;
+        self.writer.write_all(b"\n")?;
         Ok(())
     }
 
