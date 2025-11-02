@@ -28,10 +28,11 @@ use std::{
     time::Instant,
 };
 use tokio::{
-    io::AsyncReadExt,
+    io::{self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader},
     sync::mpsc,
     time::{Duration, sleep},
 };
+
 mod config;
 mod connection;
 mod filter;
@@ -129,6 +130,9 @@ struct Options {
 
     #[arg(long, value_parser = validate_positive_f64)]
     stats: Option<f64>,
+
+    #[arg(long, help = "Read from stdin instead of connecting to servers")]
+    stdin: bool,
 
     pub instances: Vec<String>,
 }
@@ -345,6 +349,60 @@ impl Backoff {
     }
 }
 
+async fn run_from_reader<R>(
+    name: &str,
+    mut reader: R,
+    tx: mpsc::Sender<MonitorMessage>,
+) where
+    R: AsyncBufRead + Unpin,
+{
+    let server = Arc::new(ServerAddr::from_path(name));
+    let name_arc = Arc::new(None::<String>);
+
+    let mut buf = Vec::with_capacity(16 * 1024);
+
+    loop {
+        buf.clear();
+
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("{server} read error {e}");
+                break;
+            }
+        }
+
+        while buf.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+            buf.pop();
+        }
+
+        if buf.first().is_some_and(|b| *b == b'+') {
+            buf.remove(0);
+        }
+
+        let line = Bytes::from(buf.clone());
+
+        let msg = MonitorMessage::new(
+            Arc::clone(&server),
+            Arc::clone(&name_arc),
+            None,
+            line,
+        );
+
+        if let Err(e) = tx.send(msg).await {
+            eprintln!("{server} tx.send failure: {e}");
+            break;
+        }
+    }
+}
+
+async fn run_stdin_shim(tx: mpsc::Sender<MonitorMessage>) {
+    let stdin = io::stdin();
+    let reader = BufReader::new(stdin);
+    run_from_reader("stdin", reader, tx).await;
+}
+
 async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
     let server = Arc::new(mon.address.clone());
     let name = Arc::new(mon.name.clone());
@@ -521,23 +579,66 @@ fn version_string() -> String {
     format!("redis-monitor v{VERSION} (git {git_display})")
 }
 
-//#[tokio::main(flavor = "current_thread")]
-#[tokio::main]
-async fn main() -> Result<()> {
-    let opt: Options = Options::parse();
+async fn run_stdin(opt: Options) -> Result<()> {
+    let format = opt
+        .format
+        .clone()
+        .unwrap_or_else(|| DEFAULT_SINGLE_FORMAT.to_string());
 
-    if let Some(Cmd::Completions { shell }) = opt.cmd {
-        let mut cmd = Options::command();
-        generate(shell, &mut cmd, "redis-monitor", &mut std::io::stdout());
-        return Ok(());
+    let (io_tx, io_jh) = start_io_thread(opt.output, &format, 65536);
+
+    let pseudo = Monitor::new(
+        Some("stdin"),
+        ServerAddr::from_path("stdin"),
+        None,
+        ServerAuth::default(),
+        None,
+    );
+
+    let preamble: Arc<[Monitor]> = Arc::from(vec![pseudo]);
+    io_tx.tx.send(IoMessage::Preamble(Arc::clone(&preamble)))?;
+
+    let (tx, mut rx) = mpsc::channel::<MonitorMessage>(16384);
+
+    tokio::spawn(run_stdin_shim(tx.clone()));
+
+    let filter: Filter = opt.filter.into();
+
+    while let Some(message) = rx.recv().await {
+        if !filter.check(&message.line) {
+            continue;
+        }
+
+        let mut msg = IoMessage::Message(message);
+        loop {
+            match io_tx.tx.try_send(msg) {
+                Ok(()) => break,
+                Err(flume::TrySendError::Full(m)) => {
+                    io_tx.stalls.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                    msg = m;
+                }
+                Err(flume::TrySendError::Disconnected(_)) => {
+                    eprintln!("io thread disconnected");
+                    break;
+                }
+            }
+        }
     }
 
+    let _ = io_tx.tx.send(IoMessage::Shutdown);
+    if let Err(e) = io_jh
+        .join()
+        .unwrap_or_else(|e| Err(anyhow!("IO thread panicked: {e:?}")))
+    {
+        eprintln!("IO thread error: {e}");
+    }
+
+    Ok(())
+}
+
+async fn run_wire(opt: Options) -> Result<()> {
     let cfg = Map::load(opt.config_file.as_deref())?;
-
-    if opt.version {
-        eprintln!("{}", version_string());
-        return Ok(());
-    }
 
     if opt.instances.is_empty() {
         eprintln!("Must pass at least one unstance (host/port or name)");
@@ -626,4 +727,27 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+//#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
+async fn main() -> Result<()> {
+    let opt: Options = Options::parse();
+
+    if opt.version {
+        eprintln!("{}", version_string());
+        return Ok(());
+    }
+
+    if let Some(Cmd::Completions { shell }) = opt.cmd {
+        let mut cmd = Options::command();
+        generate(shell, &mut cmd, "redis-monitor", &mut std::io::stdout());
+        return Ok(());
+    }
+
+    if opt.stdin {
+        run_stdin(opt).await
+    } else {
+        run_wire(opt).await
+    }
 }
