@@ -490,7 +490,10 @@ impl IoMessage {
                 let parsed = match Line::from_line_bytes(&m.line, need_args) {
                     Ok((_, line)) => line,
                     Err(e) => {
-                        return Err(anyhow!("Failed to parse line: {e}"));
+                        let s = String::from_utf8_lossy(&m.line);
+                        return Err(anyhow!(
+                            "Failed to parse line '{s}' ({e})"
+                        ));
                     }
                 };
 
