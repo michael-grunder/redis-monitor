@@ -4,6 +4,7 @@ version = "0.1.1"
 edition = "2024"
 
 [dependencies]
+aho-corasick = "1.1.4"
 anyhow = "1.0.100"
 bytes = "1.10.1"
 clap = { version = "4.5.51", features = ["derive", "wrap_help"] }
@@ -45,6 +46,3 @@ lto = "thin"
 codegen-units = 1
 incremental = false
 panic = "abort"
-
-[profile.release.package.memchr]
-opt-level = 3

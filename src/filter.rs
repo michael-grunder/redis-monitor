@@ -1,5 +1,5 @@
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use anyhow::Result;
-use memchr::memmem;
 use regex::bytes::Regex;
 use std::{
     collections::HashSet,
@@ -15,7 +15,7 @@ pub enum FilterPattern {
 
 #[derive(Debug, Clone)]
 pub enum Pattern {
-    // Keep String so equality/hash use the exact user text.
+    // Keep String so equality/hash use exact user text.
     Literal(String),
     // Bytes regex engine for matching on &[u8].
     Regex(Regex),
@@ -23,18 +23,9 @@ pub enum Pattern {
 
 impl Pattern {
     #[inline]
-    fn check(&self, value: &[u8]) -> bool {
-        match self {
-            Self::Literal(lit) => memmem::find(value, lit.as_bytes()).is_some(),
-            Self::Regex(re) => re.is_match(value),
-        }
-    }
-
-    #[inline]
     fn as_str(&self) -> &str {
         match self {
             Self::Literal(lit) => lit.as_str(),
-            // regex::bytes::Regex still exposes pattern text as &str
             Self::Regex(re) => re.as_str(),
         }
     }
@@ -82,8 +73,12 @@ impl FromStr for FilterPattern {
 
 #[derive(Debug, Clone)]
 pub struct Filter {
-    include: Vec<Pattern>,
-    exclude: Vec<Pattern>,
+    // literals → AC, optional because you may have none
+    lit_include: Option<AhoCorasick>,
+    lit_exclude: Option<AhoCorasick>,
+    // regexes → just Vec
+    re_include: Vec<Regex>,
+    re_exclude: Vec<Regex>,
 }
 
 impl From<Vec<FilterPattern>> for Filter {
@@ -113,18 +108,94 @@ impl Filter {
             }
         }
 
-        Self {
-            include: Self::unique_patterns(&include),
-            exclude: Self::unique_patterns(&exclude),
+        let include = Self::unique_patterns(&include);
+        let exclude = Self::unique_patterns(&exclude);
+
+        // separate literals and regexes
+        let mut lit_inc = Vec::new();
+        let mut lit_exc = Vec::new();
+        let mut re_inc = Vec::new();
+        let mut re_exc = Vec::new();
+
+        for p in include {
+            match p {
+                Pattern::Literal(s) => lit_inc.push(s.into_bytes()),
+                Pattern::Regex(r) => re_inc.push(r),
+            }
         }
+
+        for p in exclude {
+            match p {
+                Pattern::Literal(s) => lit_exc.push(s.into_bytes()),
+                Pattern::Regex(r) => re_exc.push(r),
+            }
+        }
+
+        // build AC for literals if we have any
+        let lit_include = if lit_inc.is_empty() {
+            None
+        } else {
+            Some(
+                AhoCorasickBuilder::new()
+                    .ascii_case_insensitive(true)
+                    .build(&lit_inc)
+                    .unwrap_or_else(|e| {
+                        panic!("Failed to build Aho-Corasick automaton: {e}")
+                    }),
+            )
+        };
+
+        let lit_exclude = if lit_exc.is_empty() {
+            None
+        } else {
+            Some(
+                AhoCorasickBuilder::new()
+                    .ascii_case_insensitive(true)
+                    .build(&lit_exc)
+                    .unwrap_or_else(|e| {
+                        panic!("Failed to build Aho-Corasick automaton: {e}")
+                    }),
+            )
+        };
+
+        Self {
+            lit_include,
+            lit_exclude,
+            re_include: re_inc,
+            re_exclude: re_exc,
+        }
+    }
+
+    fn has_includes(&self) -> bool {
+        self.lit_include.is_some() || !self.re_include.is_empty()
     }
 
     #[inline]
     pub fn check(&self, value: &[u8]) -> bool {
-        if self.exclude.iter().any(|p| p.check(value)) {
+        // Short circuit if any excludes match.
+        if let Some(ac) = &self.lit_exclude {
+            if ac.is_match(value) {
+                return false;
+            }
+        }
+
+        // Short circuit regex excludes match
+        if self.re_exclude.iter().any(|re| re.is_match(value)) {
             return false;
         }
 
-        self.include.is_empty() || self.include.iter().any(|p| p.check(value))
+        if !self.has_includes() {
+            return true;
+        }
+
+        // Now check literal includes
+        if let Some(ac) = &self.lit_include {
+            if ac.is_match(value) {
+                return true;
+            }
+        }
+
+        // Finally check regex includes
+        self.re_include.iter().any(|re| re.is_match(value))
     }
 }
