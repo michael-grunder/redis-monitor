@@ -3,7 +3,7 @@ use std::{io::Write, str::FromStr};
 use anyhow::{Error, Result, anyhow};
 
 use crate::{
-    connection::{GetHost, Monitor, ServerAddr},
+    connection::{GetHost, ServerAddr},
     monitor::{ClientAddr, Line, LineArgs},
     stats::CommandStat,
 };
