@@ -304,7 +304,7 @@ impl<'a> Line<'a> {
             Ok((input, ClientAddr::from_addr(addr, port)))
         } else if let Ok((input, (addr, port))) = Self::parse_ipv6(input) {
             Ok((input, ClientAddr::from_addr(addr, port)))
-        } else if let Ok((input, _)) = Self::parse_lua(input) {
+        } else if let Ok((input, ())) = Self::parse_lua(input) {
             Ok((input, ClientAddr::Lua))
         } else if let Ok((input, _)) = Self::parse_unknown(input) {
             Ok((input, ClientAddr::Unknown))
@@ -326,7 +326,7 @@ impl<'a> Line<'a> {
     }
 
     #[inline]
-    fn is_cmd_char(b: u8) -> bool {
+    const fn is_cmd_char(b: u8) -> bool {
         matches!(b,
             b'A'..=b'Z' |
             b'a'..=b'z' |

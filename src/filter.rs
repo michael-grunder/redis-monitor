@@ -166,17 +166,17 @@ impl Filter {
         }
     }
 
-    fn has_includes(&self) -> bool {
+    const fn has_includes(&self) -> bool {
         self.lit_include.is_some() || !self.re_include.is_empty()
     }
 
     #[inline]
     pub fn check(&self, value: &[u8]) -> bool {
         // Short circuit if any excludes match.
-        if let Some(ac) = &self.lit_exclude {
-            if ac.is_match(value) {
-                return false;
-            }
+        if let Some(ac) = &self.lit_exclude
+            && ac.is_match(value)
+        {
+            return false;
         }
 
         // Short circuit regex excludes match
@@ -189,10 +189,10 @@ impl Filter {
         }
 
         // Now check literal includes
-        if let Some(ac) = &self.lit_include {
-            if ac.is_match(value) {
-                return true;
-            }
+        if let Some(ac) = &self.lit_include
+            && ac.is_match(value)
+        {
+            return true;
         }
 
         // Finally check regex includes
