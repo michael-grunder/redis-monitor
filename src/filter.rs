@@ -1,5 +1,6 @@
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use anyhow::Result;
+use memchr::memchr;
 use regex::bytes::Regex;
 use std::{
     collections::HashSet,
@@ -171,7 +172,19 @@ impl Filter {
     }
 
     #[inline]
+    fn cmd<'a>(line: &'a [u8]) -> Option<&'a [u8]> {
+        let start = memchr(b'"', line)?;
+        let rest = &line[start + 1..];
+        let end_rel = memchr(b'"', rest)?;
+        let end = start + 1 + end_rel;
+
+        Some(&line[start + 1..end])
+    }
+
+    #[inline]
     pub fn matches(&self, value: &[u8]) -> bool {
+        let value = Self::cmd(value).unwrap_or(value);
+
         // If a non-empty exclude matches, reject immediately.
         if self.exclude.iter().any(|matcher| matcher.is_match(value)) {
             return false;
