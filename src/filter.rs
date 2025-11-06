@@ -72,13 +72,25 @@ impl FromStr for FilterPattern {
 }
 
 #[derive(Debug, Clone)]
+enum Matcher {
+    Literals(AhoCorasick),
+    Regexes(Vec<Regex>),
+}
+
+impl Matcher {
+    #[inline]
+    fn is_match(&self, value: &[u8]) -> bool {
+        match self {
+            Self::Literals(ac) => ac.is_match(value),
+            Self::Regexes(res) => res.iter().any(|re| re.is_match(value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Filter {
-    // literals → AC, optional because you may have none
-    lit_include: Option<AhoCorasick>,
-    lit_exclude: Option<AhoCorasick>,
-    // regexes → just Vec
-    re_include: Vec<Regex>,
-    re_exclude: Vec<Regex>,
+    include: Vec<Matcher>,
+    exclude: Vec<Matcher>,
 }
 
 impl From<Vec<FilterPattern>> for Filter {
@@ -111,91 +123,66 @@ impl Filter {
         let include = Self::unique_patterns(&include);
         let exclude = Self::unique_patterns(&exclude);
 
-        // separate literals and regexes
-        let mut lit_inc = Vec::new();
-        let mut lit_exc = Vec::new();
-        let mut re_inc = Vec::new();
-        let mut re_exc = Vec::new();
+        let (inc_lits, inc_res) = Self::split_patterns(include);
+        let (exc_lits, exc_res) = Self::split_patterns(exclude);
 
-        for p in include {
+        let include = Self::build_matchers(inc_lits, inc_res);
+        let exclude = Self::build_matchers(exc_lits, exc_res);
+
+        Self { include, exclude }
+    }
+
+    fn split_patterns(patterns: Vec<Pattern>) -> (Vec<Vec<u8>>, Vec<Regex>) {
+        let mut lits = Vec::new();
+        let mut res = Vec::new();
+
+        for p in patterns {
             match p {
-                Pattern::Literal(s) => lit_inc.push(s.into_bytes()),
-                Pattern::Regex(r) => re_inc.push(r),
+                Pattern::Literal(s) => lits.push(s.into_bytes()),
+                Pattern::Regex(r) => res.push(r),
             }
         }
 
-        for p in exclude {
-            match p {
-                Pattern::Literal(s) => lit_exc.push(s.into_bytes()),
-                Pattern::Regex(r) => re_exc.push(r),
-            }
+        (lits, res)
+    }
+
+    fn build_matchers(lits: Vec<Vec<u8>>, res: Vec<Regex>) -> Vec<Matcher> {
+        let mut out = Vec::new();
+
+        if !lits.is_empty() {
+            let ac = AhoCorasickBuilder::new()
+                .ascii_case_insensitive(true)
+                .build(&lits)
+                .unwrap_or_else(|e| {
+                    panic!("Failed to build Aho-Corasick automaton: {e}")
+                });
+            out.push(Matcher::Literals(ac));
         }
 
-        // build AC for literals if we have any
-        let lit_include = if lit_inc.is_empty() {
-            None
-        } else {
-            Some(
-                AhoCorasickBuilder::new()
-                    .ascii_case_insensitive(true)
-                    .build(&lit_inc)
-                    .unwrap_or_else(|e| {
-                        panic!("Failed to build Aho-Corasick automaton: {e}")
-                    }),
-            )
-        };
-
-        let lit_exclude = if lit_exc.is_empty() {
-            None
-        } else {
-            Some(
-                AhoCorasickBuilder::new()
-                    .ascii_case_insensitive(true)
-                    .build(&lit_exc)
-                    .unwrap_or_else(|e| {
-                        panic!("Failed to build Aho-Corasick automaton: {e}")
-                    }),
-            )
-        };
-
-        Self {
-            lit_include,
-            lit_exclude,
-            re_include: re_inc,
-            re_exclude: re_exc,
+        if !res.is_empty() {
+            out.push(Matcher::Regexes(res));
         }
+
+        out
     }
 
     const fn has_includes(&self) -> bool {
-        self.lit_include.is_some() || !self.re_include.is_empty()
+        !self.include.is_empty()
     }
 
     #[inline]
-    pub fn check(&self, value: &[u8]) -> bool {
-        // Short circuit if any excludes match.
-        if let Some(ac) = &self.lit_exclude
-            && ac.is_match(value)
-        {
+    pub fn matches(&self, value: &[u8]) -> bool {
+        // If a non-empty exclude matches, reject immediately.
+        if self.exclude.iter().any(|matcher| matcher.is_match(value)) {
             return false;
         }
 
-        // Short circuit regex excludes match
-        if self.re_exclude.iter().any(|re| re.is_match(value)) {
-            return false;
-        }
-
+        // Trivial success: No includes defined.
         if !self.has_includes() {
             return true;
         }
 
-        // Now check literal includes
-        if let Some(ac) = &self.lit_include
-            && ac.is_match(value)
-        {
-            return true;
-        }
-
-        // Finally check regex includes
-        self.re_include.iter().any(|re| re.is_match(value))
+        // Require at least one include match.
+        self.include.iter().any(|matcher| matcher.is_match(value))
     }
 }

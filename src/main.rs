@@ -620,7 +620,7 @@ async fn run_stdin(opt: Options) -> Result<()> {
     let filter: Filter = opt.filter.into();
 
     while let Some(message) = rx.recv().await {
-        if !filter.check(&message.line) {
+        if !filter.matches(&message.line) {
             continue;
         }
 
@@ -706,7 +706,7 @@ async fn run_wire(opt: Options) -> Result<()> {
     drop(tx);
 
     while let Some(message) = rx.recv().await {
-        if !filter.check(&message.line) {
+        if !filter.matches(&message.line) {
             continue;
         }
 
