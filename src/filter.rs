@@ -127,8 +127,8 @@ impl Filter {
         let (inc_lits, inc_res) = Self::split_patterns(include);
         let (exc_lits, exc_res) = Self::split_patterns(exclude);
 
-        let include = Self::build_matchers(inc_lits, inc_res);
-        let exclude = Self::build_matchers(exc_lits, exc_res);
+        let include = Self::build_matchers(&inc_lits, inc_res);
+        let exclude = Self::build_matchers(&exc_lits, exc_res);
 
         Self { include, exclude }
     }
@@ -147,13 +147,13 @@ impl Filter {
         (lits, res)
     }
 
-    fn build_matchers(lits: Vec<Vec<u8>>, res: Vec<Regex>) -> Vec<Matcher> {
+    fn build_matchers(lits: &[Vec<u8>], res: Vec<Regex>) -> Vec<Matcher> {
         let mut out = Vec::new();
 
         if !lits.is_empty() {
             let ac = AhoCorasickBuilder::new()
                 .ascii_case_insensitive(true)
-                .build(&lits)
+                .build(lits)
                 .unwrap_or_else(|e| {
                     panic!("Failed to build Aho-Corasick automaton: {e}")
                 });
@@ -172,7 +172,7 @@ impl Filter {
     }
 
     #[inline]
-    fn cmd<'a>(line: &'a [u8]) -> Option<&'a [u8]> {
+    fn cmd(line: &[u8]) -> Option<&[u8]> {
         let start = memchr(b'"', line)?;
         let rest = &line[start + 1..];
         let end_rel = memchr(b'"', rest)?;
