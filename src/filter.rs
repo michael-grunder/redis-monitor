@@ -16,9 +16,7 @@ pub enum FilterPattern {
 
 #[derive(Debug, Clone)]
 pub enum Pattern {
-    // Keep String so equality/hash use exact user text.
     Literal(String),
-    // Bytes regex engine for matching on &[u8].
     Regex(Regex),
 }
 
