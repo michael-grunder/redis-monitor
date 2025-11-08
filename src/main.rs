@@ -750,8 +750,7 @@ async fn run_wire(opt: Options) -> Result<()> {
     Ok(())
 }
 
-//#[tokio::main(flavor = "current_thread")]
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let opt: Options = Options::parse();
 
