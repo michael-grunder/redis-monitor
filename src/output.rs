@@ -76,7 +76,9 @@ impl Serialize for PhpLine<'_> {
             LineArgs::Parsed(v) => {
                 // Vec<Vec<u8>> -> Vec<ByteBuf>
                 let vb: Vec<SerByteBuf> =
-                    v.iter().map(|b| SerByteBuf::from(b.clone())).collect();
+                    v.iter()
+                        .map(|b| SerByteBuf::from(b.clone().into_owned()))
+                        .collect();
                 st.serialize_field("args", &vb)?;
             }
             LineArgs::Raw(raw) => {
@@ -219,7 +221,7 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
                         LineArgs::Parsed(v) => {
                             for arg in v {
                                 w.write_all(b" \"")?;
-                                w.write_all(arg)?;
+                                w.write_all(arg.as_ref())?;
                                 w.write_all(b"\"")?;
                             }
                         }

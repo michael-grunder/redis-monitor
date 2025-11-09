@@ -13,9 +13,9 @@ use nom::{
         complete::{is_not, tag, take_until, take_while, take_while_m_n},
         take_while1,
     },
-    combinator::{map, map_res, opt, peek, value, verify},
+    combinator::{map_res, opt, peek, value, verify},
     error::{ErrorKind, FromExternalError, ParseError},
-    multi::{fold_many0, separated_list0},
+    multi::separated_list0,
     sequence::preceded,
 };
 
@@ -24,17 +24,27 @@ pub enum LineArgs<'a> {
     #[serde(with = "serde_bytes")]
     Raw(&'a [u8]),
     #[serde(with = "serde_vec_bytes")]
-    Parsed(Vec<Vec<u8>>),
+    Parsed(Vec<Cow<'a, [u8]>>),
 }
 
-// helper so Vec<Vec<u8>> serializes as bytes not arrays of ints
+// helper so Vec<Cow<[u8]>> serializes as bytes not arrays of ints
 mod serde_vec_bytes {
-    use serde::{Serialize, Serializer};
-    pub fn serialize<S>(v: &Vec<Vec<u8>>, s: S) -> Result<S::Ok, S::Error>
+    use serde::{Serializer, ser::SerializeSeq};
+    use serde_bytes::Bytes;
+    use std::borrow::Cow;
+
+    pub fn serialize<'a, S>(
+        v: &Vec<Cow<'a, [u8]>>,
+        s: S,
+    ) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        v.serialize(s)
+        let mut seq = s.serialize_seq(Some(v.len()))?;
+        for arg in v {
+            seq.serialize_element(&Bytes::new(arg))?;
+        }
+        seq.end()
     }
 }
 
@@ -56,12 +66,6 @@ pub enum ClientAddr<'a> {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StringFragment<'a> {
-    Literal(&'a [u8]),
-    EscapedByte(u8),
-}
-
 impl std::fmt::Display for LineArgs<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -72,10 +76,18 @@ impl std::fmt::Display for LineArgs<'_> {
             LineArgs::Parsed(args) => {
                 let mut it = args.iter();
                 if let Some(first) = it.next() {
-                    write!(f, "\"{}\"", String::from_utf8_lossy(first))?;
+                    write!(
+                        f,
+                        "\"{}\"",
+                        String::from_utf8_lossy(first.as_ref())
+                    )?;
                 }
                 for a in it {
-                    write!(f, " \"{}\"", String::from_utf8_lossy(a))?;
+                    write!(
+                        f,
+                        " \"{}\"",
+                        String::from_utf8_lossy(a.as_ref())
+                    )?;
                 }
                 Ok(())
             }
@@ -191,43 +203,56 @@ impl<'a> Line<'a> {
         verify(not_quote_slash, |s: &[u8]| !s.is_empty()).parse(input)
     }
 
-    fn parse_fragment<E>(
+    fn parse_escaped_string<E>(
         input: &'a [u8],
-    ) -> IResult<&'a [u8], StringFragment<'a>, E>
+    ) -> IResult<&'a [u8], Cow<'a, [u8]>, E>
     where
         E: ParseError<&'a [u8]>
             + FromExternalError<&'a [u8], std::num::ParseIntError>,
     {
-        alt((
-            map(Self::parse_literal, StringFragment::Literal),
-            map(Self::parse_escaped_char, StringFragment::EscapedByte),
-        ))
-        .parse(input)
-    }
+        let (mut input, _) = tag("\"")(input)?;
+        let content_start = input;
+        let mut owned: Option<Vec<u8>> = None;
 
-    fn parse_escaped_string<E>(input: &'a [u8]) -> IResult<&'a [u8], Vec<u8>, E>
-    where
-        E: ParseError<&'a [u8]>
-            + FromExternalError<&'a [u8], std::num::ParseIntError>,
-    {
-        let mut build = fold_many0(
-            Self::parse_fragment,
-            Vec::<u8>::new,
-            |mut out, frag| {
-                match frag {
-                    StringFragment::Literal(s) => out.extend_from_slice(s),
-                    StringFragment::EscapedByte(b) => out.push(b),
-                }
-                out
-            },
-        );
+        loop {
+            if input.is_empty() {
+                return Err(nom::Err::Error(E::from_error_kind(
+                    input,
+                    ErrorKind::Tag,
+                )));
+            }
 
-        let (input, _) = tag("\"")(input)?;
-        let (input, bytes) = build.parse(input)?;
-        let (input, _) = tag("\"")(input)?;
-        let (input, _) = opt(tag(" ")).parse(input)?;
+            if matches!(input.first(), Some(b'"')) {
+                let consumed = content_start.len().saturating_sub(input.len());
+                let (input_after_quote, _) = tag("\"")(input)?;
+                let (input_after_space, _) = opt(tag(" ")).parse(input_after_quote)?;
+                let cow = if let Some(buf) = owned {
+                    Cow::Owned(buf)
+                } else {
+                    Cow::Borrowed(&content_start[..consumed])
+                };
+                return Ok((input_after_space, cow));
+            }
 
-        Ok((input, bytes))
+            if matches!(input.first(), Some(b'\\')) {
+                let consumed = content_start.len().saturating_sub(input.len());
+                let (next, byte) = Self::parse_escaped_char::<E>(input)?;
+                let buf = owned.get_or_insert_with(|| {
+                    let mut v = Vec::with_capacity(consumed + 8);
+                    v.extend_from_slice(&content_start[..consumed]);
+                    v
+                });
+                buf.push(byte);
+                input = next;
+                continue;
+            }
+
+            let (next, literal) = Self::parse_literal::<E>(input)?;
+            if let Some(buf) = &mut owned {
+                buf.extend_from_slice(literal);
+            }
+            input = next;
+        }
     }
 
     // aaa.bbb.ccc.ddd:port
@@ -386,7 +411,7 @@ impl<'a> Line<'a> {
 
         Self::write_bulk_bytes(writer, self.cmd.as_bytes())?;
         for arg in args {
-            Self::write_bulk_bytes(writer, arg)?;
+            Self::write_bulk_bytes(writer, arg.as_ref())?;
         }
         Ok(())
     }
@@ -495,7 +520,9 @@ where
     match args {
         LineArgs::Parsed(v) => {
             let strs: Vec<String> =
-                v.iter().map(|a| json_escape_lossless(a)).collect();
+                v.iter()
+                    .map(|a| json_escape_lossless(a.as_ref()))
+                    .collect();
             strs.serialize(s)
         }
         LineArgs::Raw(raw) => {
