@@ -96,10 +96,7 @@ impl Command {
 
         for command_values in &commands {
             if let Some(command) = Self::from_redis_values(command_values) {
-                println!("Parsed Command: {command:?}");
                 command_set.insert(command);
-            } else {
-                println!("Failed to parse command: {command_values:?}");
             }
         }
 

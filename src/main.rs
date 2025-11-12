@@ -588,6 +588,8 @@ impl IoMessage {
                     }
                 };
 
+                eprintln!("{:#?}", m.commands);
+
                 w.write_line(&m.server, m.name.as_ref().as_deref(), &parsed)?;
             }
             Self::Shutdown => return Ok(Control::Shutdown),
