@@ -6,13 +6,16 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::{
-    collections::HashSet, convert::From, path::PathBuf, str::FromStr,
+    collections::{HashMap, HashSet},
+    convert::From,
+    path::PathBuf,
+    str::FromStr,
     time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow};
 use bytes::{Bytes, BytesMut};
-use clap::{CommandFactory, Parser};
+use clap::{ArgAction, CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use colored::Color;
 use connection::{ServerAddr, TlsConfig};
@@ -31,7 +34,7 @@ use tokio::{
 };
 
 use crate::{
-    commands::Command,
+    commands::{Categories, Command, Flags},
     config::{Map, ServerAuth},
     connection::{Cluster, Monitor},
     filter::FilterPattern,
@@ -111,6 +114,14 @@ struct Options {
     filter: Vec<FilterPattern>,
 
     #[arg(
+        long,
+        action = ArgAction::Append,
+        value_name = "FLAG|@CATEGORY",
+        help = "Require flags (e.g. write) and/or categories (e.g. @hash)"
+    )]
+    flags: Vec<String>,
+
+    #[arg(
         short,
         long,
         default_value = "plain",
@@ -170,6 +181,44 @@ fn validate_positive_f64(s: &str) -> Result<f64> {
 }
 
 impl Options {
+    fn parse_flags<'a, I>(it: I) -> commands::Filter
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let mut f_acc = Flags::empty();
+        let mut c_acc = Categories::empty();
+        let mut f_any = false;
+        let mut c_any = false;
+
+        for raw in it {
+            for tok in raw.split(',') {
+                let s = tok.trim();
+                if s.is_empty() {
+                    continue;
+                }
+
+                if let Ok(c) = Categories::from_str(s) {
+                    c_acc |= c;
+                    c_any = true;
+                    continue;
+                } else if let Ok(f) = Flags::from_str(s) {
+                    f_acc |= f;
+                    f_any = true;
+                    continue;
+                }
+            }
+        }
+
+        commands::Filter {
+            flags: if f_any { Some(f_acc) } else { None },
+            categories: if c_any { Some(c_acc) } else { None },
+        }
+    }
+
+    fn build_flag_filter(&self) -> commands::Filter {
+        Self::parse_flags(self.flags.iter().map(String::as_str))
+    }
+
     fn get_tls_config(&self) -> Result<Option<Arc<TlsConfig>>> {
         if self.tls {
             Ok(Some(Arc::new(TlsConfig::new(
@@ -281,14 +330,88 @@ struct Backoff {
     max_delay: Duration,
 }
 
+#[derive(Debug, Clone)]
+struct CommandMetadata {
+    lookup: HashMap<u64, Vec<CommandMetaEntry>>,
+}
+
+#[derive(Debug, Clone)]
+struct CommandMetaEntry {
+    name: Vec<u8>,
+    flags: Flags,
+    categories: Categories,
+}
+
+impl CommandMetadata {
+    fn lookup(&self, command: &[u8]) -> Option<&CommandMetaEntry> {
+        let hash = ascii_case_insensitive_hash(command);
+        self.lookup.get(&hash).and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| ascii_eq_ignore_ascii_case(&entry.name, command))
+        })
+    }
+}
+
+impl From<HashSet<Command>> for CommandMetadata {
+    fn from(commands: HashSet<Command>) -> Self {
+        let mut lookup: HashMap<u64, Vec<CommandMetaEntry>> =
+            HashMap::with_capacity(commands.len());
+
+        for command in commands {
+            let entry = CommandMetaEntry {
+                name: command.name().as_bytes().to_vec(),
+                flags: command.flags(),
+                categories: command.categories(),
+            };
+            let hash = ascii_case_insensitive_hash(&entry.name);
+            lookup.entry(hash).or_default().push(entry);
+        }
+
+        Self { lookup }
+    }
+}
+
+fn ascii_eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
+    #[inline]
+    fn lower(b: u8) -> u8 {
+        if (b'A'..=b'Z').contains(&b) {
+            b + 32
+        } else {
+            b
+        }
+    }
+
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(lhs, rhs)| lower(*lhs) == lower(*rhs))
+}
+
+fn ascii_case_insensitive_hash(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x00000100000001B3;
+    let mut hash = OFFSET;
+    for &byte in bytes {
+        hash ^= byte.to_ascii_lowercase() as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+#[derive(Debug, Clone)]
+struct LineFilter {
+    empty: bool,
+    names: Filter,
+    flags: commands::Filter,
+}
+
 #[derive(Debug)]
 struct MonitorMessage {
     pub server: Arc<ServerAddr>,
     pub name: Arc<Option<String>>,
     #[allow(dead_code)]
     pub color: Option<Color>,
-    #[allow(dead_code)]
-    pub commands: Arc<Option<HashSet<Command>>>,
     line: Bytes,
 }
 
@@ -308,19 +431,80 @@ enum IoMessage {
     Shutdown,
 }
 
+impl LineFilter {
+    fn from_options(opt: &Options) -> Self {
+        let names: Filter = opt.filter.clone().into();
+        let flags = opt.build_flag_filter();
+        Self::new(names, flags)
+    }
+
+    fn new(names: Filter, flags: commands::Filter) -> Self {
+        let empty = names.is_empty() && flags.is_empty();
+        Self {
+            empty,
+            names,
+            flags,
+        }
+    }
+
+    #[inline]
+    fn cmd(line: &[u8]) -> Option<&[u8]> {
+        let start = memchr::memchr(b'"', line)?;
+        let rest = &line[start + 1..];
+        let end_rel = memchr::memchr(b'"', rest)?;
+        let end = start + 1 + end_rel;
+
+        Some(&line[start + 1..end])
+    }
+
+    fn needs_cmds(&self) -> bool {
+        !self.flags.is_empty()
+    }
+
+    #[inline]
+    fn matches(&self, commands: Option<&CommandMetadata>, line: &[u8]) -> bool {
+        if self.empty {
+            return true;
+        }
+
+        // We need to extract the command to do anything useful
+        let Some(cmd) = Self::cmd(line) else {
+            eprintln!(
+                "Unable to extract command from line: {}",
+                String::from_utf8_lossy(line)
+            );
+            return true;
+        };
+
+        if !self.names.matches(cmd) {
+            return false;
+        }
+
+        if self.flags.is_empty() {
+            return true;
+        }
+
+        let Some(meta) = commands else {
+            return true;
+        };
+
+        meta.lookup(cmd)
+            .map(|entry| self.flags.matches(entry.flags, entry.categories))
+            .unwrap_or(false)
+    }
+}
+
 impl MonitorMessage {
     const fn new(
         server: Arc<ServerAddr>,
         name: Arc<Option<String>>,
         color: Option<Color>,
-        commands: Arc<Option<HashSet<Command>>>,
         line: Bytes,
     ) -> Self {
         Self {
             server,
             name,
             color,
-            commands,
             line,
         }
     }
@@ -400,7 +584,6 @@ async fn run_from_reader<R>(
             Arc::clone(&server),
             Arc::clone(&name_arc),
             None,
-            Arc::new(None),
             line,
         );
 
@@ -417,19 +600,21 @@ async fn run_stdin_shim(tx: mpsc::Sender<MonitorMessage>) {
     run_from_reader("stdin", reader, tx).await;
 }
 
-async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
+async fn run_monitor(
+    mon: Monitor,
+    filter: LineFilter,
+    tx: mpsc::Sender<MonitorMessage>,
+) {
     let server = Arc::new(mon.address.clone());
     let name = Arc::new(mon.name.clone());
     let mut backoff = Backoff::new();
-    let mut commands = Arc::new(None);
+    let cmds = if filter.needs_cmds() {
+        load_cmds(&mon).await.map(CommandMetadata::from)
+    } else {
+        None
+    };
 
     loop {
-        if commands.as_ref().is_none() {
-            if let Some(loaded) = load_command_metadata(&mon).await {
-                commands = Arc::new(Some(loaded));
-            }
-        }
-
         match mon.clone().connect().await {
             Ok((_, mut reader)) => {
                 backoff.reset();
@@ -449,11 +634,14 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
                             line = line.slice(1..);
                         }
 
+                        if !filter.matches(cmds.as_ref(), line.as_ref()) {
+                            continue;
+                        }
+
                         let msg = MonitorMessage::new(
                             Arc::clone(&server),
                             Arc::clone(&name),
                             mon.color,
-                            Arc::clone(&commands),
                             line,
                         );
 
@@ -493,7 +681,7 @@ enum Control {
     Continue,
 }
 
-async fn load_command_metadata(mon: &Monitor) -> Option<HashSet<Command>> {
+async fn load_cmds(mon: &Monitor) -> Option<HashSet<Command>> {
     let addr = mon.address.to_string();
 
     let mut manager = match connection_manager_for_monitor(mon).await {
@@ -587,8 +775,6 @@ impl IoMessage {
                         ));
                     }
                 };
-
-                eprintln!("{:#?}", m.commands);
 
                 w.write_line(&m.server, m.name.as_ref().as_deref(), &parsed)?;
             }
@@ -711,10 +897,10 @@ async fn run_stdin(opt: Options) -> Result<()> {
         run_stdin_shim(tx).await;
     });
 
-    let filter: Filter = opt.filter.into();
+    let filter: LineFilter = LineFilter::from_options(&opt);
 
     while let Some(message) = rx.recv().await {
-        if !filter.matches(&message.line) {
+        if !filter.matches(None, &message.line) {
             continue;
         }
 
@@ -782,7 +968,7 @@ async fn run_wire(opt: Options) -> Result<()> {
     };
 
     let interval = Duration::from_secs_f64(opt.stats.unwrap_or(1.0));
-    let filter: Filter = opt.filter.into();
+    let filter = LineFilter::from_options(&opt);
     let mut tick = Instant::now();
 
     let (io_tx, io_jh) = start_io_thread(opt.output, &format, 65536);
@@ -792,18 +978,15 @@ async fn run_wire(opt: Options) -> Result<()> {
 
     for mon in preamble.iter().cloned() {
         let tx_task = tx.clone();
+        let filter_clone = filter.clone();
         tasks.push(tokio::spawn(async move {
-            run_monitor(mon, tx_task).await;
+            run_monitor(mon, filter_clone, tx_task).await;
         }));
     }
 
     drop(tx);
 
     while let Some(message) = rx.recv().await {
-        if !filter.matches(&message.line) {
-            continue;
-        }
-
         if let Some(ref mut stats) = stats {
             stats.try_incr(&message.line, message.line.len());
             if tick.elapsed() >= interval {

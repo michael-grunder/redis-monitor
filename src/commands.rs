@@ -1,6 +1,3 @@
-use anyhow::Result;
-use bitflags::bitflags;
-use redis::{self, RedisError, aio::ConnectionManager};
 use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
@@ -8,6 +5,10 @@ use std::{
     str::FromStr,
     sync::LazyLock,
 };
+
+use anyhow::Result;
+use bitflags::bitflags;
+use redis::{self, RedisError, aio::ConnectionManager};
 
 #[derive(Debug)]
 pub struct Command {
@@ -18,6 +19,12 @@ pub struct Command {
     last_key: i64,
     step_count: i64,
     categories: Categories,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Filter {
+    pub flags: Option<Flags>,
+    pub categories: Option<Categories>,
 }
 
 impl PartialEq for Command {
@@ -191,6 +198,29 @@ impl Categories {
     }
 }
 
+impl Filter {
+    pub fn is_empty(&self) -> bool {
+        self.flags.is_none() && self.categories.is_none()
+    }
+
+    #[inline]
+    pub fn matches(self, f: Flags, c: Categories) -> bool {
+        if let Some(req_flags) = self.flags {
+            if !f.contains(req_flags) {
+                return false;
+            }
+        }
+
+        if let Some(req_cats) = self.categories {
+            if !c.contains(req_cats) {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
 impl Command {
     fn parse_mask<'a, I, T>(it: I) -> T
     where
@@ -327,5 +357,17 @@ impl Command {
             }
         }
         Ok(set)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn flags(&self) -> Flags {
+        self.flags
+    }
+
+    pub fn categories(&self) -> Categories {
+        self.categories
     }
 }

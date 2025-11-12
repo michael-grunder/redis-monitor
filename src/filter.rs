@@ -100,6 +100,10 @@ impl From<Vec<FilterPattern>> for Filter {
 }
 
 impl Filter {
+    pub fn is_empty(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
+    }
+
     fn unique_patterns(patterns: &[Pattern]) -> Vec<Pattern> {
         patterns
             .iter()
@@ -181,11 +185,9 @@ impl Filter {
     }
 
     #[inline]
-    pub fn matches(&self, value: &[u8]) -> bool {
-        let value = Self::cmd(value).unwrap_or(value);
-
+    pub fn matches(&self, command: &[u8]) -> bool {
         // If a non-empty exclude matches, reject immediately.
-        if self.exclude.iter().any(|matcher| matcher.is_match(value)) {
+        if self.exclude.iter().any(|matcher| matcher.is_match(command)) {
             return false;
         }
 
@@ -195,6 +197,6 @@ impl Filter {
         }
 
         // Require at least one include match.
-        self.include.iter().any(|matcher| matcher.is_match(value))
+        self.include.iter().any(|matcher| matcher.is_match(command))
     }
 }
