@@ -127,48 +127,54 @@ impl BitMask for Flags {
 static CATEGORY_MAP: LazyLock<HashMap<&'static str, Categories>> =
     LazyLock::new(|| {
         HashMap::from([
-            ("admin", Categories::ADMIN),
-            ("allow_busy", Categories::ALLOW_BUSY),
-            ("blocking", Categories::BLOCKING),
-            ("asking", Categories::ASKING),
-            ("denyoom", Categories::DENYOOM),
-            ("fast", Categories::FAST),
-            ("loading", Categories::LOADING),
-            ("module", Categories::MODULE),
-            ("movablekeys", Categories::MOVABLEKEYS),
-            ("no_mandatory_keys", Categories::NO_MANDATORY_KEYS),
-            ("no_multi", Categories::NO_MULTI),
-            ("noscript", Categories::NOSCRIPT),
-            ("pubsub", Categories::PUBSUB),
-            ("readonly", Categories::READONLY),
-            ("skip_monitor", Categories::SKIP_MONITOR),
-            ("skip_slowlog", Categories::SKIP_SLOWLOG),
-            ("stale", Categories::STALE),
-            ("write", Categories::WRITE),
+            ("@admini", Categories::ADMIN),
+            ("@bitmap", Categories::BITMAP),
+            ("@blocking", Categories::BLOCKING),
+            ("@connection", Categories::CONNECTION),
+            ("@dangerous", Categories::DANGEROUS),
+            ("@fast", Categories::FAST),
+            ("@geo", Categories::GEO),
+            ("@hash", Categories::HASH),
+            ("@hyperloglog", Categories::HYPERLOGLOG),
+            ("@keyspace", Categories::KEYSPACE),
+            ("@list", Categories::LIST),
+            ("@pubsub", Categories::PUBSUB),
+            ("@read", Categories::READ),
+            ("@scripting", Categories::SCRIPTING),
+            ("@set", Categories::SET),
+            ("@slow", Categories::SLOW),
+            ("@sortedset", Categories::SORTEDSET),
+            ("@stream", Categories::STREAM),
+            ("@string", Categories::STRING),
+            ("@transaction", Categories::TRANSACTION),
+            ("@write", Categories::WRITE),
         ])
     });
 
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct Categories: u32 {
-        const ADMIN              = 1 << 0;
-        const ALLOW_BUSY         = 1 << 1;
-        const BLOCKING           = 1 << 2;
-        const ASKING             = 1 << 3;
-        const DENYOOM            = 1 << 4;
-        const FAST               = 1 << 5;
-        const LOADING            = 1 << 6;
-        const MODULE             = 1 << 7;
-        const MOVABLEKEYS        = 1 << 8;
-        const NO_MANDATORY_KEYS  = 1 << 9;
-        const NO_MULTI           = 1 << 10;
-        const NOSCRIPT           = 1 << 11;
-        const PUBSUB             = 1 << 12;
-        const READONLY           = 1 << 13;
-        const SKIP_MONITOR       = 1 << 14;
-        const SKIP_SLOWLOG       = 1 << 15;
-        const STALE              = 1 << 16;
-        const WRITE              = 1 << 17;
+        const ADMIN       = 1 << 0;
+        const BITMAP      = 1 << 1;
+        const BLOCKING    = 1 << 2;
+        const CONNECTION  = 1 << 3;
+        const DANGEROUS   = 1 << 4;
+        const FAST        = 1 << 5;
+        const GEO         = 1 << 6;
+        const HASH        = 1 << 7;
+        const HYPERLOGLOG = 1 << 8;
+        const KEYSPACE    = 1 << 9;
+        const LIST        = 1 << 10;
+        const PUBSUB      = 1 << 11;
+        const READ        = 1 << 12;
+        const SCRIPTING   = 1 << 13;
+        const SET         = 1 << 14;
+        const SLOW        = 1 << 15;
+        const SORTEDSET   = 1 << 16;
+        const STREAM      = 1 << 17;
+        const STRING      = 1 << 18;
+        const TRANSACTION = 1 << 19;
+        const WRITE       = 1 << 20;
     }
 }
 

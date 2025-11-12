@@ -197,6 +197,8 @@ impl Options {
                     continue;
                 }
 
+                println!("Parsing flag/category: '{s}'");
+
                 if let Ok(c) = Categories::from_str(s) {
                     c_acc |= c;
                     c_any = true;
@@ -205,6 +207,8 @@ impl Options {
                     f_acc |= f;
                     f_any = true;
                     continue;
+                } else {
+                    eprintln!("Warning: Unknown flag or category '{s}'");
                 }
             }
         }
