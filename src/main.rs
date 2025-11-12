@@ -180,6 +180,12 @@ fn validate_positive_f64(s: &str) -> Result<f64> {
     }
 }
 
+impl From<Vec<String>> for commands::Filter {
+    fn from(flags: Vec<String>) -> Self {
+        Options::parse_flags(flags.iter().map(String::as_str))
+    }
+}
+
 impl Options {
     fn parse_flags<'a, I>(it: I) -> commands::Filter
     where
@@ -207,10 +213,6 @@ impl Options {
             flags: (!flags.is_empty()).then_some(flags),
             categories: (!acl.is_empty()).then_some(acl),
         }
-    }
-
-    fn build_flag_filter(&self) -> commands::Filter {
-        Self::parse_flags(self.flags.iter().map(String::as_str))
     }
 
     fn get_tls_config(&self) -> Result<Option<Arc<TlsConfig>>> {
@@ -428,7 +430,7 @@ enum IoMessage {
 impl LineFilter {
     fn from_options(opt: &Options) -> Self {
         let names: Filter = opt.filter.clone().into();
-        let flags = opt.build_flag_filter();
+        let flags = opt.flags.clone().into();
         Self::new(names, flags)
     }
 
