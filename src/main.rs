@@ -185,10 +185,8 @@ impl Options {
     where
         I: IntoIterator<Item = &'a str>,
     {
-        let mut f_acc = Flags::empty();
-        let mut c_acc = Categories::empty();
-        let mut f_any = false;
-        let mut c_any = false;
+        let mut flags = Flags::empty();
+        let mut acl = Categories::empty();
 
         for raw in it {
             for tok in raw.split(',') {
@@ -197,25 +195,17 @@ impl Options {
                     continue;
                 }
 
-                println!("Parsing flag/category: '{s}'");
-
                 if let Ok(c) = Categories::from_str(s) {
-                    c_acc |= c;
-                    c_any = true;
-                    continue;
+                    acl |= c;
                 } else if let Ok(f) = Flags::from_str(s) {
-                    f_acc |= f;
-                    f_any = true;
-                    continue;
-                } else {
-                    eprintln!("Warning: Unknown flag or category '{s}'");
+                    flags |= f;
                 }
             }
         }
 
         commands::Filter {
-            flags: if f_any { Some(f_acc) } else { None },
-            categories: if c_any { Some(c_acc) } else { None },
+            flags: (!flags.is_empty()).then_some(flags),
+            categories: (!acl.is_empty()).then_some(acl),
         }
     }
 
