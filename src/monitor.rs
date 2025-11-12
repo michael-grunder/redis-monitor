@@ -83,11 +83,7 @@ impl std::fmt::Display for LineArgs<'_> {
                     )?;
                 }
                 for a in it {
-                    write!(
-                        f,
-                        " \"{}\"",
-                        String::from_utf8_lossy(a.as_ref())
-                    )?;
+                    write!(f, " \"{}\"", String::from_utf8_lossy(a.as_ref()))?;
                 }
                 Ok(())
             }
@@ -225,7 +221,8 @@ impl<'a> Line<'a> {
             if matches!(input.first(), Some(b'"')) {
                 let consumed = content_start.len().saturating_sub(input.len());
                 let (input_after_quote, _) = tag("\"")(input)?;
-                let (input_after_space, _) = opt(tag(" ")).parse(input_after_quote)?;
+                let (input_after_space, _) =
+                    opt(tag(" ")).parse(input_after_quote)?;
                 let cow = if let Some(buf) = owned {
                     Cow::Owned(buf)
                 } else {
@@ -520,9 +517,7 @@ where
     match args {
         LineArgs::Parsed(v) => {
             let strs: Vec<String> =
-                v.iter()
-                    .map(|a| json_escape_lossless(a.as_ref()))
-                    .collect();
+                v.iter().map(|a| json_escape_lossless(a.as_ref())).collect();
             strs.serialize(s)
         }
         LineArgs::Raw(raw) => {

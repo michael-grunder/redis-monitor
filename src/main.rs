@@ -2,6 +2,7 @@
 //#![allow(clippy::non_ascii_literal)]
 //#![allow(clippy::must_use_candidate)]
 use crate::{
+    commands::Command,
     config::{Map, ServerAuth},
     connection::{Cluster, Monitor},
     filter::FilterPattern,
@@ -9,7 +10,7 @@ use crate::{
     output::OutputHandler,
     stats::CommandStat,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use bytes::{Bytes, BytesMut};
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
@@ -19,6 +20,10 @@ use filter::Filter;
 use futures::stream::FuturesUnordered;
 use output::OutputKind;
 use rand::{Rng, rng};
+use redis::{
+    Client, ConnectionAddr, ConnectionInfo, RedisConnectionInfo,
+    aio::ConnectionManager as RedisConnectionManager,
+};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -33,6 +38,7 @@ use tokio::{
     time::{Duration, sleep},
 };
 
+mod commands;
 mod config;
 mod connection;
 mod filter;
@@ -277,7 +283,10 @@ struct Backoff {
 struct MonitorMessage {
     pub server: Arc<ServerAddr>,
     pub name: Arc<Option<String>>,
+    #[allow(dead_code)]
     pub color: Option<Color>,
+    #[allow(dead_code)]
+    pub commands: Arc<Option<HashSet<Command>>>,
     line: Bytes,
 }
 
@@ -302,12 +311,14 @@ impl MonitorMessage {
         server: Arc<ServerAddr>,
         name: Arc<Option<String>>,
         color: Option<Color>,
+        commands: Arc<Option<HashSet<Command>>>,
         line: Bytes,
     ) -> Self {
         Self {
             server,
             name,
             color,
+            commands,
             line,
         }
     }
@@ -387,6 +398,7 @@ async fn run_from_reader<R>(
             Arc::clone(&server),
             Arc::clone(&name_arc),
             None,
+            Arc::new(None),
             line,
         );
 
@@ -407,8 +419,15 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
     let server = Arc::new(mon.address.clone());
     let name = Arc::new(mon.name.clone());
     let mut backoff = Backoff::new();
+    let mut commands = Arc::new(None);
 
     loop {
+        if commands.as_ref().is_none() {
+            if let Some(loaded) = load_command_metadata(&mon).await {
+                commands = Arc::new(Some(loaded));
+            }
+        }
+
         match mon.clone().connect().await {
             Ok((_, mut reader)) => {
                 backoff.reset();
@@ -432,6 +451,7 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
                             Arc::clone(&server),
                             Arc::clone(&name),
                             mon.color,
+                            Arc::clone(&commands),
                             line,
                         );
 
@@ -469,6 +489,76 @@ async fn run_monitor(mon: Monitor, tx: mpsc::Sender<MonitorMessage>) {
 enum Control {
     Shutdown,
     Continue,
+}
+
+async fn load_command_metadata(mon: &Monitor) -> Option<HashSet<Command>> {
+    let addr = mon.address.to_string();
+
+    let mut manager = match connection_manager_for_monitor(mon).await {
+        Ok(manager) => manager,
+        Err(err) => {
+            eprintln!(
+                "{addr} failed to create COMMAND metadata connection: {err}"
+            );
+            return None;
+        }
+    };
+
+    if let Err(err) = mon.auth.auth(&mut manager).await {
+        eprintln!("{addr} AUTH failed while loading COMMAND metadata: {err}");
+        return None;
+    }
+
+    match Command::load(&mut manager).await {
+        Ok(commands) => Some(commands),
+        Err(err) => {
+            eprintln!("{addr} failed to load COMMAND metadata: {err}");
+            None
+        }
+    }
+}
+
+async fn connection_manager_for_monitor(
+    mon: &Monitor,
+) -> Result<RedisConnectionManager> {
+    let addr = mon.address.to_string();
+    let client = Client::open(connection_info_from_monitor(mon))
+        .with_context(|| format!("Failed to create Redis client for {addr}"))?;
+
+    client
+        .get_connection_manager()
+        .await
+        .with_context(|| format!("Failed to open async connection to {addr}"))
+}
+
+fn connection_info_from_monitor(mon: &Monitor) -> ConnectionInfo {
+    let addr = match &mon.address {
+        ServerAddr::Tcp(host, port) => {
+            if mon.tls.is_some() {
+                ConnectionAddr::TcpTls {
+                    host: host.clone(),
+                    port: *port,
+                    insecure: mon
+                        .tls
+                        .as_ref()
+                        .map(|cfg| cfg.insecure)
+                        .unwrap_or(false),
+                    tls_params: None,
+                }
+            } else {
+                ConnectionAddr::Tcp(host.clone(), *port)
+            }
+        }
+        ServerAddr::Unix(path) => ConnectionAddr::Unix(PathBuf::from(path)),
+    };
+
+    let redis = RedisConnectionInfo {
+        username: mon.auth.user.clone(),
+        password: mon.auth.pass.clone(),
+        ..RedisConnectionInfo::default()
+    };
+
+    ConnectionInfo { addr, redis }
 }
 
 impl IoMessage {

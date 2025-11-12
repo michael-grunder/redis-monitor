@@ -75,10 +75,10 @@ impl Serialize for PhpLine<'_> {
         match &l.args {
             LineArgs::Parsed(v) => {
                 // Vec<Vec<u8>> -> Vec<ByteBuf>
-                let vb: Vec<SerByteBuf> =
-                    v.iter()
-                        .map(|b| SerByteBuf::from(b.clone().into_owned()))
-                        .collect();
+                let vb: Vec<SerByteBuf> = v
+                    .iter()
+                    .map(|b| SerByteBuf::from(b.clone().into_owned()))
+                    .collect();
                 st.serialize_field("args", &vb)?;
             }
             LineArgs::Raw(raw) => {
