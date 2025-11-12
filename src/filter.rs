@@ -1,12 +1,13 @@
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
-use anyhow::Result;
-use memchr::memchr;
-use regex::bytes::Regex;
 use std::{
     collections::HashSet,
     hash::{Hash, Hasher},
     str::FromStr,
 };
+
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
+use anyhow::Result;
+use memchr::memchr;
+use regex::bytes::Regex;
 
 #[derive(Debug, Clone)]
 pub enum FilterPattern {

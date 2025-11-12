@@ -1,15 +1,3 @@
-use crate::{ServerAuth, config::Entry};
-use anyhow::{Context, Result, anyhow};
-use colored::Color;
-use redis::{Client, Connection, Value};
-use rustls::client::danger::ServerCertVerifier;
-use rustls::{
-    ClientConfig, RootCertStore,
-    pki_types::{CertificateDer, PrivateKeyDer, ServerName},
-};
-use serde::Serialize;
-
-use serde::{Deserialize, Deserializer, de};
 use std::borrow::Cow;
 use std::string::ToString;
 use std::{
@@ -23,11 +11,24 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
+
+use anyhow::{Context, Result, anyhow};
+use colored::Color;
+use redis::{Client, Connection, Value};
+use rustls::client::danger::ServerCertVerifier;
+use rustls::{
+    ClientConfig, RootCertStore,
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName},
+};
+use serde::Serialize;
+use serde::{Deserialize, Deserializer, de};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpStream, UnixStream},
 };
 use tokio_rustls::{TlsConnector, client::TlsStream as ClientTlsStream};
+
+use crate::{ServerAuth, config::Entry};
 
 #[derive(Debug)]
 pub enum Stream {

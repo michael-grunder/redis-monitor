@@ -1,11 +1,10 @@
-use anyhow::Result;
-use serde::{Serialize, Serializer};
 use std::{
     borrow::Cow,
     io::Write,
     net::{IpAddr, Ipv4Addr},
 };
 
+use anyhow::Result;
 use nom::{
     Err, IResult, Parser,
     branch::alt,
@@ -18,6 +17,7 @@ use nom::{
     multi::separated_list0,
     sequence::preceded,
 };
+use serde::{Serialize, Serializer};
 
 #[derive(Debug, Serialize)]
 pub enum LineArgs<'a> {
@@ -29,9 +29,10 @@ pub enum LineArgs<'a> {
 
 // helper so Vec<Cow<[u8]>> serializes as bytes not arrays of ints
 mod serde_vec_bytes {
+    use std::borrow::Cow;
+
     use serde::{Serializer, ser::SerializeSeq};
     use serde_bytes::Bytes;
-    use std::borrow::Cow;
 
     pub fn serialize<'a, S>(
         v: &Vec<Cow<'a, [u8]>>,

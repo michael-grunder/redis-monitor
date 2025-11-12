@@ -1,15 +1,15 @@
 #![warn(clippy::all, clippy::nursery, clippy::pedantic)]
 //#![allow(clippy::non_ascii_literal)]
 //#![allow(clippy::must_use_candidate)]
-use crate::{
-    commands::Command,
-    config::{Map, ServerAuth},
-    connection::{Cluster, Monitor},
-    filter::FilterPattern,
-    monitor::Line,
-    output::OutputHandler,
-    stats::CommandStat,
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
 };
+use std::{
+    collections::HashSet, convert::From, path::PathBuf, str::FromStr,
+    time::Instant,
+};
+
 use anyhow::{Context, Result, anyhow};
 use bytes::{Bytes, BytesMut};
 use clap::{CommandFactory, Parser};
@@ -24,18 +24,20 @@ use redis::{
     Client, ConnectionAddr, ConnectionInfo, RedisConnectionInfo,
     aio::ConnectionManager as RedisConnectionManager,
 };
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
-use std::{
-    collections::HashSet, convert::From, path::PathBuf, str::FromStr,
-    time::Instant,
-};
 use tokio::{
     io::{self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader},
     sync::mpsc,
     time::{Duration, sleep},
+};
+
+use crate::{
+    commands::Command,
+    config::{Map, ServerAuth},
+    connection::{Cluster, Monitor},
+    filter::FilterPattern,
+    monitor::Line,
+    output::OutputHandler,
+    stats::CommandStat,
 };
 
 mod commands;

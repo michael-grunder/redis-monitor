@@ -1,10 +1,3 @@
-use crate::connection::{ServerAddr, TlsConfig};
-use anyhow::{Result, anyhow, bail};
-use colored::Color;
-use config::{Config, File, FileFormat};
-use redis::cmd;
-
-use serde::{Deserialize, Deserializer, de};
 use std::{
     collections::HashMap,
     convert::AsRef,
@@ -15,6 +8,14 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
 };
+
+use anyhow::{Result, anyhow, bail};
+use colored::Color;
+use config::{Config, File, FileFormat};
+use redis::cmd;
+use serde::{Deserialize, Deserializer, de};
+
+use crate::connection::{ServerAddr, TlsConfig};
 
 const DEFAULT_CFGFILE_NAMES: &[&str] = &[".redis-monitor"];
 const DEFAULT_CFGFILE_EXT: &[&str] = &["", "toml"];

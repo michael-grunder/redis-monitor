@@ -1,17 +1,15 @@
 use std::{io::Write, str::FromStr};
 
 use anyhow::{Error, Result, anyhow};
+use serde::{Serialize, Serializer, ser::SerializeStruct};
+use serde_bytes::{ByteBuf as SerByteBuf, Bytes as SerBytes};
+use serde_php as php;
 
 use crate::{
     connection::{GetHost, ServerAddr},
     monitor::{ClientAddr, Line, LineArgs},
     stats::CommandStat,
 };
-
-use serde_php as php;
-
-use serde::{Serialize, Serializer, ser::SerializeStruct};
-use serde_bytes::{ByteBuf as SerByteBuf, Bytes as SerBytes};
 
 struct PhpLine<'a>(&'a Line<'a>);
 

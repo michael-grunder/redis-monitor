@@ -1,6 +1,7 @@
+use std::{collections::HashSet, hash::Hash};
+
 use anyhow::Result;
 use redis::{RedisError, aio::ConnectionManager};
-use std::{collections::HashSet, hash::Hash};
 
 #[derive(Debug, Hash, Eq, PartialEq)]
 pub struct Command {
