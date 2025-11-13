@@ -1,6 +1,7 @@
 use std::{
+    borrow::Borrow,
     collections::{HashMap, HashSet},
-    hash::Hash,
+    hash::{Hash, Hasher},
     ops::BitOr,
     str::FromStr,
     sync::LazyLock,
@@ -9,6 +10,19 @@ use std::{
 use anyhow::Result;
 use bitflags::bitflags;
 use redis::{self, RedisError, aio::ConnectionManager};
+
+#[derive(Debug, Clone)]
+pub struct Metadata {
+    pub name: String,
+    pub flags: Flags,
+    pub categories: Categories,
+}
+
+#[repr(transparent)]
+struct CiStr(str);
+
+#[derive(Debug, Clone)]
+pub struct Lookup(HashSet<Metadata>);
 
 #[derive(Debug)]
 pub struct Command {
@@ -25,6 +39,75 @@ pub struct Command {
 pub struct Filter {
     pub flags: Option<Flags>,
     pub categories: Option<Categories>,
+}
+
+impl CiStr {
+    #[inline]
+    fn from_str(s: &str) -> &Self {
+        unsafe { &*(s as *const str as *const CiStr) }
+    }
+
+    fn ascii_eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
+        #[inline]
+        fn lower(b: u8) -> u8 {
+            if (b'A'..=b'Z').contains(&b) {
+                b + 32
+            } else {
+                b
+            }
+        }
+
+        a.len() == b.len()
+            && a.iter()
+                .zip(b.iter())
+                .all(|(lhs, rhs)| lower(*lhs) == lower(*rhs))
+    }
+}
+
+impl PartialEq for CiStr {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        CiStr::ascii_eq_ignore_ascii_case(self.0.as_bytes(), other.0.as_bytes())
+    }
+}
+
+impl Eq for CiStr {}
+
+impl Hash for CiStr {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for b in self.0.as_bytes() {
+            let lb = if (b'A'..=b'Z').contains(b) {
+                b + 32
+            } else {
+                *b
+            };
+            lb.hash(state);
+        }
+    }
+}
+
+impl Borrow<CiStr> for Metadata {
+    #[inline]
+    fn borrow(&self) -> &CiStr {
+        CiStr::from_str(&self.name)
+    }
+}
+
+impl PartialEq for Metadata {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.name.eq_ignore_ascii_case(&other.name)
+    }
+}
+
+impl Eq for Metadata {}
+
+impl Hash for Metadata {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        CiStr::from_str(&self.name).hash(state);
+    }
 }
 
 impl PartialEq for Command {
@@ -127,7 +210,7 @@ impl BitMask for Flags {
 static CATEGORY_MAP: LazyLock<HashMap<&'static str, Categories>> =
     LazyLock::new(|| {
         HashMap::from([
-            ("@admini", Categories::ADMIN),
+            ("@admin", Categories::ADMIN),
             ("@bitmap", Categories::BITMAP),
             ("@blocking", Categories::BLOCKING),
             ("@connection", Categories::CONNECTION),
@@ -375,5 +458,54 @@ impl Command {
 
     pub fn categories(&self) -> Categories {
         self.categories
+    }
+}
+
+impl From<HashSet<Command>> for Lookup {
+    fn from(commands: HashSet<Command>) -> Self {
+        let mut set = HashSet::new();
+        for cmd in commands {
+            let metadata = Metadata {
+                name: cmd.name,
+                flags: cmd.flags,
+                categories: cmd.categories,
+            };
+            set.insert(metadata);
+        }
+        Self(set)
+    }
+}
+
+impl Lookup {
+    #[inline]
+    pub fn get(&self, cmd: &str) -> Option<&Metadata> {
+        self.0.get(CiStr::from_str(cmd))
+    }
+
+    #[inline]
+    pub fn get_bytes(&self, cmd: &[u8]) -> Option<&Metadata> {
+        std::str::from_utf8(cmd).ok().and_then(|s| self.get(s))
+    }
+
+    /// Apply `filt`; if the command isn't in the table, return `unknown`.
+    #[inline]
+    pub fn matches_or(&self, cmd: &str, filt: Filter, unknown: bool) -> bool {
+        match self.get(cmd) {
+            Some(m) => filt.matches(m.flags, m.categories),
+            None => unknown,
+        }
+    }
+
+    #[inline]
+    pub fn matches_bytes_or(
+        &self,
+        cmd: &[u8],
+        filt: Filter,
+        unknown: bool,
+    ) -> bool {
+        match self.get_bytes(cmd) {
+            Some(m) => filt.matches(m.flags, m.categories),
+            None => unknown,
+        }
     }
 }

@@ -6,10 +6,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::{
-    collections::{HashMap, HashSet},
-    convert::From,
-    path::PathBuf,
-    str::FromStr,
+    collections::HashSet, convert::From, path::PathBuf, str::FromStr,
     time::Instant,
 };
 
@@ -327,75 +324,6 @@ struct Backoff {
 }
 
 #[derive(Debug, Clone)]
-struct CommandMetadata {
-    lookup: HashMap<u64, Vec<CommandMetaEntry>>,
-}
-
-#[derive(Debug, Clone)]
-struct CommandMetaEntry {
-    name: Vec<u8>,
-    flags: Flags,
-    categories: Categories,
-}
-
-impl CommandMetadata {
-    fn lookup(&self, command: &[u8]) -> Option<&CommandMetaEntry> {
-        let hash = ascii_case_insensitive_hash(command);
-        self.lookup.get(&hash).and_then(|entries| {
-            entries
-                .iter()
-                .find(|entry| ascii_eq_ignore_ascii_case(&entry.name, command))
-        })
-    }
-}
-
-impl From<HashSet<Command>> for CommandMetadata {
-    fn from(commands: HashSet<Command>) -> Self {
-        let mut lookup: HashMap<u64, Vec<CommandMetaEntry>> =
-            HashMap::with_capacity(commands.len());
-
-        for command in commands {
-            let entry = CommandMetaEntry {
-                name: command.name().as_bytes().to_vec(),
-                flags: command.flags(),
-                categories: command.categories(),
-            };
-            let hash = ascii_case_insensitive_hash(&entry.name);
-            lookup.entry(hash).or_default().push(entry);
-        }
-
-        Self { lookup }
-    }
-}
-
-fn ascii_eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
-    #[inline]
-    fn lower(b: u8) -> u8 {
-        if (b'A'..=b'Z').contains(&b) {
-            b + 32
-        } else {
-            b
-        }
-    }
-
-    a.len() == b.len()
-        && a.iter()
-            .zip(b.iter())
-            .all(|(lhs, rhs)| lower(*lhs) == lower(*rhs))
-}
-
-fn ascii_case_insensitive_hash(bytes: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x00000100000001B3;
-    let mut hash = OFFSET;
-    for &byte in bytes {
-        hash ^= byte.to_ascii_lowercase() as u64;
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
-}
-
-#[derive(Debug, Clone)]
 struct LineFilter {
     empty: bool,
     names: Filter,
@@ -458,7 +386,11 @@ impl LineFilter {
     }
 
     #[inline]
-    fn matches(&self, commands: Option<&CommandMetadata>, line: &[u8]) -> bool {
+    fn matches(
+        &self,
+        commands: Option<&commands::Lookup>,
+        line: &[u8],
+    ) -> bool {
         if self.empty {
             return true;
         }
@@ -480,13 +412,7 @@ impl LineFilter {
             return true;
         }
 
-        let Some(meta) = commands else {
-            return true;
-        };
-
-        meta.lookup(cmd)
-            .map(|entry| self.flags.matches(entry.flags, entry.categories))
-            .unwrap_or(false)
+        commands.map_or(true, |lu| lu.matches_bytes_or(cmd, self.flags, true))
     }
 }
 
@@ -605,7 +531,7 @@ async fn run_monitor(
     let name = Arc::new(mon.name.clone());
     let mut backoff = Backoff::new();
     let cmds = if filter.needs_cmds() {
-        load_cmds(&mon).await.map(CommandMetadata::from)
+        load_cmds(&mon).await
     } else {
         None
     };
@@ -677,7 +603,7 @@ enum Control {
     Continue,
 }
 
-async fn load_cmds(mon: &Monitor) -> Option<HashSet<Command>> {
+async fn load_cmds(mon: &Monitor) -> Option<commands::Lookup> {
     let addr = mon.address.to_string();
 
     let mut manager = match connection_manager_for_monitor(mon).await {
@@ -696,7 +622,7 @@ async fn load_cmds(mon: &Monitor) -> Option<HashSet<Command>> {
     }
 
     match Command::load(&mut manager).await {
-        Ok(commands) => Some(commands),
+        Ok(commands) => Some(commands.into()),
         Err(err) => {
             eprintln!("{addr} failed to load COMMAND metadata: {err}");
             None
