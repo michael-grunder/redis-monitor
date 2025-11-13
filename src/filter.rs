@@ -100,7 +100,7 @@ impl From<Vec<FilterPattern>> for Filter {
 }
 
 impl Filter {
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.include.is_empty() && self.exclude.is_empty()
     }
 

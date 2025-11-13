@@ -362,7 +362,7 @@ impl LineFilter {
         Self::new(names, flags)
     }
 
-    fn new(names: Filter, flags: commands::Filter) -> Self {
+    const fn new(names: Filter, flags: commands::Filter) -> Self {
         let empty = names.is_empty() && flags.is_empty();
         Self {
             empty,
@@ -381,7 +381,7 @@ impl LineFilter {
         Some(&line[start + 1..end])
     }
 
-    fn needs_cmds(&self) -> bool {
+    const fn needs_cmds(&self) -> bool {
         !self.flags.is_empty()
     }
 
@@ -412,7 +412,7 @@ impl LineFilter {
             return true;
         }
 
-        commands.map_or(true, |lu| lu.matches_bytes_or(cmd, self.flags, true))
+        commands.is_none_or(|lu| lu.matches_bytes_or(cmd, self.flags, true))
     }
 }
 
@@ -650,11 +650,7 @@ fn connection_info_from_monitor(mon: &Monitor) -> ConnectionInfo {
                 ConnectionAddr::TcpTls {
                     host: host.clone(),
                     port: *port,
-                    insecure: mon
-                        .tls
-                        .as_ref()
-                        .map(|cfg| cfg.insecure)
-                        .unwrap_or(false),
+                    insecure: mon.tls.as_ref().is_some_and(|cfg| cfg.insecure),
                     tls_params: None,
                 }
             } else {

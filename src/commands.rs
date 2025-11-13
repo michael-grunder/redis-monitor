@@ -43,18 +43,15 @@ pub struct Filter {
 
 impl CiStr {
     #[inline]
-    fn from_str(s: &str) -> &Self {
-        unsafe { &*(s as *const str as *const CiStr) }
+    const fn from_str(s: &str) -> &Self {
+        // SAFETY: CiStr is #[repr(transparent)] over str
+        unsafe { &*(std::ptr::from_ref::<str>(s) as *const Self) }
     }
 
     fn ascii_eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
         #[inline]
-        fn lower(b: u8) -> u8 {
-            if (b'A'..=b'Z').contains(&b) {
-                b + 32
-            } else {
-                b
-            }
+        const fn lower(b: u8) -> u8 {
+            if b.is_ascii_uppercase() { b + 32 } else { b }
         }
 
         a.len() == b.len()
@@ -67,7 +64,7 @@ impl CiStr {
 impl PartialEq for CiStr {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        CiStr::ascii_eq_ignore_ascii_case(self.0.as_bytes(), other.0.as_bytes())
+        Self::ascii_eq_ignore_ascii_case(self.0.as_bytes(), other.0.as_bytes())
     }
 }
 
@@ -77,11 +74,7 @@ impl Hash for CiStr {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         for b in self.0.as_bytes() {
-            let lb = if (b'A'..=b'Z').contains(b) {
-                b + 32
-            } else {
-                *b
-            };
+            let lb = if b.is_ascii_uppercase() { b + 32 } else { *b };
             lb.hash(state);
         }
     }
@@ -197,13 +190,13 @@ impl Flags {
     }
 
     pub fn to_vec(self) -> Vec<String> {
-        self.names().map(|s| s.to_string()).collect()
+        self.names().map(std::string::ToString::to_string).collect()
     }
 }
 
 impl BitMask for Flags {
     fn empty() -> Self {
-        Flags::empty()
+        Self::empty()
     }
 }
 
@@ -271,7 +264,7 @@ impl FromStr for Categories {
 
 impl BitMask for Categories {
     fn empty() -> Self {
-        Categories::empty()
+        Self::empty()
     }
 }
 
@@ -283,27 +276,27 @@ impl Categories {
     }
 
     pub fn to_vec(self) -> Vec<String> {
-        self.names().map(|s| s.to_string()).collect()
+        self.names().map(std::string::ToString::to_string).collect()
     }
 }
 
 impl Filter {
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.flags.is_none() && self.categories.is_none()
     }
 
     #[inline]
-    pub fn matches(self, f: Flags, c: Categories) -> bool {
-        if let Some(req_flags) = self.flags {
-            if !f.contains(req_flags) {
-                return false;
-            }
+    pub const fn matches(self, f: Flags, c: Categories) -> bool {
+        if let Some(req_flags) = self.flags
+            && !f.contains(req_flags)
+        {
+            return false;
         }
 
-        if let Some(req_cats) = self.categories {
-            if !c.contains(req_cats) {
-                return false;
-            }
+        if let Some(req_cats) = self.categories
+            && !c.contains(req_cats)
+        {
+            return false;
         }
 
         true
@@ -321,37 +314,7 @@ impl Command {
             .fold(T::empty(), |a, x| a | x)
     }
 
-    //fn parse_flags<'a, I>(it: I) -> Flags
-    //where
-    //    I: IntoIterator<Item = &'a str>,
-    //{
-    //    let mut f = Flags::empty();
-    //    for s in it {
-    //        if let Ok(flag) = Flags::from_str(s) {
-    //            f |= flag;
-    //        }
-    //    }
-
-    //    f
-    //}
-
-    //fn parse_categories<'a, I>(it: I) -> Categories
-    //where
-    //    I: IntoIterator<Item = &'a str>,
-    //{
-    //    let mut c = Categories::empty();
-    //    for s in it {
-    //        if let Ok(cat) = Categories::from_str(s) {
-    //            c |= cat;
-    //        }
-    //    }
-
-    //    c
-    //}
-
-    fn iter_simplestring<'a>(
-        arr: &'a [redis::Value],
-    ) -> impl Iterator<Item = &'a str> {
+    fn iter_simplestring(arr: &[redis::Value]) -> impl Iterator<Item = &str> {
         arr.iter().filter_map(|v| match v {
             redis::Value::SimpleString(s) => Some(s.as_str()),
             redis::Value::BulkString(bytes) => std::str::from_utf8(bytes).ok(),
@@ -452,11 +415,11 @@ impl Command {
         &self.name
     }
 
-    pub fn flags(&self) -> Flags {
+    pub const fn flags(&self) -> Flags {
         self.flags
     }
 
-    pub fn categories(&self) -> Categories {
+    pub const fn categories(&self) -> Categories {
         self.categories
     }
 }
@@ -490,10 +453,8 @@ impl Lookup {
     /// Apply `filt`; if the command isn't in the table, return `unknown`.
     #[inline]
     pub fn matches_or(&self, cmd: &str, filt: Filter, unknown: bool) -> bool {
-        match self.get(cmd) {
-            Some(m) => filt.matches(m.flags, m.categories),
-            None => unknown,
-        }
+        self.get(cmd)
+            .map_or(unknown, |m| filt.matches(m.flags, m.categories))
     }
 
     #[inline]
@@ -503,9 +464,7 @@ impl Lookup {
         filt: Filter,
         unknown: bool,
     ) -> bool {
-        match self.get_bytes(cmd) {
-            Some(m) => filt.matches(m.flags, m.categories),
-            None => unknown,
-        }
+        self.get_bytes(cmd)
+            .map_or(unknown, |m| filt.matches(m.flags, m.categories))
     }
 }

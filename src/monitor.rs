@@ -34,10 +34,7 @@ mod serde_vec_bytes {
     use serde::{Serializer, ser::SerializeSeq};
     use serde_bytes::Bytes;
 
-    pub fn serialize<'a, S>(
-        v: &Vec<Cow<'a, [u8]>>,
-        s: S,
-    ) -> Result<S::Ok, S::Error>
+    pub fn serialize<S>(v: &Vec<Cow<[u8]>>, s: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -224,11 +221,11 @@ impl<'a> Line<'a> {
                 let (input_after_quote, _) = tag("\"")(input)?;
                 let (input_after_space, _) =
                     opt(tag(" ")).parse(input_after_quote)?;
-                let cow = if let Some(buf) = owned {
-                    Cow::Owned(buf)
-                } else {
-                    Cow::Borrowed(&content_start[..consumed])
-                };
+
+                let cow = owned.map_or_else(
+                    || Cow::Borrowed(&content_start[..consumed]),
+                    Cow::Owned,
+                );
                 return Ok((input_after_space, cow));
             }
 
