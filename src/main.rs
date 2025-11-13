@@ -184,6 +184,13 @@ const GIT_DIRTY: &str = env!("GIT_DIRTY");
 const DEFAULT_SINGLE_FORMAT: &str = "%t [%d %ca] %l";
 const DEFAULT_MULTI_FORMAT: &str = "%t [%S %d] %l";
 
+// Simple wrapper tat just eprintln!s with a [WARNING] prefix
+macro_rules !warn {
+    ($($arg:tt)*) => {
+        eprintln!("[WARNING] {}", format!($($arg)*));
+    };
+}
+
 fn validate_positive_f64(s: &str) -> Result<f64> {
     match s.parse::<f64>() {
         Ok(val) if val > 0.0 => Ok(val),
@@ -332,6 +339,26 @@ fn process_instances(
         .collect()
 }
 
+#[derive(Debug, Default)]
+struct Stalls {
+    total: AtomicU64,
+    current: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct IoStats {
+    total: AtomicU64,
+    filtered: AtomicU64,
+    stalls: Stalls,
+}
+
+#[derive(Debug)]
+struct LocalStats {
+    batch_size: u64,
+    total: u64,
+    filtered: u64,
+}
+
 #[derive(Debug)]
 struct Backoff {
     retries: u32,
@@ -359,7 +386,6 @@ type IoSender = flume::Sender<IoMessage>;
 #[derive(Debug, Clone)]
 struct IoHandle {
     tx: IoSender,
-    stalls: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -368,6 +394,73 @@ enum IoMessage {
     Stats(Vec<CommandStat>),
     Message(MonitorMessage),
     Shutdown,
+}
+
+static IO_STATS: IoStats = IoStats {
+    total: AtomicU64::new(0),
+    filtered: AtomicU64::new(0),
+    stalls: Stalls {
+        total: AtomicU64::new(0),
+        current: AtomicU64::new(0),
+    },
+};
+
+impl IoStats {
+    fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.total.load(Ordering::Relaxed),
+            self.filtered.load(Ordering::Relaxed),
+            self.stalls.total.load(Ordering::Relaxed),
+        )
+    }
+
+    fn stall(&self) {
+        self.stalls.current.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn fold(&self) -> (u64, u64) {
+        let current = self.stalls.current.swap(0, Ordering::Relaxed);
+        let total = self.stalls.total.fetch_add(current, Ordering::Relaxed);
+
+        (current, total)
+    }
+}
+
+impl LocalStats {
+    fn new(batch_size: u64) -> Self {
+        Self {
+            batch_size,
+            total: 0,
+            filtered: 0,
+        }
+    }
+
+    fn tick(&mut self) {
+        self.total += 1;
+        if self.total % self.batch_size == 0 {
+            self.fold();
+        }
+    }
+
+    fn filtered(&mut self) {
+        self.filtered += 1;
+    }
+
+    #[inline]
+    fn fold(&mut self) {
+        if self.total > 0 {
+            IO_STATS.total.fetch_add(self.total, Ordering::Relaxed);
+        }
+
+        if self.filtered > 0 {
+            IO_STATS
+                .filtered
+                .fetch_add(self.filtered, Ordering::Relaxed);
+        }
+
+        self.total = 0;
+        self.filtered = 0;
+    }
 }
 
 impl fmt::Debug for LineFilter {
@@ -555,6 +648,7 @@ async fn run_monitor(
     let server = Arc::new(mon.address.clone());
     let name = Arc::new(mon.name.clone());
     let mut backoff = Backoff::new();
+    let mut stats = LocalStats::new(1000);
     let cmds = if filter.needs_cmds() {
         load_cmds(&mon).await
     } else {
@@ -569,6 +663,8 @@ async fn run_monitor(
                 let mut buf = BytesMut::with_capacity(16 * 1024);
 
                 loop {
+                    stats.tick();
+
                     while let Some(nl) = memchr::memchr(b'\n', &buf) {
                         let mut line = buf.split_to(nl + 1).freeze();
                         if line.ends_with(b"\n") {
@@ -582,6 +678,7 @@ async fn run_monitor(
                         }
 
                         if !filter.matches(cmds.as_ref(), line.as_ref()) {
+                            stats.filtered();
                             continue;
                         }
 
@@ -668,6 +765,13 @@ async fn connection_manager_for_monitor(
         .with_context(|| format!("Failed to open async connection to {addr}"))
 }
 
+fn print_final_stats() {
+    let (total, filtered, stalls) = IO_STATS.snapshot();
+    eprintln!(
+        "Processed {total} lines (filtered: {filtered}), backpressure stalls: {stalls}"
+    );
+}
+
 fn connection_info_from_monitor(mon: &Monitor) -> ConnectionInfo {
     let addr = match &mon.address {
         ServerAddr::Tcp(host, port) => {
@@ -749,15 +853,12 @@ fn start_io_thread(
 
     let fmt = format.to_string();
     let need_args = output_kind.need_args();
-    let stalls = Arc::new(AtomicU64::new(0));
-    let stalls_io = Arc::clone(&stalls);
 
     let jh = std::thread::spawn(move || -> Result<()> {
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::with_capacity(1 << 20, stdout.lock());
         let mut writer = output_kind.get_writer(&mut out, &fmt);
         let mut last = Instant::now();
-        let mut total = 0u64;
         let mut shutdown = false;
 
         while !shutdown {
@@ -785,12 +886,9 @@ fn start_io_thread(
             }
 
             if last.elapsed() >= Duration::from_secs(1) {
-                let n = stalls_io.swap(0, Ordering::Relaxed);
-                if n > 0 {
-                    total = total.saturating_add(n);
-                    eprintln!(
-                        "[WARNING] Stalled {n} times due to backpressure (total {total})",
-                    );
+                let (curr, tot) = IO_STATS.fold();
+                if curr > 0 {
+                    warn!("backpressure stalls (curr: {curr}, total: {tot})");
                 }
 
                 last = Instant::now();
@@ -802,7 +900,7 @@ fn start_io_thread(
         Ok(())
     });
 
-    (IoHandle { tx, stalls }, jh)
+    (IoHandle { tx }, jh)
 }
 
 fn version_string() -> String {
@@ -852,7 +950,7 @@ async fn run_stdin(opt: Options) -> Result<()> {
             match io_tx.tx.try_send(msg) {
                 Ok(()) => break,
                 Err(flume::TrySendError::Full(m)) => {
-                    io_tx.stalls.fetch_add(1, Ordering::Relaxed);
+                    IO_STATS.stall();
                     tokio::task::yield_now().await;
                     msg = m;
                 }
@@ -947,11 +1045,11 @@ async fn run_wire(opt: Options) -> Result<()> {
             match io_tx.tx.try_send(msg) {
                 Ok(()) => break,
                 Err(flume::TrySendError::Full(m)) => {
-                    io_tx.stalls.fetch_add(1, Ordering::Relaxed);
+                    IO_STATS.stall();
                     tokio::task::yield_now().await;
                     msg = m;
                 }
-                Err(flume::TrySendError::Disconnected(_m)) => {
+                Err(flume::TrySendError::Disconnected(_)) => {
                     eprintln!("io thread disconnected");
                     break;
                 }
@@ -968,6 +1066,14 @@ async fn run_wire(opt: Options) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn run(opt: Options) -> Result<()> {
+    if opt.stdin {
+        run_stdin(opt).await
+    } else {
+        run_wire(opt).await
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -990,9 +1096,17 @@ async fn main() -> Result<()> {
         eprintln!("{filter:#?}");
     }
 
-    if opt.stdin {
-        run_stdin(opt).await
-    } else {
-        run_wire(opt).await
-    }
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    let res = tokio::select! {
+        r = run(opt) => r,
+        _ = ctrl_c => {
+            eprintln!("\nCtrl-C received, shutting down...");
+            Ok(())
+        }
+    };
+
+    print_final_stats();
+
+    res
 }
