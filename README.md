@@ -22,29 +22,52 @@ Commands:
   help         Print this message or the help of the given subcommand(s)
 
 Arguments:
-  [INSTANCES]...
+  [INSTANCES]...  
 
 Options:
-  -c, --cluster                    Treat each instance like its a cluster seed
-  -f, --format <FORMAT>            How to format each MONITOR line
-  -r, --replicas                   Also connect and MONITOR cluster replicas
+  -c, --cluster
+          Treat each instance like its a cluster seed
+  -f, --format <FORMAT>
+          How to format each MONITOR line
+  -r, --replicas
+          Also connect and MONITOR cluster replicas
       --config-file <CONFIG_FILE>
-      --no-color                   Disable colored output
-      --db <DB>                    Only show commands for a specific database
-  -u, --user <USER>                Redis user
-  -p, --pass <PASS>                Redis password
-      --filter <FILTER>            One or more patterns to either filter out or in
-  -o, --output <OUTPUT>            How to serialize the output. Values: plain, json, php,
-                                   csv, resp [default: plain]
-      --tls                        Connect using TLS
-      --insecure                   Disable TLS certificate verification
-      --tls-ca <TLS_CA>            Path to CA cert for TLS
-      --tls-cert <TLS_CERT>        Path to client cert for TLS
-      --tls-key <TLS_KEY>          Path to client private key for TLS
-  -v, --version                    Display the version and exit
+          
+      --no-color
+          Disable colored output
+      --db <DB>
+          Only show commands for a specific database
+  -u, --user <USER>
+          Redis user
+  -p, --pass <PASS>
+          Redis password
+      --filter <FILTER>
+          One or more literal or regex patterns to filter command names
+      --flags <FLAG|@CATEGORY>
+          Require flags (e.g. write) and/or categories (e.g. @hash)
+  -o, --output <OUTPUT>
+          How to serialize the output. Values: plain, json, php, csv, resp [default:
+          plain]
+      --tls
+          Connect using TLS
+      --insecure
+          Disable TLS certificate verification
+      --tls-ca <TLS_CA>
+          Path to CA cert for TLS
+      --tls-cert <TLS_CERT>
+          Path to client cert for TLS
+      --tls-key <TLS_KEY>
+          Path to client private key for TLS
+  -v, --version
+          Display the version and exit
       --stats <STATS>
-      --stdin                      Read from stdin instead of connecting to servers
-  -h, --help                       Print help
+          
+      --stdin
+          Read from stdin instead of connecting to servers
+      --debug
+          Output debug information such as detailed filter info
+  -h, --help
+          Print help
 
 Format specifiers:
   %S   Short form of server and client address
@@ -68,6 +91,15 @@ Format specifiers:
 Examples:
   # Monitor a cluster expecting one node to be 127.0.0.1:6379
   redis-monitor -c 6379
+
   # Monitor two standalone instances
   redis-monitor host1:6379 host2:6379
+
+  # Run while filtering specific commands
+  redis-monitor --filter get --filter set
+  redis-monitor --filter '!get' --filter '!set'
+  redis-monitor --filter '/^geo/'
+
+  # Filtering by command flags and categories
+  redis-monitor --flags write,@hash
 ```

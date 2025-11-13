@@ -74,8 +74,17 @@ mod stats;
 Examples:
   # Monitor a cluster expecting one node to be 127.0.0.1:6379
   redis-monitor -c 6379
+
   # Monitor two standalone instances
-  redis-monitor host1:6379 host2:6379"#
+  redis-monitor host1:6379 host2:6379
+
+  # Run while filtering specific commands
+  redis-monitor --filter get --filter set
+  redis-monitor --filter '!get' --filter '!set'
+  redis-monitor --filter '/^geo/'
+
+  # Filtering by command flags and categories
+  redis-monitor --flags write,@hash"#
 )]
 #[allow(clippy::struct_excessive_bools)]
 struct Options {
@@ -107,7 +116,7 @@ struct Options {
     pass: Option<String>,
 
     #[clap(long, action = clap::ArgAction::Append,
-           help = "One or more patterns to either filter out or in")]
+           help = "One or more literal or regex patterns to filter command names")]
     filter: Vec<FilterPattern>,
 
     #[arg(
