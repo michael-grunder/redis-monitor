@@ -407,11 +407,14 @@ static IO_STATS: IoStats = IoStats {
 
 impl IoStats {
     fn snapshot(&self) -> (u64, u64, u64) {
-        (
-            self.total.load(Ordering::Relaxed),
-            self.filtered.load(Ordering::Relaxed),
-            self.stalls.total.load(Ordering::Relaxed),
-        )
+        let total = self.total.load(Ordering::Relaxed);
+        let filtered = self.filtered.load(Ordering::Relaxed);
+
+        let stalls_current = self.stalls.current.load(Ordering::Relaxed);
+        let stalls_total =
+            self.stalls.total.load(Ordering::Relaxed) + stalls_current;
+
+        (total, filtered, stalls_total)
     }
 
     fn stall(&self) {
@@ -420,7 +423,8 @@ impl IoStats {
 
     fn fold(&self) -> (u64, u64) {
         let current = self.stalls.current.swap(0, Ordering::Relaxed);
-        let total = self.stalls.total.fetch_add(current, Ordering::Relaxed);
+        let prev = self.stalls.total.fetch_add(current, Ordering::Relaxed);
+        let total = prev + current;
 
         (current, total)
     }
