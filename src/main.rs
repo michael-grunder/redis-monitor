@@ -663,9 +663,9 @@ async fn run_monitor(
                 let mut buf = BytesMut::with_capacity(16 * 1024);
 
                 loop {
-                    stats.tick();
-
                     while let Some(nl) = memchr::memchr(b'\n', &buf) {
+                        stats.tick();
+
                         let mut line = buf.split_to(nl + 1).freeze();
                         if line.ends_with(b"\n") {
                             line.truncate(line.len() - 1);
