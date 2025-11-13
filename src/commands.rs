@@ -1,6 +1,7 @@
 use std::{
     borrow::Borrow,
     collections::{HashMap, HashSet},
+    fmt,
     hash::{Hash, Hasher},
     ops::BitOr,
     str::FromStr,
@@ -25,6 +26,7 @@ struct CiStr(str);
 pub struct Lookup(HashSet<Metadata>);
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct Command {
     name: String,
     arity: i64,
@@ -35,7 +37,7 @@ pub struct Command {
     categories: Categories,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Default)]
 pub struct Filter {
     pub flags: Option<Flags>,
     pub categories: Option<Categories>,
@@ -182,6 +184,20 @@ impl FromStr for Flags {
     }
 }
 
+impl fmt::Display for Flags {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        for name in self.names() {
+            if !first {
+                write!(f, ",")?;
+            }
+            write!(f, "{name}")?;
+            first = false;
+        }
+        Ok(())
+    }
+}
+
 impl Flags {
     pub fn names(self) -> impl Iterator<Item = &'static str> {
         FLAG_MAP.iter().filter_map(move |(k, v)| {
@@ -189,9 +205,9 @@ impl Flags {
         })
     }
 
-    pub fn to_vec(self) -> Vec<String> {
-        self.names().map(std::string::ToString::to_string).collect()
-    }
+    //    pub fn to_vec(self) -> Vec<String> {
+    //        self.names().map(std::string::ToString::to_string).collect()
+    //    }
 }
 
 impl BitMask for Flags {
@@ -268,6 +284,20 @@ impl BitMask for Categories {
     }
 }
 
+impl fmt::Display for Categories {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        for name in self.names() {
+            if !first {
+                write!(f, ",")?;
+            }
+            write!(f, "{name}")?;
+            first = false;
+        }
+        Ok(())
+    }
+}
+
 impl Categories {
     pub fn names(self) -> impl Iterator<Item = &'static str> {
         CATEGORY_MAP.iter().filter_map(move |(k, v)| {
@@ -275,9 +305,9 @@ impl Categories {
         })
     }
 
-    pub fn to_vec(self) -> Vec<String> {
-        self.names().map(std::string::ToString::to_string).collect()
-    }
+    //pub fn to_vec(self) -> Vec<String> {
+    //    self.names().map(std::string::ToString::to_string).collect()
+    //}
 }
 
 impl Filter {
@@ -411,17 +441,17 @@ impl Command {
         Ok(set)
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub const fn flags(&self) -> Flags {
-        self.flags
-    }
-
-    pub const fn categories(&self) -> Categories {
-        self.categories
-    }
+    //    pub fn name(&self) -> &str {
+    //        &self.name
+    //    }
+    //
+    //    pub const fn flags(&self) -> Flags {
+    //        self.flags
+    //    }
+    //
+    //    pub const fn categories(&self) -> Categories {
+    //        self.categories
+    //    }
 }
 
 impl From<HashSet<Command>> for Lookup {
@@ -450,12 +480,12 @@ impl Lookup {
         std::str::from_utf8(cmd).ok().and_then(|s| self.get(s))
     }
 
-    /// Apply `filt`; if the command isn't in the table, return `unknown`.
-    #[inline]
-    pub fn matches_or(&self, cmd: &str, filt: Filter, unknown: bool) -> bool {
-        self.get(cmd)
-            .map_or(unknown, |m| filt.matches(m.flags, m.categories))
-    }
+    // Apply `filt`; if the command isn't in the table, return `unknown`.
+    //#[inline]
+    //pub fn matches_or(&self, cmd: &str, filt: Filter, unknown: bool) -> bool {
+    //    self.get(cmd)
+    //        .map_or(unknown, |m| filt.matches(m.flags, m.categories))
+    //}
 
     #[inline]
     pub fn matches_bytes_or(
@@ -466,5 +496,21 @@ impl Lookup {
     ) -> bool {
         self.get_bytes(cmd)
             .map_or(unknown, |m| filt.matches(m.flags, m.categories))
+    }
+}
+
+impl fmt::Debug for Filter {
+    fn fmt(&self, fm: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let flags = self
+            .flags
+            .map_or_else(|| "<none>".into(), |f| f.to_string());
+        let cats = self
+            .categories
+            .map_or_else(|| "<none>".into(), |c| c.to_string());
+
+        fm.debug_struct("CmdFilter")
+            .field("flags", &flags)
+            .field("categories", &cats)
+            .finish()
     }
 }

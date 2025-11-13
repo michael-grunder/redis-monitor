@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::{
-    collections::HashSet, convert::From, path::PathBuf, str::FromStr,
+    collections::HashSet, convert::From, fmt, path::PathBuf, str::FromStr,
     time::Instant,
 };
 
@@ -149,6 +149,12 @@ struct Options {
 
     #[arg(long, help = "Read from stdin instead of connecting to servers")]
     stdin: bool,
+
+    #[arg(
+        long,
+        help = "Output debug information such as detailed filter info"
+    )]
+    debug: bool,
 
     pub instances: Vec<String>,
 }
@@ -323,7 +329,7 @@ struct Backoff {
     max_delay: Duration,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct LineFilter {
     empty: bool,
     names: Filter,
@@ -353,6 +359,16 @@ enum IoMessage {
     Stats(Vec<CommandStat>),
     Message(MonitorMessage),
     Shutdown,
+}
+
+impl fmt::Debug for LineFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LineFilter")
+            .field("empty", &self.empty)
+            .field("names", &self.names)
+            .field("flags", &self.flags)
+            .finish()
+    }
 }
 
 impl LineFilter {
@@ -958,6 +974,11 @@ async fn main() -> Result<()> {
         let mut cmd = Options::command();
         generate(shell, &mut cmd, "redis-monitor", &mut std::io::stdout());
         return Ok(());
+    }
+
+    if opt.debug {
+        let filter = LineFilter::from_options(&opt);
+        eprintln!("{filter:#?}");
     }
 
     if opt.stdin {

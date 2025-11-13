@@ -1,12 +1,12 @@
 use std::{
     collections::HashSet,
+    fmt,
     hash::{Hash, Hasher},
     str::FromStr,
 };
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use anyhow::Result;
-use memchr::memchr;
 use regex::bytes::Regex;
 
 #[derive(Debug, Clone)]
@@ -87,7 +87,7 @@ impl Matcher {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Filter {
     include: Vec<Matcher>,
     exclude: Vec<Matcher>,
@@ -175,16 +175,6 @@ impl Filter {
     }
 
     #[inline]
-    fn cmd(line: &[u8]) -> Option<&[u8]> {
-        let start = memchr(b'"', line)?;
-        let rest = &line[start + 1..];
-        let end_rel = memchr(b'"', rest)?;
-        let end = start + 1 + end_rel;
-
-        Some(&line[start + 1..end])
-    }
-
-    #[inline]
     pub fn matches(&self, command: &[u8]) -> bool {
         // If a non-empty exclude matches, reject immediately.
         if self.exclude.iter().any(|matcher| matcher.is_match(command)) {
@@ -198,5 +188,37 @@ impl Filter {
 
         // Require at least one include match.
         self.include.iter().any(|matcher| matcher.is_match(command))
+    }
+}
+
+fn matcher_counts(v: &[Matcher]) -> (usize, usize) {
+    let mut lits = 0;
+    let mut regs = 0;
+
+    for m in v {
+        match m {
+            Matcher::Literals(_) => lits += 1,
+            Matcher::Regexes(rs) => regs += rs.len(),
+        }
+    }
+
+    (lits, regs)
+}
+
+impl fmt::Debug for Filter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (inc_lit, inc_re) = matcher_counts(&self.include);
+        let (exc_lit, exc_re) = matcher_counts(&self.exclude);
+
+        f.debug_struct("NameFilter")
+            .field(
+                "includes",
+                &format_args!("{inc_lit} literal set(s), {inc_re} regex(es)",),
+            )
+            .field(
+                "excludes",
+                &format_args!("{exc_lit} literal set(s), {exc_re} regex(es)",),
+            )
+            .finish()
     }
 }
