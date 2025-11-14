@@ -17,6 +17,10 @@ pub struct Metadata {
     pub name: String,
     pub flags: Flags,
     pub categories: Categories,
+    pub first_key: i64,
+    pub last_key: i64,
+    pub step_count: i64,
+    pub key_specs: Vec<KeySpec>,
 }
 
 #[repr(transparent)]
@@ -455,10 +459,10 @@ impl Command {
     ) -> Option<&'a redis::Value> {
         let mut idx = 0;
         while idx + 1 < arr.len() {
-            if let Some(k) = Self::value_to_str(&arr[idx]) {
-                if k.eq_ignore_ascii_case(key) {
-                    return arr.get(idx + 1);
-                }
+            if let Some(k) = Self::value_to_str(&arr[idx])
+                && k.eq_ignore_ascii_case(key)
+            {
+                return arr.get(idx + 1);
             }
             idx += 2;
         }
@@ -475,23 +479,21 @@ impl Command {
     }
 
     fn parse_key_spec(value: &redis::Value) -> Option<KeySpec> {
-        let arr = match value {
-            redis::Value::Array(arr) => arr,
-            _ => return None,
+        let redis::Value::Array(arr) = value else {
+            return None;
         };
 
         let flags = Self::lookup_flat_array(arr, "flags")
             .and_then(Self::value_as_array)
-            .map(|values| Self::parse_mask(Self::iter_simplestring(values)))
-            .unwrap_or_else(KeySpecFlags::empty);
+            .map_or_else(KeySpecFlags::empty, |values| {
+                Self::parse_mask(Self::iter_simplestring(values))
+            });
 
         let begin_search = Self::lookup_flat_array(arr, "begin_search")
-            .map(Self::parse_begin_search)
-            .unwrap_or(BeginSearch::Unknown);
+            .map_or(BeginSearch::Unknown, Self::parse_begin_search);
 
         let find_keys = Self::lookup_flat_array(arr, "find_keys")
-            .map(Self::parse_find_keys)
-            .unwrap_or(FindKeys::Unknown);
+            .map_or(FindKeys::Unknown, Self::parse_find_keys);
 
         Some(KeySpec {
             flags,
@@ -501,9 +503,8 @@ impl Command {
     }
 
     fn parse_begin_search(value: &redis::Value) -> BeginSearch {
-        let arr = match value {
-            redis::Value::Array(arr) => arr,
-            _ => return BeginSearch::Unknown,
+        let redis::Value::Array(arr) = value else {
+            return BeginSearch::Unknown;
         };
 
         let ty = Self::lookup_flat_array(arr, "type")
@@ -514,42 +515,39 @@ impl Command {
             Some("index") => {
                 let spec = Self::lookup_flat_array(arr, "spec")
                     .and_then(Self::value_as_array);
-                if let Some(spec) = spec {
-                    if let Some(index) = Self::lookup_flat_array(spec, "index")
+                if let Some(spec) = spec
+                    && let Some(index) = Self::lookup_flat_array(spec, "index")
                         .and_then(Self::value_to_i64)
-                    {
-                        return BeginSearch::Index { index };
-                    }
+                {
+                    return BeginSearch::Index { index };
                 }
                 BeginSearch::Unknown
             }
             Some("keyword") => {
                 let spec = Self::lookup_flat_array(arr, "spec")
                     .and_then(Self::value_as_array);
-                if let Some(spec) = spec {
-                    if let (Some(keyword), Some(start_from)) = (
+                if let Some(spec) = spec
+                    && let (Some(keyword), Some(start_from)) = (
                         Self::lookup_flat_array(spec, "keyword")
                             .and_then(Self::value_to_str),
                         Self::lookup_flat_array(spec, "startfrom")
                             .and_then(Self::value_to_i64),
-                    ) {
-                        return BeginSearch::Keyword {
-                            keyword: keyword.to_string(),
-                            start_from,
-                        };
-                    }
+                    )
+                {
+                    return BeginSearch::Keyword {
+                        keyword: keyword.to_string(),
+                        start_from,
+                    };
                 }
                 BeginSearch::Unknown
             }
-            Some("unknown") => BeginSearch::Unknown,
             _ => BeginSearch::Unknown,
         }
     }
 
     fn parse_find_keys(value: &redis::Value) -> FindKeys {
-        let arr = match value {
-            redis::Value::Array(arr) => arr,
-            _ => return FindKeys::Unknown,
+        let redis::Value::Array(arr) = value else {
+            return FindKeys::Unknown;
         };
 
         let ty = Self::lookup_flat_array(arr, "type")
@@ -560,46 +558,45 @@ impl Command {
             Some("range") => {
                 let spec = Self::lookup_flat_array(arr, "spec")
                     .and_then(Self::value_as_array);
-                if let Some(spec) = spec {
-                    if let (Some(last_key), Some(key_step), Some(limit)) = (
+                if let Some(spec) = spec
+                    && let (Some(last_key), Some(key_step), Some(limit)) = (
                         Self::lookup_flat_array(spec, "lastkey")
                             .and_then(Self::value_to_i64),
                         Self::lookup_flat_array(spec, "keystep")
                             .and_then(Self::value_to_i64),
                         Self::lookup_flat_array(spec, "limit")
                             .and_then(Self::value_to_i64),
-                    ) {
-                        return FindKeys::Range {
-                            last_key,
-                            key_step,
-                            limit,
-                        };
-                    }
+                    )
+                {
+                    return FindKeys::Range {
+                        last_key,
+                        key_step,
+                        limit,
+                    };
                 }
                 FindKeys::Unknown
             }
             Some("keynum") => {
                 let spec = Self::lookup_flat_array(arr, "spec")
                     .and_then(Self::value_as_array);
-                if let Some(spec) = spec {
-                    if let (Some(keynum_idx), Some(first_key), Some(key_step)) = (
+                if let Some(spec) = spec
+                    && let (Some(keynum_idx), Some(first_key), Some(key_step)) = (
                         Self::lookup_flat_array(spec, "keynumidx")
                             .and_then(Self::value_to_i64),
                         Self::lookup_flat_array(spec, "firstkey")
                             .and_then(Self::value_to_i64),
                         Self::lookup_flat_array(spec, "keystep")
                             .and_then(Self::value_to_i64),
-                    ) {
-                        return FindKeys::Keynum {
-                            keynum_idx,
-                            first_key,
-                            key_step,
-                        };
-                    }
+                    )
+                {
+                    return FindKeys::Keynum {
+                        keynum_idx,
+                        first_key,
+                        key_step,
+                    };
                 }
                 FindKeys::Unknown
             }
-            Some("unknown") => FindKeys::Unknown,
             _ => FindKeys::Unknown,
         }
     }
@@ -693,6 +690,10 @@ impl From<HashSet<Command>> for Lookup {
                 name: cmd.name,
                 flags: cmd.flags,
                 categories: cmd.categories,
+                first_key: cmd.first_key,
+                last_key: cmd.last_key,
+                step_count: cmd.step_count,
+                key_specs: cmd.key_specs,
             };
             set.insert(metadata);
         }

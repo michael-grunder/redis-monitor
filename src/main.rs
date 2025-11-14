@@ -431,7 +431,7 @@ impl IoStats {
 }
 
 impl LocalStats {
-    fn new(batch_size: u64) -> Self {
+    const fn new(batch_size: u64) -> Self {
         Self {
             batch_size,
             total: 0,
@@ -441,12 +441,12 @@ impl LocalStats {
 
     fn tick(&mut self) {
         self.total += 1;
-        if self.total % self.batch_size == 0 {
+        if self.total.is_multiple_of(self.batch_size) {
             self.fold();
         }
     }
 
-    fn filtered(&mut self) {
+    const fn filtered(&mut self) {
         self.filtered += 1;
     }
 
