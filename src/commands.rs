@@ -204,10 +204,6 @@ impl Flags {
             if self.contains(*v) { Some(*k) } else { None }
         })
     }
-
-    //    pub fn to_vec(self) -> Vec<String> {
-    //        self.names().map(std::string::ToString::to_string).collect()
-    //    }
 }
 
 impl BitMask for Flags {
@@ -304,10 +300,6 @@ impl Categories {
             if self.contains(*v) { Some(*k) } else { None }
         })
     }
-
-    //pub fn to_vec(self) -> Vec<String> {
-    //    self.names().map(std::string::ToString::to_string).collect()
-    //}
 }
 
 impl Filter {
@@ -440,18 +432,6 @@ impl Command {
         }
         Ok(set)
     }
-
-    //    pub fn name(&self) -> &str {
-    //        &self.name
-    //    }
-    //
-    //    pub const fn flags(&self) -> Flags {
-    //        self.flags
-    //    }
-    //
-    //    pub const fn categories(&self) -> Categories {
-    //        self.categories
-    //    }
 }
 
 impl From<HashSet<Command>> for Lookup {
@@ -479,13 +459,6 @@ impl Lookup {
     pub fn get_bytes(&self, cmd: &[u8]) -> Option<&Metadata> {
         std::str::from_utf8(cmd).ok().and_then(|s| self.get(s))
     }
-
-    // Apply `filt`; if the command isn't in the table, return `unknown`.
-    //#[inline]
-    //pub fn matches_or(&self, cmd: &str, filt: Filter, unknown: bool) -> bool {
-    //    self.get(cmd)
-    //        .map_or(unknown, |m| filt.matches(m.flags, m.categories))
-    //}
 
     #[inline]
     pub fn matches_bytes_or(

@@ -11,7 +11,7 @@ bytes = "1.10.1"
 clap = { version = "4.5.51", features = ["derive", "wrap_help"] }
 clap_complete = "4.5.60"
 colored = "3.0.0"
-config = { version = "0.15.18", features = ["toml"] }
+config = { version = "0.15.19", features = ["toml"] }
 csv = "1.4.0"
 flume = "0.11.1"
 futures = "0.3.31"

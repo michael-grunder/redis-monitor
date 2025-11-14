@@ -253,8 +253,8 @@ impl Options {
 }
 
 // Treat each instance as a potential cluster seed. This means that if more than
-// one seeds of the same cluster are passed we may map the same keyspace more than
-// once. This is fine, but we should be aware of it.
+// one seeds of the same cluster are passed we may map the same keyspace more
+// than once. This is fine, but we should be aware of it.
 fn process_cluster_instances(
     opt: &Options,
     tls: Option<&Arc<TlsConfig>>,
