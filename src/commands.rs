@@ -35,6 +35,37 @@ pub struct Command {
     last_key: i64,
     step_count: i64,
     categories: Categories,
+    key_specs: Vec<KeySpec>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct KeySpec {
+    flags: KeySpecFlags,
+    begin_search: BeginSearch,
+    find_keys: FindKeys,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BeginSearch {
+    Index { index: i64 },
+    Keyword { keyword: String, start_from: i64 },
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindKeys {
+    Range {
+        last_key: i64,
+        key_step: i64,
+        limit: i64,
+    },
+    Keynum {
+        keynum_idx: i64,
+        first_key: i64,
+        key_step: i64,
+    },
+    Unknown,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -150,6 +181,23 @@ static FLAG_MAP: LazyLock<HashMap<&'static str, Flags>> = LazyLock::new(|| {
     ])
 });
 
+static KEY_SPEC_FLAG_MAP: LazyLock<HashMap<&'static str, KeySpecFlags>> =
+    LazyLock::new(|| {
+        HashMap::from([
+            ("rw", KeySpecFlags::RW),
+            ("ro", KeySpecFlags::RO),
+            ("ow", KeySpecFlags::OW),
+            ("rm", KeySpecFlags::RM),
+            ("access", KeySpecFlags::ACCESS),
+            ("insert", KeySpecFlags::INSERT),
+            ("update", KeySpecFlags::UPDATE),
+            ("delete", KeySpecFlags::DELETE),
+            ("incomplete", KeySpecFlags::INCOMPLETE),
+            ("not_key", KeySpecFlags::NOT_KEY),
+            ("variable_flags", KeySpecFlags::VARIABLE_FLAGS),
+        ])
+    });
+
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct Flags: u32 {
@@ -176,11 +224,36 @@ bitflags! {
     }
 }
 
+bitflags! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub struct KeySpecFlags: u16 {
+        const RW             = 1 << 0;
+        const RO             = 1 << 1;
+        const OW             = 1 << 2;
+        const RM             = 1 << 3;
+        const ACCESS         = 1 << 4;
+        const INSERT         = 1 << 5;
+        const UPDATE         = 1 << 6;
+        const DELETE         = 1 << 7;
+        const INCOMPLETE     = 1 << 8;
+        const NOT_KEY        = 1 << 9;
+        const VARIABLE_FLAGS = 1 << 10;
+    }
+}
+
 impl FromStr for Flags {
     type Err = ();
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let k = s.trim().to_ascii_lowercase();
         FLAG_MAP.get(k.as_str()).copied().ok_or(())
+    }
+}
+
+impl FromStr for KeySpecFlags {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let k = s.trim().to_ascii_lowercase();
+        KEY_SPEC_FLAG_MAP.get(k.as_str()).copied().ok_or(())
     }
 }
 
@@ -207,6 +280,12 @@ impl Flags {
 }
 
 impl BitMask for Flags {
+    fn empty() -> Self {
+        Self::empty()
+    }
+}
+
+impl BitMask for KeySpecFlags {
     fn empty() -> Self {
         Self::empty()
     }
@@ -344,25 +423,193 @@ impl Command {
         })
     }
 
-    fn from_redis_values(values: &[redis::Value]) -> Option<Self> {
-        let (
-            name,
-            arity,
-            flags,
-            first_key,
-            last_key,
-            step,
-            acl,
-            _history,
-            _tips,
-        ) = match values {
-            [name, arity, flags, first_key, last_key, step, acl, ..] => {
-                (name, arity, flags, first_key, last_key, step, acl, (), ())
+    fn value_to_str(value: &redis::Value) -> Option<&str> {
+        match value {
+            redis::Value::SimpleString(s) => Some(s.as_str()),
+            redis::Value::BulkString(bytes) => std::str::from_utf8(bytes).ok(),
+            _ => None,
+        }
+    }
+
+    fn value_to_i64(value: &redis::Value) -> Option<i64> {
+        match value {
+            redis::Value::Int(x) => Some(*x),
+            redis::Value::SimpleString(s) => s.parse().ok(),
+            redis::Value::BulkString(bytes) => {
+                std::str::from_utf8(bytes).ok()?.parse().ok()
             }
+            _ => None,
+        }
+    }
+
+    fn value_as_array(value: &redis::Value) -> Option<&[redis::Value]> {
+        match value {
+            redis::Value::Array(values) => Some(values),
+            _ => None,
+        }
+    }
+
+    fn lookup_flat_array<'a>(
+        arr: &'a [redis::Value],
+        key: &str,
+    ) -> Option<&'a redis::Value> {
+        let mut idx = 0;
+        while idx + 1 < arr.len() {
+            if let Some(k) = Self::value_to_str(&arr[idx]) {
+                if k.eq_ignore_ascii_case(key) {
+                    return arr.get(idx + 1);
+                }
+            }
+            idx += 2;
+        }
+        None
+    }
+
+    fn parse_key_specs(value: Option<&redis::Value>) -> Vec<KeySpec> {
+        match value {
+            Some(redis::Value::Array(specs)) => {
+                specs.iter().filter_map(Self::parse_key_spec).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn parse_key_spec(value: &redis::Value) -> Option<KeySpec> {
+        let arr = match value {
+            redis::Value::Array(arr) => arr,
             _ => return None,
         };
 
-        let name = match name {
+        let flags = Self::lookup_flat_array(arr, "flags")
+            .and_then(Self::value_as_array)
+            .map(|values| Self::parse_mask(Self::iter_simplestring(values)))
+            .unwrap_or_else(KeySpecFlags::empty);
+
+        let begin_search = Self::lookup_flat_array(arr, "begin_search")
+            .map(Self::parse_begin_search)
+            .unwrap_or(BeginSearch::Unknown);
+
+        let find_keys = Self::lookup_flat_array(arr, "find_keys")
+            .map(Self::parse_find_keys)
+            .unwrap_or(FindKeys::Unknown);
+
+        Some(KeySpec {
+            flags,
+            begin_search,
+            find_keys,
+        })
+    }
+
+    fn parse_begin_search(value: &redis::Value) -> BeginSearch {
+        let arr = match value {
+            redis::Value::Array(arr) => arr,
+            _ => return BeginSearch::Unknown,
+        };
+
+        let ty = Self::lookup_flat_array(arr, "type")
+            .and_then(Self::value_to_str)
+            .map(str::to_ascii_lowercase);
+
+        match ty.as_deref() {
+            Some("index") => {
+                let spec = Self::lookup_flat_array(arr, "spec")
+                    .and_then(Self::value_as_array);
+                if let Some(spec) = spec {
+                    if let Some(index) = Self::lookup_flat_array(spec, "index")
+                        .and_then(Self::value_to_i64)
+                    {
+                        return BeginSearch::Index { index };
+                    }
+                }
+                BeginSearch::Unknown
+            }
+            Some("keyword") => {
+                let spec = Self::lookup_flat_array(arr, "spec")
+                    .and_then(Self::value_as_array);
+                if let Some(spec) = spec {
+                    if let (Some(keyword), Some(start_from)) = (
+                        Self::lookup_flat_array(spec, "keyword")
+                            .and_then(Self::value_to_str),
+                        Self::lookup_flat_array(spec, "startfrom")
+                            .and_then(Self::value_to_i64),
+                    ) {
+                        return BeginSearch::Keyword {
+                            keyword: keyword.to_string(),
+                            start_from,
+                        };
+                    }
+                }
+                BeginSearch::Unknown
+            }
+            Some("unknown") => BeginSearch::Unknown,
+            _ => BeginSearch::Unknown,
+        }
+    }
+
+    fn parse_find_keys(value: &redis::Value) -> FindKeys {
+        let arr = match value {
+            redis::Value::Array(arr) => arr,
+            _ => return FindKeys::Unknown,
+        };
+
+        let ty = Self::lookup_flat_array(arr, "type")
+            .and_then(Self::value_to_str)
+            .map(str::to_ascii_lowercase);
+
+        match ty.as_deref() {
+            Some("range") => {
+                let spec = Self::lookup_flat_array(arr, "spec")
+                    .and_then(Self::value_as_array);
+                if let Some(spec) = spec {
+                    if let (Some(last_key), Some(key_step), Some(limit)) = (
+                        Self::lookup_flat_array(spec, "lastkey")
+                            .and_then(Self::value_to_i64),
+                        Self::lookup_flat_array(spec, "keystep")
+                            .and_then(Self::value_to_i64),
+                        Self::lookup_flat_array(spec, "limit")
+                            .and_then(Self::value_to_i64),
+                    ) {
+                        return FindKeys::Range {
+                            last_key,
+                            key_step,
+                            limit,
+                        };
+                    }
+                }
+                FindKeys::Unknown
+            }
+            Some("keynum") => {
+                let spec = Self::lookup_flat_array(arr, "spec")
+                    .and_then(Self::value_as_array);
+                if let Some(spec) = spec {
+                    if let (Some(keynum_idx), Some(first_key), Some(key_step)) = (
+                        Self::lookup_flat_array(spec, "keynumidx")
+                            .and_then(Self::value_to_i64),
+                        Self::lookup_flat_array(spec, "firstkey")
+                            .and_then(Self::value_to_i64),
+                        Self::lookup_flat_array(spec, "keystep")
+                            .and_then(Self::value_to_i64),
+                    ) {
+                        return FindKeys::Keynum {
+                            keynum_idx,
+                            first_key,
+                            key_step,
+                        };
+                    }
+                }
+                FindKeys::Unknown
+            }
+            Some("unknown") => FindKeys::Unknown,
+            _ => FindKeys::Unknown,
+        }
+    }
+
+    fn from_redis_values(values: &[redis::Value]) -> Option<Self> {
+        if values.len() < 7 {
+            return None;
+        }
+
+        let name = match &values[0] {
             redis::Value::BulkString(bytes) => {
                 String::from_utf8(bytes.clone()).ok()?
             }
@@ -370,36 +617,38 @@ impl Command {
             _ => return None,
         };
 
-        let arity = match arity {
+        let arity = match &values[1] {
             redis::Value::Int(x) => *x,
             _ => return None,
         };
-        let first_key = match first_key {
+        let first_key = match &values[3] {
             redis::Value::Int(x) => *x,
             _ => return None,
         };
-        let last_key = match last_key {
+        let last_key = match &values[4] {
             redis::Value::Int(x) => *x,
             _ => return None,
         };
-        let step_count = match step {
+        let step_count = match &values[5] {
             redis::Value::Int(x) => *x,
             _ => return None,
         };
 
-        let flags = match flags {
+        let flags = match &values[2] {
             redis::Value::Array(a) => {
                 Self::parse_mask(Self::iter_simplestring(a))
             }
             _ => Flags::empty(),
         };
 
-        let categories = match acl {
+        let categories = match &values[6] {
             redis::Value::Array(a) => {
                 Self::parse_mask(Self::iter_simplestring(a))
             }
             _ => Categories::empty(),
         };
+
+        let key_specs = Self::parse_key_specs(values.get(8));
 
         Some(Self {
             name,
@@ -409,6 +658,7 @@ impl Command {
             last_key,
             step_count,
             categories,
+            key_specs,
         })
     }
 
@@ -430,6 +680,7 @@ impl Command {
                 set.insert(cmd);
             }
         }
+
         Ok(set)
     }
 }
