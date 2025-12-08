@@ -21,8 +21,8 @@ use futures::stream::FuturesUnordered;
 use output::OutputKind;
 use rand::{Rng, rng};
 use redis::{
-    Client, ConnectionAddr, ConnectionInfo, RedisConnectionInfo,
-    aio::ConnectionManager as RedisConnectionManager,
+    Client, ConnectionAddr, ConnectionInfo, IntoConnectionInfo,
+    RedisConnectionInfo, aio::ConnectionManager as RedisConnectionManager,
 };
 use tokio::{
     io::{self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader},
@@ -793,13 +793,17 @@ fn connection_info_from_monitor(mon: &Monitor) -> ConnectionInfo {
         ServerAddr::Unix(path) => ConnectionAddr::Unix(PathBuf::from(path)),
     };
 
-    let redis = RedisConnectionInfo {
-        username: mon.auth.user.clone(),
-        password: mon.auth.pass.clone(),
-        ..RedisConnectionInfo::default()
-    };
+    let mut redis = RedisConnectionInfo::default();
+    if let Some(user) = &mon.auth.user {
+        redis = redis.set_username(user);
+    }
+    if let Some(pass) = &mon.auth.pass {
+        redis = redis.set_password(pass);
+    }
 
-    ConnectionInfo { addr, redis }
+    addr.into_connection_info()
+        .expect("ConnectionAddr::into_connection_info cannot fail")
+        .set_redis_settings(redis)
 }
 
 impl IoMessage {

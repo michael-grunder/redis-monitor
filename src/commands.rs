@@ -665,7 +665,7 @@ impl Command {
             .await
             .map_err(|err| {
                 RedisError::from((
-                    redis::ErrorKind::IoError,
+                    redis::ErrorKind::Io,
                     "Failed to execute COMMAND command",
                     err.to_string(),
                 ))
