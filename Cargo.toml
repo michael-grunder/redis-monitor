@@ -14,7 +14,7 @@ clap_complete = "4.5.61"
 colored = "3.0.0"
 config = { version = "0.15.19", features = ["toml"] }
 csv = "1.4.0"
-flume = "0.11.1"
+flume = "0.12.0"
 futures = "0.3.31"
 lexical-core = "1.0.6"
 memchr = "2.7.6"
