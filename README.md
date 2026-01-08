@@ -10,6 +10,17 @@ cd redis-monitor
 cargo build --release
 
 ```
+
+### Building a static binary
+
+To produce a static binary with no runtime dependencies, compile with the `release-static` profile against the MUSL target:
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --profile release-static --target x86_64-unknown-linux-musl
+```
+
+The resulting binary in `target/x86_64-unknown-linux-musl/release-static/redis-monitor` is fully self-contained.
 ## Usage
 
 ```

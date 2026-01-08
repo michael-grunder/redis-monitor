@@ -47,3 +47,6 @@ lto = "thin"
 codegen-units = 1
 incremental = false
 panic = "abort"
+
+[profile.release-static]
+inherits = "release"
