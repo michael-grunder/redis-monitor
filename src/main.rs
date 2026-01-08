@@ -503,6 +503,7 @@ impl LineFilter {
         Some(&line[start + 1..end])
     }
 
+    #[inline]
     const fn needs_cmds(&self) -> bool {
         !self.flags.is_empty()
     }
@@ -772,7 +773,8 @@ async fn connection_manager_for_monitor(
 fn print_final_stats() {
     let (total, filtered, stalls) = IO_STATS.snapshot();
     eprintln!(
-        "Processed {total} lines (filtered: {filtered}), backpressure stalls: {stalls}"
+        "Processed {total} lines (filtered: {filtered}), backpressure stalls: \
+        {stalls}"
     );
 }
 
