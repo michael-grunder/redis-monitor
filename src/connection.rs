@@ -68,7 +68,7 @@ pub trait GetHost {
 pub struct ClusterNode {
     pub id: String,
     pub addr: ServerAddr,
-    pub replicas: HashSet<ClusterNode>,
+    pub replicas: HashSet<Self>,
 }
 
 #[derive(Debug)]

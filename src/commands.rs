@@ -13,6 +13,7 @@ use bitflags::bitflags;
 use redis::{self, RedisError, aio::ConnectionManager};
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Metadata {
     pub name: String,
     pub flags: Flags,
