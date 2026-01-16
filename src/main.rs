@@ -19,7 +19,7 @@ use connection::{ServerAddr, TlsConfig};
 use filter::Filter;
 use futures::stream::FuturesUnordered;
 use output::OutputKind;
-use rand::{Rng, rng};
+use rand::{RngExt, rngs::ThreadRng};
 use redis::{
     Client, ConnectionAddr, ConnectionInfo, IntoConnectionInfo,
     RedisConnectionInfo, aio::ConnectionManager as RedisConnectionManager,
@@ -567,11 +567,10 @@ impl Backoff {
     }
 
     fn delay(&mut self) -> Duration {
-        let mut rng = rng();
+        let mut rng = ThreadRng::default();
 
         self.retries += 1;
-        let shift_amount =
-            (self.retries.min(6) + rng.random_range(0..3)) as u32;
+        let shift_amount = self.retries.min(6) + rng.random_range(0..3);
         let base_delay = Self::MIN_DELAY.as_millis();
         let delay_ms =
             (base_delay << shift_amount).try_into().unwrap_or(u64::MAX);
