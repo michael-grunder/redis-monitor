@@ -119,7 +119,7 @@ impl ServerAuth {
         match command.query_async(con).await {
             Ok(redis::Value::Okay) => Ok(()),
             other => {
-                bail!("AUTH failed: unexpected response from Redis: {other:?}",)
+                bail!("AUTH failed: unexpected response from Redis: {other:?}")
             }
         }
     }

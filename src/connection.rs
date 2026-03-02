@@ -481,7 +481,7 @@ impl Monitor {
         match line.chars().next() {
             Some('+') => Ok(line[1..].to_string()),
             Some('-') => Err(anyhow!("Server Error: {}", &line[1..])),
-            Some(c) => Err(anyhow!("Got reply-type byte '{c}': {line}",)),
+            Some(c) => Err(anyhow!("Got reply-type byte '{c}': {line}")),
             _ => Err(anyhow!("Received empty line from server")),
         }
     }

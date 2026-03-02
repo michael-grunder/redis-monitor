@@ -30,7 +30,7 @@ redis = { version = "1.2.0", default-features = false, features = [
   # "tls-rustls-webpki-roots",
 ] }
 regex = "1.12.3"
-rustls = "0.23.36"
+rustls = "0.23.37"
 rustls-native-certs = "0.8.3"
 rustls-pemfile = "2.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
