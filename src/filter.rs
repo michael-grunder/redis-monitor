@@ -213,11 +213,11 @@ impl fmt::Debug for Filter {
         f.debug_struct("NameFilter")
             .field(
                 "includes",
-                &format_args!("{inc_lit} literal set(s), {inc_re} regex(es)",),
+                &format_args!("{inc_lit} literal set(s), {inc_re} regex(es)"),
             )
             .field(
                 "excludes",
-                &format_args!("{exc_lit} literal set(s), {exc_re} regex(es)",),
+                &format_args!("{exc_lit} literal set(s), {exc_re} regex(es)"),
             )
             .finish()
     }
