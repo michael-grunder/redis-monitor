@@ -20,7 +20,7 @@ lexical-core = "1.0.6"
 memchr = "2.8.0"
 nom = "8.0.0"
 rand = "0.10.0"
-redis = { version = "1.0.4", default-features = false, features = [
+redis = { version = "1.0.5", default-features = false, features = [
   "aio",
   "connection-manager",
   "tokio-comp",
