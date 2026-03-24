@@ -72,6 +72,9 @@ mod stats;
     Multiple Instances: "%t [%S %d] %l";
 
 Examples:
+  # Monitor localhost:6379 by default
+  redis-monitor
+
   # Monitor a cluster expecting one node to be 127.0.0.1:6379
   redis-monitor -c 6379
 
@@ -984,14 +987,15 @@ async fn run_stdin(opt: Options) -> Result<()> {
 
 async fn run_wire(opt: Options) -> Result<()> {
     let cfg = Map::load(opt.config_file.as_deref())?;
-
-    if opt.instances.is_empty() {
-        eprintln!("Must pass at least one unstance (host/port or name)");
-        std::process::exit(1);
-    }
+    let instances: Vec<String> = if opt.instances.is_empty() {
+        vec!["localhost:6379".to_string()]
+    } else {
+        opt.instances.clone()
+    };
 
     let tls = opt.get_tls_config()?;
     let auth = opt.get_server_auth();
+    let opt = Options { instances, ..opt };
 
     let seeds = if opt.cluster {
         process_cluster_instances(&opt, tls.as_ref(), &auth)

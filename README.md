@@ -100,6 +100,9 @@ Format specifiers:
     Multiple Instances: "%t [%S %d] %l";
 
 Examples:
+  # Monitor localhost:6379 by default
+  redis-monitor
+
   # Monitor a cluster expecting one node to be 127.0.0.1:6379
   redis-monitor -c 6379
 
