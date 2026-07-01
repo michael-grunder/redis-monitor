@@ -5,22 +5,22 @@ edition = "2024"
 
 [dependencies]
 aho-corasick = "1.1.4"
-anyhow = "1.0.102"
+anyhow = "1.0.103"
 arcstr = "1.2.0"
-bitflags = "2.11.1"
-bytes = "1.11.1"
+bitflags = "2.13.0"
+bytes = "1.12.0"
 clap = { version = "4.6.1", features = ["derive", "wrap_help"] }
-clap_complete = "4.6.5"
+clap_complete = "4.6.6"
 colored = "3.1.1"
-config = { version = "0.15.23", features = ["toml"] }
+config = { version = "0.15.25", features = ["toml"] }
 csv = "1.4.0"
 flume = "0.12.0"
 futures = "0.3.32"
 lexical-core = "1.0.6"
-memchr = "2.8.0"
+memchr = "2.8.2"
 nom = "8.0.0"
 rand = "0.10.1"
-redis = { version = "1.2.1", default-features = false, features = [
+redis = { version = "1.3.0", default-features = false, features = [
   "aio",
   "connection-manager",
   "tokio-comp",
@@ -29,13 +29,13 @@ redis = { version = "1.2.1", default-features = false, features = [
   # optional: bake in Mozilla roots instead of using OS store:
   # "tls-rustls-webpki-roots",
 ] }
-regex = "1.12.3"
-rustls = "0.23.40"
-rustls-native-certs = "0.8.3"
+regex = "1.12.4"
+rustls = "0.23.41"
+rustls-native-certs = "0.8.4"
 rustls-pemfile = "2.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_bytes = "0.11.19"
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 serde_php = "0.5.0"
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-rustls = "0.26.4"
