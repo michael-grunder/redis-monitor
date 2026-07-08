@@ -99,6 +99,9 @@ Format specifiers:
     Single instance:    "%t [%d %ca] %l";
     Multiple Instances: "%t [%S %d] %l";
 
+Structured outputs (`json`, `php`, `csv`, and `resp`) parse MONITOR arguments as
+strings and preserve quoted argument content, including JSON-like values.
+
 Examples:
   # Monitor localhost:6379 by default
   redis-monitor

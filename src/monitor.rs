@@ -12,9 +12,8 @@ use nom::{
         complete::{is_not, tag, take_until, take_while, take_while_m_n},
         take_while1,
     },
-    combinator::{map_res, opt, peek, value, verify},
+    combinator::{map_res, peek, value, verify},
     error::{ErrorKind, FromExternalError, ParseError},
-    multi::separated_list0,
     sequence::preceded,
 };
 use serde::{Serialize, Serializer};
@@ -148,6 +147,11 @@ fn parse_f64(i: &[u8]) -> IResult<&[u8], f64> {
 }
 
 impl<'a> Line<'a> {
+    fn is_structural_quote(input: &[u8]) -> bool {
+        matches!(input.first(), Some(b'"'))
+            && matches!(input.get(1), None | Some(b' ' | b'\t' | b'\r' | b'\n'))
+    }
+
     fn parse_escaped_hex<E>(input: &'a [u8]) -> IResult<&'a [u8], u8, E>
     where
         E: ParseError<&'a [u8]>
@@ -216,17 +220,27 @@ impl<'a> Line<'a> {
                 )));
             }
 
-            if matches!(input.first(), Some(b'"')) {
+            if Self::is_structural_quote(input) {
                 let consumed = content_start.len().saturating_sub(input.len());
                 let (input_after_quote, _) = tag("\"")(input)?;
-                let (input_after_space, _) =
-                    opt(tag(" ")).parse(input_after_quote)?;
 
                 let cow = owned.map_or_else(
                     || Cow::Borrowed(&content_start[..consumed]),
                     Cow::Owned,
                 );
-                return Ok((input_after_space, cow));
+                return Ok((input_after_quote, cow));
+            }
+
+            if matches!(input.first(), Some(b'"')) {
+                let consumed = content_start.len().saturating_sub(input.len());
+                let buf = owned.get_or_insert_with(|| {
+                    let mut v = Vec::with_capacity(consumed + 8);
+                    v.extend_from_slice(&content_start[..consumed]);
+                    v
+                });
+                buf.push(b'"');
+                input = &input[1..];
+                continue;
             }
 
             if matches!(input.first(), Some(b'\\')) {
@@ -248,6 +262,41 @@ impl<'a> Line<'a> {
             }
             input = next;
         }
+    }
+
+    fn parse_escaped_args<E>(
+        mut input: &'a [u8],
+    ) -> IResult<&'a [u8], Vec<Cow<'a, [u8]>>, E>
+    where
+        E: ParseError<&'a [u8]>
+            + FromExternalError<&'a [u8], std::num::ParseIntError>,
+    {
+        let mut args = Vec::new();
+
+        while !input.is_empty() {
+            let (next, arg) = Self::parse_escaped_string(input)?;
+            args.push(arg);
+
+            let space_len = next
+                .iter()
+                .take_while(|b| matches!(b, b' ' | b'\t'))
+                .count();
+            let space = &next[..space_len];
+            let after_space = &next[space_len..];
+            if after_space.is_empty() {
+                input = after_space;
+                break;
+            }
+            if space.is_empty() {
+                return Err(nom::Err::Error(E::from_error_kind(
+                    after_space,
+                    ErrorKind::Space,
+                )));
+            }
+            input = after_space;
+        }
+
+        Ok((input, args))
     }
 
     // aaa.bbb.ccc.ddd:port
@@ -374,12 +423,16 @@ impl<'a> Line<'a> {
         let (input, (db, addr)) = Self::parse_source(input)?;
         let (input, _) = space0b(input)?;
         let (input, cmd) = Self::parse_quoted_ascii_cmd(input)?;
-        let (input, _) = opt(tag(" ")).parse(input)?;
+        let (input, _) = space0b(input)?;
 
         let args = if parse_args {
-            let (_, args) =
-                separated_list0(space0b, Self::parse_escaped_string)
-                    .parse(input)?;
+            let (input, args) = Self::parse_escaped_args(input)?;
+            if !input.is_empty() {
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    input,
+                    ErrorKind::Tag,
+                )));
+            }
             LineArgs::Parsed(args)
         } else {
             LineArgs::Raw(input)
@@ -484,27 +537,6 @@ impl Serialize for ClientAddr<'_> {
     }
 }
 
-fn json_escape_lossless(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        match b {
-            b'"' => out.push_str("\\\""),
-            b'\\' => out.push_str("\\\\"),
-            b'\n' => out.push_str("\\n"),
-            b'\r' => out.push_str("\\r"),
-            b'\t' => out.push_str("\\t"),
-            0x08 => out.push_str("\\b"),
-            0x0C => out.push_str("\\f"),
-            0x20..=0x21 | 0x23..=0x5B | 0x5D..=0x7E => out.push(b as char),
-            _ => {
-                use core::fmt::Write as _;
-                let _ = write!(out, "\\u00{b:02X}");
-            }
-        }
-    }
-    out
-}
-
 fn serialize_args_as_strings<S>(
     args: &LineArgs<'_>,
     s: S,
@@ -514,13 +546,60 @@ where
 {
     match args {
         LineArgs::Parsed(v) => {
-            let strs: Vec<String> =
-                v.iter().map(|a| json_escape_lossless(a.as_ref())).collect();
+            let strs: Vec<Cow<'_, str>> = v
+                .iter()
+                .map(|a| bytes_to_structured_string(a.as_ref()))
+                .collect();
             strs.serialize(s)
         }
         LineArgs::Raw(raw) => {
-            let s1 = json_escape_lossless(raw);
+            let s1 = bytes_to_structured_string(raw);
             s.serialize_str(&s1)
         }
+    }
+}
+
+fn bytes_to_structured_string(bytes: &[u8]) -> Cow<'_, str> {
+    String::from_utf8_lossy(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    use super::{Line, LineArgs};
+
+    #[test]
+    fn parses_argument_containing_unescaped_json_quotes() {
+        let payload =
+            r#"{"id":"996048d52cd44ebd24cf","wp":{"hits":1131},"relay":null}"#;
+        let line = format!(
+            r#"1783484211.311904 [0 127.0.0.1:52460] "ZADD" "analytics:measurements" "1783484211.3117671" "{payload}""#
+        );
+
+        let (_, parsed) = Line::from_line_bytes(line.as_bytes(), true).unwrap();
+
+        let LineArgs::Parsed(args) = &parsed.args else {
+            panic!("expected parsed args");
+        };
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[2].as_ref(), payload.as_bytes());
+
+        let json = serde_json::to_string(&parsed).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["args"][2], payload);
+    }
+
+    #[test]
+    fn parses_escaped_quotes_inside_argument() {
+        let line = br#"1783484211.311904 [0 127.0.0.1:52460] "SET" "key" "hello \"there\"""#;
+
+        let (_, parsed) = Line::from_line_bytes(line, true).unwrap();
+
+        let LineArgs::Parsed(args) = parsed.args else {
+            panic!("expected parsed args");
+        };
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[1].as_ref(), b"hello \"there\"");
     }
 }
