@@ -148,8 +148,20 @@ fn parse_f64(i: &[u8]) -> IResult<&[u8], f64> {
 
 impl<'a> Line<'a> {
     fn is_structural_quote(input: &[u8]) -> bool {
-        matches!(input.first(), Some(b'"'))
-            && matches!(input.get(1), None | Some(b' ' | b'\t' | b'\r' | b'\n'))
+        if !matches!(input.first(), Some(b'"')) {
+            return false;
+        }
+
+        let after_quote = &input[1..];
+        let next_non_space = after_quote
+            .iter()
+            .position(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
+
+        match next_non_space {
+            None => true,
+            Some(0) => false,
+            Some(idx) => after_quote[idx] == b'"',
+        }
     }
 
     fn parse_escaped_hex<E>(input: &'a [u8]) -> IResult<&'a [u8], u8, E>
@@ -245,14 +257,18 @@ impl<'a> Line<'a> {
 
             if matches!(input.first(), Some(b'\\')) {
                 let consumed = content_start.len().saturating_sub(input.len());
-                let (next, byte) = Self::parse_escaped_char::<E>(input)?;
                 let buf = owned.get_or_insert_with(|| {
                     let mut v = Vec::with_capacity(consumed + 8);
                     v.extend_from_slice(&content_start[..consumed]);
                     v
                 });
-                buf.push(byte);
-                input = next;
+                if let Ok((next, byte)) = Self::parse_escaped_char::<E>(input) {
+                    buf.push(byte);
+                    input = next;
+                } else {
+                    buf.push(b'\\');
+                    input = &input[1..];
+                }
                 continue;
             }
 
@@ -601,5 +617,85 @@ mod tests {
         };
         assert_eq!(args.len(), 2);
         assert_eq!(args[1].as_ref(), b"hello \"there\"");
+    }
+
+    #[test]
+    fn parses_unescaped_html_attribute_quotes_inside_argument() {
+        let payload = br#"<iframe src="https://example.test/video" width="500" height="281"></iframe>"#;
+        let mut line =
+            b"1783484211.311904 [0 127.0.0.1:52460] \"SET\" \"key\" \""
+                .to_vec();
+        line.extend_from_slice(payload);
+        line.extend_from_slice(b"\" \"NX\" \"EX\" \"604800\"");
+
+        let (_, parsed) = Line::from_line_bytes(&line, true).unwrap();
+
+        let LineArgs::Parsed(args) = parsed.args else {
+            panic!("expected parsed args");
+        };
+        assert_eq!(args.len(), 5);
+        assert_eq!(args[0].as_ref(), b"key");
+        assert_eq!(args[1].as_ref(), payload);
+        assert_eq!(args[2].as_ref(), b"NX");
+    }
+
+    #[test]
+    fn parses_php_serialized_empty_string_quotes_inside_argument() {
+        let payload =
+            br#"a:2:{s:11:"description";s:0:"";s:5:"count";s:1:"1";}"#;
+        let mut line =
+            b"1783484211.311904 [0 127.0.0.1:52460] \"SET\" \"terms:1\" \""
+                .to_vec();
+        line.extend_from_slice(payload);
+        line.extend_from_slice(b"\" \"NX\" \"EX\" \"604800\"");
+
+        let (_, parsed) = Line::from_line_bytes(&line, true).unwrap();
+
+        let LineArgs::Parsed(args) = parsed.args else {
+            panic!("expected parsed args");
+        };
+        assert_eq!(args.len(), 5);
+        assert_eq!(args[0].as_ref(), b"terms:1");
+        assert_eq!(args[1].as_ref(), payload);
+        assert_eq!(args[2].as_ref(), b"NX");
+    }
+
+    #[test]
+    fn parses_php_serialized_object_argument() {
+        let payload = br#"O:8:"stdClass":9:{s:7:"term_id";s:4:"1504";s:4:"name";s:11:"VIP Recipes";s:11:"description";s:0:"";}"#;
+        let mut line =
+            b"1783484180.262905 [0 127.0.0.1:40960] \"SET\" \"terms:1504\" \""
+                .to_vec();
+        line.extend_from_slice(payload);
+        line.extend_from_slice(b"\" \"NX\" \"EX\" \"604800\"");
+
+        let (_, parsed) = Line::from_line_bytes(&line, true).unwrap();
+
+        let LineArgs::Parsed(args) = parsed.args else {
+            panic!("expected parsed args");
+        };
+        assert_eq!(args.len(), 5);
+        assert_eq!(args[0].as_ref(), b"terms:1504");
+        assert_eq!(args[1].as_ref(), payload);
+        assert_eq!(args[2].as_ref(), b"NX");
+    }
+
+    #[test]
+    fn preserves_unknown_backslash_sequences_inside_argument() {
+        let payload = br#"a:2:{s:5:"class";s:15:"Foo\Bar\Baz";s:5:"quote";s:8:"it\'s ok";}"#;
+        let mut line =
+            b"1783484211.311904 [0 127.0.0.1:52460] \"SET\" \"key\" \""
+                .to_vec();
+        line.extend_from_slice(payload);
+        line.extend_from_slice(b"\" \"NX\" \"EX\" \"604800\"");
+
+        let (_, parsed) = Line::from_line_bytes(&line, true).unwrap();
+
+        let LineArgs::Parsed(args) = parsed.args else {
+            panic!("expected parsed args");
+        };
+        assert_eq!(args.len(), 5);
+        assert_eq!(args[0].as_ref(), b"key");
+        assert_eq!(args[1].as_ref(), payload);
     }
 }

@@ -100,7 +100,8 @@ Format specifiers:
     Multiple Instances: "%t [%S %d] %l";
 
 Structured outputs (`json`, `php`, `csv`, and `resp`) parse MONITOR arguments as
-strings and preserve quoted argument content, including JSON-like values.
+strings and preserve quoted argument content, including JSON-like values,
+serialized PHP values, and literal backslash sequences.
 
 Examples:
   # Monitor localhost:6379 by default
