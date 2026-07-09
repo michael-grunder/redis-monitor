@@ -102,6 +102,7 @@ Format specifiers:
 Structured outputs (`json`, `php`, `csv`, and `resp`) parse MONITOR arguments as
 strings and preserve quoted argument content, including JSON-like values,
 serialized PHP values, and literal backslash sequences.
+Standalone `OK` replies from entering MONITOR mode are ignored.
 
 Examples:
   # Monitor localhost:6379 by default

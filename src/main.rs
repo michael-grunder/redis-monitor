@@ -828,6 +828,10 @@ impl IoMessage {
                 let parsed = match Line::from_line_bytes(&m.line, need_args) {
                     Ok((_, line)) => line,
                     Err(e) => {
+                        if m.line.as_ref() == b"OK" {
+                            return Ok(Control::Continue);
+                        }
+
                         let s = String::from_utf8_lossy(&m.line);
                         return Err(anyhow!(
                             "Failed to parse line '{s}' ({e})"
@@ -1122,4 +1126,61 @@ async fn main() -> Result<()> {
     print_final_stats();
 
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct TestWriter {
+        lines: usize,
+    }
+
+    impl OutputHandler for TestWriter {
+        fn write_line(
+            &mut self,
+            _server: &ServerAddr,
+            _name: Option<&str>,
+            _line: &Line,
+        ) -> Result<()> {
+            self.lines += 1;
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_message(line: &'static [u8]) -> IoMessage {
+        IoMessage::Message(MonitorMessage::new(
+            Arc::new(ServerAddr::from_path("stdin")),
+            Arc::new(None),
+            None,
+            Bytes::from_static(line),
+        ))
+    }
+
+    #[test]
+    fn ignores_standalone_ok_reply_after_parse_failure() {
+        let mut writer = TestWriter::default();
+
+        let control = test_message(b"OK").process(&mut writer, true).unwrap();
+
+        assert!(matches!(control, Control::Continue));
+        assert_eq!(writer.lines, 0);
+    }
+
+    #[test]
+    fn reports_other_parse_failures() {
+        let mut writer = TestWriter::default();
+
+        let err = test_message(b"PONG")
+            .process(&mut writer, true)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Failed to parse line 'PONG'"));
+        assert_eq!(writer.lines, 0);
+    }
 }
