@@ -10,7 +10,7 @@ arcstr = "1.2.0"
 bitflags = "2.13.1"
 bytes = "1.12.1"
 clap = { version = "4.6.4", features = ["derive", "wrap_help"] }
-clap_complete = "4.6.7"
+clap_complete = "4.6.8"
 colored = "3.1.1"
 config = { version = "0.15.25", features = ["toml"] }
 csv = "1.4.0"
@@ -20,7 +20,7 @@ lexical-core = "1.0.6"
 memchr = "2.8.3"
 nom = "8.0.0"
 rand = "0.10.2"
-redis = { version = "1.4.1", default-features = false, features = [
+redis = { version = "1.5.0", default-features = false, features = [
   "aio",
   "connection-manager",
   "tokio-comp",
@@ -30,7 +30,7 @@ redis = { version = "1.4.1", default-features = false, features = [
   # "tls-rustls-webpki-roots",
 ] }
 regex = "1.13.1"
-rustls = "0.23.42"
+rustls = "0.23.43"
 rustls-native-certs = "0.8.4"
 rustls-pemfile = "2.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
