@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+### Documentation
+
+- Expand the agent guide with firehose-oriented performance requirements,
+  measurement practices, Rust abstraction tradeoffs, and completion checks.
+
 ### Fixed
 
 - Ignore standalone `OK` replies from Redis MONITOR setup instead of reporting
