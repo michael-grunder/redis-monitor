@@ -10,6 +10,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - Elide per-record address allocations in plain multi-source output by
   normalizing server IP addresses once and writing address components directly.
+- Await capacity on saturated output queues instead of polling, and count each
+  discrete backpressure episode once.
 
 ### Documentation
 

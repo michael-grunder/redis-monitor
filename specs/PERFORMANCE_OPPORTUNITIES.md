@@ -37,29 +37,7 @@ wall-clock results should be treated as directional. The `perf` and allocation
 profiles were consistent across the single-source, two-source, and cluster
 workloads.
 
-## 1. Await full output queues instead of polling with `try_send` and yielding
-
-**Estimated improvement:** 3-15% more throughput when output is saturated,
-with a larger reduction in producer CPU use and scheduler churn. Little change
-is expected when the queue never fills.
-**Implementation lift:** Small; approximately half to one day.
-**Confidence:** High that CPU use improves; medium for the throughput estimate.
-
-Both `run_wire` and `run_stdin` retry `flume::Sender::try_send` in a loop and
-call `tokio::task::yield_now()` after every full result. This repeatedly polls a
-queue whose consumer is a different OS thread. The stall counter therefore
-counts failed polls rather than distinct backpressure episodes. Under load, the
-main runtime spends useful cycles rescheduling producers that can only add more
-pressure to the already full downstream queue.
-
-**Proposed change:** Use flume's existing `send_async` future so a producer is
-woken when capacity becomes available. Count the transition into a blocked send
-once, and preserve disconnected-channel and cancellation behavior. A focused
-slow-writer test should prove that no records are dropped, shutdown completes,
-and the producer does not spin. Benchmark both a `/dev/null` sink and a
-rate-limited pipe.
-
-## 2. Compile a byte-oriented parse plan for plain output
+## 1. Compile a byte-oriented parse plan for plain output
 
 **Estimated improvement:** 15-30% more plain-output throughput, depending on
 the selected format; likely largest for the single-instance default format.
@@ -85,7 +63,7 @@ This must retain malformed-input validation and the current output contract,
 including escaping and spacing. Regression tests should compare every format
 token against the existing implementation before the old path is removed.
 
-## 3. Batch records and collapse the two queue handoffs
+## 2. Batch records and collapse the two queue handoffs
 
 **Estimated improvement:** 20-40% higher saturation throughput for short
 records and many producers, plus substantially fewer queue operations and
@@ -118,7 +96,7 @@ before retaining a chunk and released after output. Keep a smaller item bound
 as a secondary guard. Tests must cover per-source ordering, cross-source
 behavior, oversized single frames, a slow writer, disconnect, and shutdown.
 
-## 4. Remove avoidable structured-output collections and address strings
+## 3. Remove avoidable structured-output collections and address strings
 
 **Estimated improvement:** 10-25% for JSON/CSV/PHP and 5-15% for RESP, with
 roughly two to four fewer allocations per common record.
@@ -153,7 +131,7 @@ a small inline vector of byte ranges with owned storage only for escaped
 arguments). Preserve the rule that malformed input is rejected before a partial
 record is committed to output.
 
-## 5. Remove the two-core ceiling for many-instance workloads
+## 4. Remove the two-core ceiling for many-instance workloads
 
 **Estimated improvement:** A 1.5-3x higher processing ceiling with many busy
 instances when parsing/filtering is the bottleneck; little gain when the final
@@ -180,7 +158,7 @@ Measure with 1, 3, and 21 active sources, accept-most and reject-most filters,
 and both plain and JSON output. Preserve per-source ordering and document the
 cross-source ordering guarantee.
 
-## 6. Stop cloning every stdin record
+## 5. Stop cloning every stdin record
 
 **Estimated improvement:** 10-25% more stdin replay throughput and materially
 lower allocation pressure/peak retained memory.
@@ -200,7 +178,7 @@ Strip the optional leading `+` by slicing, never shifting the payload. Apply the
 same byte-budgeted backpressure used by network producers so replaying the 3.3
 MB fixture cannot multiply retained memory unexpectedly.
 
-## 7. Amortize optional statistics work
+## 6. Amortize optional statistics work
 
 **Estimated improvement:** 5-15% in `--stats` mode; negligible when statistics
 are disabled.
@@ -219,7 +197,7 @@ maximum report delay remains bounded. Keep command counters local to ingest
 shards if parallel ingestion is introduced, then merge only at report time.
 Include stats accuracy and interval-boundary tests.
 
-## 8. Make output flush policy byte/time based
+## 7. Make output flush policy byte/time based
 
 **Estimated improvement:** 3-10% at sparse-to-medium rates or when records arrive
 one at a time; minimal change during full 1,024-record drains.
@@ -240,12 +218,12 @@ deterministic writer test.
 
 ## Suggested implementation order
 
-Implement findings 1 as an isolated quick win. Prototype finding 2 next,
-because it reduces work without changing concurrency. Findings 3 and 4 then
-address the dominant queue and structured-output costs. Re-profile before
-undertaking finding 5: the earlier changes will determine whether ingest,
-formatting, or the sink is the remaining scaling limit. Findings 6-8 can be
-scheduled by feature priority and can share the batching infrastructure.
+Prototype finding 1 next, because it reduces work without changing concurrency.
+Findings 2 and 3 then address the dominant queue and structured-output costs.
+Re-profile before undertaking finding 4: the earlier changes will determine
+whether ingest, formatting, or the sink is the remaining scaling limit.
+Findings 5-7 can be scheduled by feature priority and can share the batching
+infrastructure.
 
 For every hot-path change, retain a release-mode replay benchmark plus an
 end-to-end multi-producer workload with a slow-consumer case. Report both

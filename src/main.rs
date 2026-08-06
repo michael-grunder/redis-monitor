@@ -433,6 +433,32 @@ impl IoStats {
     }
 }
 
+impl IoHandle {
+    async fn send(
+        &self,
+        message: IoMessage,
+    ) -> Result<(), flume::SendError<IoMessage>> {
+        send_io_message(&self.tx, message, &IO_STATS).await
+    }
+}
+
+async fn send_io_message(
+    tx: &IoSender,
+    message: IoMessage,
+    stats: &IoStats,
+) -> Result<(), flume::SendError<IoMessage>> {
+    match tx.try_send(message) {
+        Ok(()) => Ok(()),
+        Err(flume::TrySendError::Full(message)) => {
+            stats.stall();
+            tx.send_async(message).await
+        }
+        Err(flume::TrySendError::Disconnected(message)) => {
+            Err(flume::SendError(message))
+        }
+    }
+}
+
 impl LocalStats {
     const fn new(batch_size: u64) -> Self {
         Self {
@@ -946,7 +972,9 @@ async fn run_stdin(opt: Options) -> Result<()> {
 
     let preamble: Arc<[Monitor]> = Arc::from(vec![pseudo]);
 
-    io_tx.tx.send(IoMessage::Preamble(Arc::clone(&preamble)))?;
+    io_tx
+        .send(IoMessage::Preamble(Arc::clone(&preamble)))
+        .await?;
 
     let (tx, mut rx) = mpsc::channel::<MonitorMessage>(16384);
 
@@ -961,24 +989,13 @@ async fn run_stdin(opt: Options) -> Result<()> {
             continue;
         }
 
-        let mut msg = IoMessage::Message(message);
-        loop {
-            match io_tx.tx.try_send(msg) {
-                Ok(()) => break,
-                Err(flume::TrySendError::Full(m)) => {
-                    IO_STATS.stall();
-                    tokio::task::yield_now().await;
-                    msg = m;
-                }
-                Err(flume::TrySendError::Disconnected(_)) => {
-                    eprintln!("io thread disconnected");
-                    break;
-                }
-            }
+        if io_tx.send(IoMessage::Message(message)).await.is_err() {
+            eprintln!("io thread disconnected");
+            break;
         }
     }
 
-    let _ = io_tx.tx.send(IoMessage::Shutdown);
+    let _ = io_tx.send(IoMessage::Shutdown).await;
     if let Err(e) = io_jh
         .join()
         .unwrap_or_else(|e| Err(anyhow!("IO thread panicked: {e:?}")))
@@ -1032,7 +1049,9 @@ async fn run_wire(opt: Options) -> Result<()> {
     let (io_tx, io_jh) = start_io_thread(opt.output, &format, 65536);
 
     let preamble: Arc<[Monitor]> = Arc::from(seeds);
-    io_tx.tx.send(IoMessage::Preamble(Arc::clone(&preamble)))?;
+    io_tx
+        .send(IoMessage::Preamble(Arc::clone(&preamble)))
+        .await?;
 
     for mon in preamble.iter().cloned() {
         let tx_task = tx.clone();
@@ -1049,32 +1068,21 @@ async fn run_wire(opt: Options) -> Result<()> {
             stats.try_incr(&message.line, message.line.len());
             if tick.elapsed() >= interval {
                 let s = stats.get_stats();
-                io_tx.tx.send(IoMessage::Stats(s)).unwrap_or_else(|e| {
+                if let Err(e) = io_tx.send(IoMessage::Stats(s)).await {
                     eprintln!("Failed to send stats: {e}");
-                });
+                    break;
+                }
                 tick = Instant::now();
             }
         }
 
-        let mut msg = IoMessage::Message(message);
-
-        loop {
-            match io_tx.tx.try_send(msg) {
-                Ok(()) => break,
-                Err(flume::TrySendError::Full(m)) => {
-                    IO_STATS.stall();
-                    tokio::task::yield_now().await;
-                    msg = m;
-                }
-                Err(flume::TrySendError::Disconnected(_)) => {
-                    eprintln!("io thread disconnected");
-                    break;
-                }
-            }
+        if io_tx.send(IoMessage::Message(message)).await.is_err() {
+            eprintln!("io thread disconnected");
+            break;
         }
     }
 
-    let _ = io_tx.tx.send(IoMessage::Shutdown);
+    let _ = io_tx.send(IoMessage::Shutdown).await;
     if let Err(e) = io_jh
         .join()
         .unwrap_or_else(|e| Err(anyhow!("IO thread panicked: {e:?}")))
@@ -1182,5 +1190,51 @@ mod tests {
 
         assert!(err.to_string().contains("Failed to parse line 'PONG'"));
         assert_eq!(writer.lines, 0);
+    }
+
+    #[tokio::test]
+    async fn full_output_queue_awaits_without_dropping_or_recounting() {
+        let stats = IoStats::default();
+        let (tx, rx) = flume::bounded(1);
+        tx.send(test_message(b"first")).unwrap();
+
+        let mut blocked =
+            Box::pin(send_io_message(&tx, test_message(b"second"), &stats));
+
+        for _ in 0..100 {
+            assert!(futures::poll!(blocked.as_mut()).is_pending());
+        }
+        assert_eq!(stats.snapshot().2, 1);
+
+        let IoMessage::Message(first) = rx.recv().unwrap() else {
+            panic!("expected first record");
+        };
+        assert_eq!(first.line, b"first"[..]);
+
+        blocked.await.unwrap();
+        let IoMessage::Message(second) = rx.recv().unwrap() else {
+            panic!("expected second record");
+        };
+        assert_eq!(second.line, b"second"[..]);
+
+        send_io_message(&tx, IoMessage::Shutdown, &stats)
+            .await
+            .unwrap();
+        assert!(matches!(rx.recv().unwrap(), IoMessage::Shutdown));
+        assert_eq!(stats.snapshot().2, 1);
+    }
+
+    #[tokio::test]
+    async fn output_queue_disconnection_is_reported_without_a_stall() {
+        let stats = IoStats::default();
+        let (tx, rx) = flume::bounded(1);
+        drop(rx);
+
+        assert!(
+            send_io_message(&tx, test_message(b"record"), &stats)
+                .await
+                .is_err()
+        );
+        assert_eq!(stats.snapshot().2, 0);
     }
 }
