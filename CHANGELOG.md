@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+### Changed
+
+- Elide per-record address allocations in plain multi-source output by
+  normalizing server IP addresses once and writing address components directly.
+
 ### Documentation
 
 - Expand the agent guide with firehose-oriented performance requirements,

@@ -191,14 +191,14 @@ impl<W: Write> OutputHandler for PlainWriter<W> {
                     w.write_all(server.get_host().as_bytes())?;
                 }
                 FormatToken::ServerPort => {
-                    w.write_all(server.get_short_name().as_bytes())?;
+                    Self::w_server_port(w, server)?;
                 }
                 FormatToken::ClientAddress => write!(w, "{}", line.addr)?,
                 FormatToken::ClientHost => {
-                    w.write_all(line.addr.get_host().as_bytes())?;
+                    Self::w_client_host(w, &line.addr)?;
                 }
                 FormatToken::ClientPort => {
-                    w.write_all(line.addr.get_short_name().as_bytes())?;
+                    Self::w_client_port(w, &line.addr)?;
                 }
                 FormatToken::Timestamp => {
                     write!(w, "{}", line.timestamp)?;
@@ -320,9 +320,9 @@ impl<W: Write> PlainWriter<W> {
         server: &ServerAddr,
         client: &ClientAddr,
     ) -> Result<()> {
-        if let ServerAddr::Tcp(shost, sport) = server
+        if let ServerAddr::Tcp(_, sport, Some(server_ip)) = server
             && let ClientAddr::Tcp(chost, cport) = client
-            && shost == &chost.to_string()
+            && server_ip == chost
         {
             write!(writer, "{sport} {cport}")?;
             return Ok(());
@@ -330,6 +330,42 @@ impl<W: Write> PlainWriter<W> {
 
         write!(writer, "{server} {client}")?;
 
+        Ok(())
+    }
+
+    fn w_server_port(writer: &mut W, server: &ServerAddr) -> Result<()> {
+        match server {
+            ServerAddr::Tcp(_, port, _) => write!(writer, "{port}")?,
+            ServerAddr::Unix(path) => writer.write_all(
+                path.rsplit('/').next().unwrap_or(path).as_bytes(),
+            )?,
+        }
+        Ok(())
+    }
+
+    fn w_client_host(writer: &mut W, client: &ClientAddr) -> Result<()> {
+        match client {
+            ClientAddr::Tcp(ip, _) => write!(writer, "{ip}")?,
+            ClientAddr::Path(_) | ClientAddr::Lua | ClientAddr::Unknown => {
+                writer.write_all(b"-")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn w_client_port(writer: &mut W, client: &ClientAddr) -> Result<()> {
+        match client {
+            ClientAddr::Tcp(_, port) => write!(writer, "{port}")?,
+            ClientAddr::Path(path) => writer.write_all(
+                path.rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("-")
+                    .as_bytes(),
+            )?,
+            ClientAddr::Lua => writer.write_all(b"lua")?,
+            ClientAddr::Unknown => writer.write_all(b"-")?,
+        }
         Ok(())
     }
 
@@ -422,5 +458,126 @@ impl<W: Write> OutputHandler for PhpWriter<W> {
 
     fn flush(&mut self) -> Result<()> {
         self.writer.flush().map_err(|e| anyhow!(e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{hint::black_box, io::Write, net::IpAddr};
+
+    use super::{OutputHandler, PlainWriter};
+    use crate::{
+        connection::ServerAddr,
+        monitor::{ClientAddr, Line, LineArgs},
+    };
+
+    fn render(
+        format: &str,
+        server: &ServerAddr,
+        client: ClientAddr<'_>,
+    ) -> String {
+        let line = Line::new(0.0, 0, client, "PING", LineArgs::Raw(b""));
+        let mut output = Vec::new();
+        PlainWriter::new(&mut output, format)
+            .write_line(server, None, &line)
+            .unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
+    fn ip(address: &str) -> IpAddr {
+        address.parse().unwrap()
+    }
+
+    #[derive(Default)]
+    struct ByteCounter(usize);
+
+    impl Write for ByteCounter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += black_box(bytes.len());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn short_addresses_elide_matching_ipv4_and_ipv6_hosts() {
+        let cases = [
+            ("127.0.0.1", "127.0.0.1", "6379 49152\n"),
+            ("2001:db8::1", "2001:db8::1", "6379 49152\n"),
+        ];
+
+        for (server_host, client_host, expected) in cases {
+            let server = ServerAddr::from_tcp_addr(server_host, 6379);
+            let client = ClientAddr::from_addr(ip(client_host), 49152);
+            assert_eq!(render("%S", &server, client), expected);
+        }
+    }
+
+    #[test]
+    fn short_addresses_preserve_full_addresses_for_nonmatching_hosts() {
+        let cases = [
+            (
+                ServerAddr::from_tcp_addr("127.0.0.1", 6379),
+                ClientAddr::from_addr(ip("127.0.0.2"), 49152),
+                "127.0.0.1:6379 127.0.0.2:49152\n",
+            ),
+            (
+                ServerAddr::from_tcp_addr("redis.example", 6379),
+                ClientAddr::from_addr(ip("127.0.0.1"), 49152),
+                "redis.example:6379 127.0.0.1:49152\n",
+            ),
+            (
+                ServerAddr::from_path("/run/redis/server.sock"),
+                ClientAddr::from_path("/run/redis/client.sock"),
+                "/run/redis/server.sock /run/redis/client.sock\n",
+            ),
+        ];
+
+        for (server, client, expected) in cases {
+            assert_eq!(render("%S", &server, client), expected);
+        }
+    }
+
+    #[test]
+    fn address_components_are_written_without_temporary_strings() {
+        let server = ServerAddr::from_tcp_addr("127.0.0.1", 6379);
+        let client = ClientAddr::from_addr(ip("127.0.0.1"), 49152);
+        assert_eq!(
+            render("%sp %ch %cp", &server, client),
+            "6379 127.0.0.1 49152\n"
+        );
+
+        let server = ServerAddr::from_path("/run/redis/server.sock");
+        let client = ClientAddr::from_path("/run/redis/client.sock");
+        assert_eq!(
+            render("%sp %ch %cp", &server, client),
+            "server.sock - client.sock\n"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual optimized-build throughput benchmark"]
+    fn benchmark_default_multi_source_format() {
+        let server = ServerAddr::from_tcp_addr("127.0.0.1", 6379);
+        let line = Line::new(
+            1_783_484_211.311_904,
+            0,
+            ClientAddr::from_addr(ip("127.0.0.1"), 49152),
+            "GET",
+            LineArgs::Raw(b"\"benchmark-key\""),
+        );
+        let mut writer =
+            PlainWriter::new(ByteCounter::default(), "%t [%S %d] %l");
+
+        for _ in 0..10_000_000 {
+            writer
+                .write_line(black_box(&server), None, black_box(&line))
+                .unwrap();
+        }
+
+        black_box(writer.writer.0);
     }
 }

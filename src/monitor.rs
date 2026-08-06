@@ -505,25 +505,6 @@ impl<'a> ClientAddr<'a> {
     pub const fn from_addr(addr: IpAddr, port: u16) -> Self {
         Self::Tcp(addr, port)
     }
-
-    pub fn get_short_name(&self) -> Cow<'_, str> {
-        match self {
-            Self::Path(p) => match p.rsplit('/').next() {
-                Some(name) if !name.is_empty() => Cow::Borrowed(name),
-                _ => Cow::Borrowed("-"),
-            },
-            Self::Tcp(_, port) => Cow::Owned(port.to_string()),
-            Self::Lua => Cow::Borrowed("lua"),
-            Self::Unknown => Cow::Borrowed("-"),
-        }
-    }
-
-    pub fn get_host(&self) -> String {
-        match self {
-            ClientAddr::Tcp(ip, _port) => ip.to_string(),
-            _ => "-".to_string(),
-        }
-    }
 }
 
 impl std::fmt::Display for ClientAddr<'_> {

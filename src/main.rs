@@ -782,7 +782,7 @@ fn print_final_stats() {
 
 fn connection_info_from_monitor(mon: &Monitor) -> ConnectionInfo {
     let addr = match &mon.address {
-        ServerAddr::Tcp(host, port) => {
+        ServerAddr::Tcp(host, port, _) => {
             if mon.tls.is_some() {
                 ConnectionAddr::TcpTls {
                     host: host.clone(),

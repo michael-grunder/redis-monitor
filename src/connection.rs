@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::string::ToString;
 use std::{
     collections::HashSet,
@@ -6,6 +5,7 @@ use std::{
     fs,
     hash::{Hash, Hasher},
     io::{Cursor, Write},
+    net::IpAddr,
     path::Path,
     pin::Pin,
     str::FromStr,
@@ -56,7 +56,7 @@ pub struct Monitor {
 
 #[derive(Debug, Eq, Clone, Serialize)]
 pub enum ServerAddr {
-    Tcp(String, u16),
+    Tcp(String, u16, #[serde(skip)] Option<IpAddr>),
     Unix(String),
 }
 
@@ -145,8 +145,8 @@ impl<'de> Deserialize<'de> for ServerAddr {
 impl PartialEq for ServerAddr {
     fn eq(&self, other: &Self) -> bool {
         match self {
-            Self::Tcp(host, port) => match other {
-                Self::Tcp(other_host, other_port) => {
+            Self::Tcp(host, port, _) => match other {
+                Self::Tcp(other_host, other_port, _) => {
                     host == other_host && port == other_port
                 }
                 Self::Unix(_) => false,
@@ -168,7 +168,7 @@ impl PartialEq for ClusterNode {
 impl Hash for ServerAddr {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
-            Self::Tcp(host, port) => {
+            Self::Tcp(host, port, _) => {
                 0u8.hash(state);
                 host.hash(state);
                 port.hash(state);
@@ -197,7 +197,7 @@ impl Hash for ClusterNode {
 impl std::fmt::Display for ServerAddr {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Self::Tcp(host, port) => write!(f, "{host}:{port}"),
+            Self::Tcp(host, port, _) => write!(f, "{host}:{port}"),
             Self::Unix(path) => write!(f, "{path}"),
         }
     }
@@ -206,7 +206,7 @@ impl std::fmt::Display for ServerAddr {
 impl GetHost for ServerAddr {
     fn get_host(&self) -> &str {
         match self {
-            Self::Tcp(host, _) => host,
+            Self::Tcp(host, ..) => host,
             Self::Unix(path) => path,
         }
     }
@@ -214,7 +214,8 @@ impl GetHost for ServerAddr {
 
 impl ServerAddr {
     pub fn from_tcp_addr<T: AsRef<str>>(host: T, port: u16) -> Self {
-        Self::Tcp(host.as_ref().to_string(), port)
+        let host = host.as_ref();
+        Self::Tcp(host.to_string(), port, host.parse().ok())
     }
 
     pub fn from_path<T: AsRef<str>>(path: T) -> Self {
@@ -223,7 +224,7 @@ impl ServerAddr {
 
     pub fn get_url_string(&self) -> String {
         match self {
-            Self::Tcp(host, port) => format!("redis://{host}:{port}"),
+            Self::Tcp(host, port, _) => format!("redis://{host}:{port}"),
             Self::Unix(path) => format!("unix://{path}"),
         }
     }
@@ -237,15 +238,6 @@ impl ServerAddr {
         })?;
 
         Ok(con)
-    }
-
-    pub fn get_short_name(&self) -> Cow<'_, str> {
-        match self {
-            Self::Tcp(_, port) => Cow::Owned(port.to_string()),
-            Self::Unix(path) => {
-                Cow::Borrowed(path.rsplit('/').next().unwrap_or(path.as_str()))
-            }
-        }
     }
 }
 
@@ -512,7 +504,7 @@ impl Monitor {
 
     pub async fn connect(self) -> Result<(Self, BufReader<Stream>)> {
         let mut stream = match &self.address {
-            ServerAddr::Tcp(host, port) => {
+            ServerAddr::Tcp(host, port, _) => {
                 let stream = TcpStream::connect((host.as_str(), *port)).await?;
 
                 if let Some(tls) = &self.tls {
@@ -701,5 +693,20 @@ impl ServerCertVerifier for NoVerifier {
             rustls::SignatureScheme::RSA_PSS_SHA256,
             rustls::SignatureScheme::ED25519,
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerAddr;
+
+    #[test]
+    fn server_address_serialization_omits_normalized_ip_cache() {
+        let address = ServerAddr::from_tcp_addr("127.0.0.1", 6379);
+
+        assert_eq!(
+            serde_json::to_string(&address).unwrap(),
+            r#"{"Tcp":["127.0.0.1",6379]}"#
+        );
     }
 }
