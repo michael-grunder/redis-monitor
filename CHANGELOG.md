@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   normalizing server IP addresses once and writing address components directly.
 - Await capacity on saturated output queues instead of polling, and count each
   discrete backpressure episode once.
+- Compile plain-output formats into byte-oriented parse plans so common fields
+  can be validated and copied from the input without typed round trips.
 
 ### Documentation
 

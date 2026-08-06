@@ -37,33 +37,7 @@ wall-clock results should be treated as directional. The `perf` and allocation
 profiles were consistent across the single-source, two-source, and cluster
 workloads.
 
-## 1. Compile a byte-oriented parse plan for plain output
-
-**Estimated improvement:** 15-30% more plain-output throughput, depending on
-the selected format; likely largest for the single-instance default format.
-**Implementation lift:** Medium; approximately two to four days.
-**Confidence:** Medium-high.
-
-Every accepted record is fully converted into `Line`: the timestamp is parsed
-to `f64`, the database to `u64`, and the client address to `IpAddr`. Plain output
-then formats those values back to text. In the single-source live profile,
-float-to-decimal formatting alone accounted for about 7% of cycles. IPv4 and
-integer formatting consumed several more percent, while much of the 14.6% in
-`IoMessage::process` was parsing. The default output mostly reproduces bytes
-already present in the MONITOR line.
-
-**Proposed change:** Have `compile_format` produce a `ParsePlan` describing the
-fields actually required. Parse a `LineView` containing validated byte ranges
-for timestamp, database, client address, command, and arguments. Plain writers
-should copy those original slices when numeric or typed values are not needed;
-structured writers can request the current typed conversions. A narrowly
-guarded whole-line fast path is reasonable for formats proven byte-equivalent.
-
-This must retain malformed-input validation and the current output contract,
-including escaping and spacing. Regression tests should compare every format
-token against the existing implementation before the old path is removed.
-
-## 2. Batch records and collapse the two queue handoffs
+## 1. Batch records and collapse the two queue handoffs
 
 **Estimated improvement:** 20-40% higher saturation throughput for short
 records and many producers, plus substantially fewer queue operations and
@@ -96,7 +70,7 @@ before retaining a chunk and released after output. Keep a smaller item bound
 as a secondary guard. Tests must cover per-source ordering, cross-source
 behavior, oversized single frames, a slow writer, disconnect, and shutdown.
 
-## 3. Remove avoidable structured-output collections and address strings
+## 2. Remove avoidable structured-output collections and address strings
 
 **Estimated improvement:** 10-25% for JSON/CSV/PHP and 5-15% for RESP, with
 roughly two to four fewer allocations per common record.
@@ -131,7 +105,7 @@ a small inline vector of byte ranges with owned storage only for escaped
 arguments). Preserve the rule that malformed input is rejected before a partial
 record is committed to output.
 
-## 4. Remove the two-core ceiling for many-instance workloads
+## 3. Remove the two-core ceiling for many-instance workloads
 
 **Estimated improvement:** A 1.5-3x higher processing ceiling with many busy
 instances when parsing/filtering is the bottleneck; little gain when the final
@@ -158,7 +132,7 @@ Measure with 1, 3, and 21 active sources, accept-most and reject-most filters,
 and both plain and JSON output. Preserve per-source ordering and document the
 cross-source ordering guarantee.
 
-## 5. Stop cloning every stdin record
+## 4. Stop cloning every stdin record
 
 **Estimated improvement:** 10-25% more stdin replay throughput and materially
 lower allocation pressure/peak retained memory.
@@ -178,7 +152,7 @@ Strip the optional leading `+` by slicing, never shifting the payload. Apply the
 same byte-budgeted backpressure used by network producers so replaying the 3.3
 MB fixture cannot multiply retained memory unexpectedly.
 
-## 6. Amortize optional statistics work
+## 5. Amortize optional statistics work
 
 **Estimated improvement:** 5-15% in `--stats` mode; negligible when statistics
 are disabled.
@@ -197,7 +171,7 @@ maximum report delay remains bounded. Keep command counters local to ingest
 shards if parallel ingestion is introduced, then merge only at report time.
 Include stats accuracy and interval-boundary tests.
 
-## 7. Make output flush policy byte/time based
+## 6. Make output flush policy byte/time based
 
 **Estimated improvement:** 3-10% at sparse-to-medium rates or when records arrive
 one at a time; minimal change during full 1,024-record drains.
@@ -218,11 +192,10 @@ deterministic writer test.
 
 ## Suggested implementation order
 
-Prototype finding 1 next, because it reduces work without changing concurrency.
-Findings 2 and 3 then address the dominant queue and structured-output costs.
-Re-profile before undertaking finding 4: the earlier changes will determine
+Findings 1 and 2 address the dominant queue and structured-output costs.
+Re-profile before undertaking finding 3: the earlier changes will determine
 whether ingest, formatting, or the sink is the remaining scaling limit.
-Findings 5-7 can be scheduled by feature priority and can share the batching
+Findings 4-6 can be scheduled by feature priority and can share the batching
 infrastructure.
 
 For every hot-path change, retain a release-mode replay benchmark plus an

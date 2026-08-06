@@ -35,7 +35,6 @@ use crate::{
     config::{Map, ServerAuth},
     connection::{Cluster, Monitor},
     filter::FilterPattern,
-    monitor::Line,
     output::OutputHandler,
     stats::CommandStat,
 };
@@ -837,11 +836,7 @@ fn connection_info_from_monitor(mon: &Monitor) -> ConnectionInfo {
 }
 
 impl IoMessage {
-    fn process(
-        self,
-        w: &mut dyn OutputHandler,
-        need_args: bool,
-    ) -> Result<Control> {
+    fn process(self, w: &mut dyn OutputHandler) -> Result<Control> {
         match self {
             Self::Preamble(servers) => {
                 eprintln!("{}", format_preamble(&servers));
@@ -851,21 +846,15 @@ impl IoMessage {
                 w.flush()?;
             }
             Self::Message(m) => {
-                let parsed = match Line::from_line_bytes(&m.line, need_args) {
-                    Ok((_, line)) => line,
-                    Err(e) => {
-                        if m.line.as_ref() == b"OK" {
-                            return Ok(Control::Continue);
-                        }
+                if m.line.as_ref() == b"OK" {
+                    return Ok(Control::Continue);
+                }
 
-                        let s = String::from_utf8_lossy(&m.line);
-                        return Err(anyhow!(
-                            "Failed to parse line '{s}' ({e})"
-                        ));
-                    }
-                };
-
-                w.write_line(&m.server, m.name.as_ref().as_deref(), &parsed)?;
+                w.write_raw_line(
+                    &m.server,
+                    m.name.as_ref().as_deref(),
+                    &m.line,
+                )?;
             }
             Self::Shutdown => return Ok(Control::Shutdown),
         }
@@ -894,8 +883,6 @@ fn start_io_thread(
     let (tx, rx) = flume::bounded::<IoMessage>(size);
 
     let fmt = format.to_string();
-    let need_args = output_kind.need_args();
-
     let jh = std::thread::spawn(move || -> Result<()> {
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::with_capacity(1 << 20, stdout.lock());
@@ -906,7 +893,7 @@ fn start_io_thread(
         while !shutdown {
             let Ok(first) = rx.recv() else { break };
 
-            match first.process(writer.as_mut(), need_args) {
+            match first.process(writer.as_mut()) {
                 Ok(Control::Shutdown) => break,
                 Ok(Control::Continue) => {}
                 Err(e) => {
@@ -915,7 +902,7 @@ fn start_io_thread(
             }
 
             for msg in rx.try_iter().take(BATCH_MAX - 1) {
-                match msg.process(writer.as_mut(), need_args) {
+                match msg.process(writer.as_mut()) {
                     Ok(Control::Shutdown) => {
                         shutdown = true;
                         break;
@@ -1139,6 +1126,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitor::Line;
 
     #[derive(Default)]
     struct TestWriter {
@@ -1174,7 +1162,7 @@ mod tests {
     fn ignores_standalone_ok_reply_after_parse_failure() {
         let mut writer = TestWriter::default();
 
-        let control = test_message(b"OK").process(&mut writer, true).unwrap();
+        let control = test_message(b"OK").process(&mut writer).unwrap();
 
         assert!(matches!(control, Control::Continue));
         assert_eq!(writer.lines, 0);
@@ -1184,9 +1172,7 @@ mod tests {
     fn reports_other_parse_failures() {
         let mut writer = TestWriter::default();
 
-        let err = test_message(b"PONG")
-            .process(&mut writer, true)
-            .unwrap_err();
+        let err = test_message(b"PONG").process(&mut writer).unwrap_err();
 
         assert!(err.to_string().contains("Failed to parse line 'PONG'"));
         assert_eq!(writer.lines, 0);

@@ -7,7 +7,9 @@ use serde_php as php;
 
 use crate::{
     connection::{GetHost, ServerAddr},
-    monitor::{ClientAddr, Line, LineArgs},
+    monitor::{
+        ClientAddr, ClientAddrView, Line, LineArgs, LineView, ParsePlan,
+    },
     stats::CommandStat,
 };
 
@@ -38,6 +40,13 @@ enum FormatToken {
     Command,
     Arguments,
     FullLine,
+}
+
+#[derive(Debug, Copy, Clone)]
+enum FastFormat {
+    None,
+    FullLine,
+    DefaultSingle,
 }
 
 impl FromStr for OutputKind {
@@ -89,10 +98,6 @@ impl Serialize for PhpLine<'_> {
     }
 }
 impl OutputKind {
-    pub fn need_args(self) -> bool {
-        self != Self::Plain
-    }
-
     pub fn get_writer<'a, W: Write + 'a>(
         self,
         writer: W,
@@ -113,6 +118,17 @@ impl OutputKind {
 }
 
 pub trait OutputHandler {
+    fn write_raw_line(
+        &mut self,
+        server: &ServerAddr,
+        name: Option<&str>,
+        input: &[u8],
+    ) -> Result<()> {
+        let (_, line) = Line::from_line_bytes(input, true)
+            .map_err(|error| invalid_line(input, error))?;
+        self.write_line(server, name, &line)
+    }
+
     fn write_line(
         &mut self,
         server: &ServerAddr,
@@ -146,6 +162,8 @@ pub trait OutputHandler {
 struct PlainWriter<W: Write> {
     writer: W,
     format: Vec<FormatToken>,
+    parse_plan: ParsePlan,
+    fast_format: FastFormat,
 }
 
 #[derive(Debug)]
@@ -169,6 +187,17 @@ struct PhpWriter<W: Write> {
 }
 
 impl<W: Write> OutputHandler for PlainWriter<W> {
+    fn write_raw_line(
+        &mut self,
+        server: &ServerAddr,
+        name: Option<&str>,
+        input: &[u8],
+    ) -> Result<()> {
+        let (_, line) = LineView::from_line_bytes(input, self.parse_plan)
+            .map_err(|error| invalid_line(input, error))?;
+        self.write_view(server, name, &line)
+    }
+
     fn write_line(
         &mut self,
         server: &ServerAddr,
@@ -245,7 +274,7 @@ impl<W: Write> PlainWriter<W> {
         }
     }
 
-    fn compile_format(fmt: &str) -> Vec<FormatToken> {
+    fn compile_format(fmt: &str) -> (Vec<FormatToken>, ParsePlan) {
         let mut res = vec![];
         let mut lit = vec![];
 
@@ -312,7 +341,95 @@ impl<W: Write> PlainWriter<W> {
 
         Self::push_literal(&mut res, &mut lit);
 
-        res
+        let parse_plan = ParsePlan {
+            client_ip: res
+                .iter()
+                .any(|token| matches!(token, FormatToken::ClientServerShort)),
+            timestamp: res
+                .iter()
+                .any(|token| matches!(token, FormatToken::Timestamp)),
+        };
+
+        (res, parse_plan)
+    }
+
+    fn write_view(
+        &mut self,
+        server: &ServerAddr,
+        name: Option<&str>,
+        line: &LineView<'_>,
+    ) -> Result<()> {
+        let (writer, format) = (&mut self.writer, &self.format);
+
+        match self.fast_format {
+            FastFormat::FullLine => {
+                if let Some(full_line) = line.full_line {
+                    writer.write_all(full_line)?;
+                    writer.write_all(b"\n")?;
+                    return Ok(());
+                }
+            }
+            FastFormat::DefaultSingle => {
+                if let Some(tail) = line.single_default_tail {
+                    Self::w_timestamp_view(writer, line)?;
+                    writer.write_all(b" ")?;
+                    writer.write_all(tail)?;
+                    writer.write_all(b"\n")?;
+                    return Ok(());
+                }
+            }
+            FastFormat::None => {}
+        }
+
+        for token in format {
+            match token {
+                FormatToken::Literal(bytes) => writer.write_all(bytes)?,
+                FormatToken::ClientServerShort => {
+                    Self::w_client_server_short_view(
+                        writer, server, &line.addr,
+                    )?;
+                }
+                FormatToken::ServerName => {
+                    writer.write_all(name.unwrap_or("-").as_bytes())?;
+                }
+                FormatToken::ServerAddress => write!(writer, "{server}")?,
+                FormatToken::ServerHost => {
+                    writer.write_all(server.get_host().as_bytes())?;
+                }
+                FormatToken::ServerPort => {
+                    Self::w_server_port(writer, server)?;
+                }
+                FormatToken::ClientAddress => {
+                    Self::w_client_address_view(writer, &line.addr)?;
+                }
+                FormatToken::ClientHost => {
+                    Self::w_client_host_view(writer, &line.addr)?;
+                }
+                FormatToken::ClientPort => {
+                    Self::w_client_port_view(writer, &line.addr)?;
+                }
+                FormatToken::Timestamp => {
+                    Self::w_timestamp_view(writer, line)?;
+                }
+                FormatToken::Database => {
+                    Self::w_uint_bytes(writer, line.db)?;
+                }
+                FormatToken::Command => {
+                    writer.write_all(line.cmd.as_bytes())?;
+                }
+                FormatToken::Arguments => writer
+                    .write_all(String::from_utf8_lossy(line.args).as_bytes())?,
+                FormatToken::FullLine => {
+                    writer.write_all(b"\"")?;
+                    writer.write_all(line.cmd.as_bytes())?;
+                    writer.write_all(b"\" ")?;
+                    writer.write_all(line.args)?;
+                }
+            }
+        }
+
+        self.writer.write_all(b"\n")?;
+        Ok(())
     }
 
     fn w_client_server_short(
@@ -331,6 +448,152 @@ impl<W: Write> PlainWriter<W> {
         write!(writer, "{server} {client}")?;
 
         Ok(())
+    }
+
+    fn w_client_server_short_view(
+        writer: &mut W,
+        server: &ServerAddr,
+        client: &ClientAddrView<'_>,
+    ) -> Result<()> {
+        if let ServerAddr::Tcp(_, server_port, Some(server_ip)) = server
+            && let ClientAddrView::Tcp {
+                port,
+                ip: Some(client_ip),
+                ..
+            } = client
+            && server_ip == client_ip
+        {
+            write!(writer, "{server_port} ")?;
+            Self::w_uint_bytes(writer, port)?;
+            return Ok(());
+        }
+
+        write!(writer, "{server} ")?;
+        Self::w_client_address_view(writer, client)
+    }
+
+    fn w_client_address_view(
+        writer: &mut W,
+        client: &ClientAddrView<'_>,
+    ) -> Result<()> {
+        match client {
+            ClientAddrView::Path(path) => writer.write_all(path.as_bytes())?,
+            ClientAddrView::Tcp {
+                host,
+                port,
+                ip,
+                bracketed,
+            } => {
+                if *bracketed {
+                    if let Some(ip) = ip {
+                        write!(writer, "{ip}")?;
+                    } else {
+                        writer.write_all(host)?;
+                    }
+                } else {
+                    Self::w_ipv4_host(writer, host)?;
+                }
+                writer.write_all(b":")?;
+                Self::w_uint_bytes(writer, port)?;
+            }
+            ClientAddrView::Lua => writer.write_all(b"lua")?,
+            ClientAddrView::Unknown => writer.write_all(b"-")?,
+        }
+        Ok(())
+    }
+
+    fn w_client_host_view(
+        writer: &mut W,
+        client: &ClientAddrView<'_>,
+    ) -> Result<()> {
+        match client {
+            ClientAddrView::Tcp {
+                host,
+                ip,
+                bracketed,
+                ..
+            } => {
+                if *bracketed {
+                    if let Some(ip) = ip {
+                        write!(writer, "{ip}")?;
+                    } else {
+                        writer.write_all(host)?;
+                    }
+                } else {
+                    Self::w_ipv4_host(writer, host)?;
+                }
+            }
+            ClientAddrView::Path(_)
+            | ClientAddrView::Lua
+            | ClientAddrView::Unknown => writer.write_all(b"-")?,
+        }
+        Ok(())
+    }
+
+    fn w_client_port_view(
+        writer: &mut W,
+        client: &ClientAddrView<'_>,
+    ) -> Result<()> {
+        match client {
+            ClientAddrView::Tcp { port, .. } => {
+                Self::w_uint_bytes(writer, port)?;
+            }
+            ClientAddrView::Path(path) => writer.write_all(
+                path.rsplit('/')
+                    .next()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("-")
+                    .as_bytes(),
+            )?,
+            ClientAddrView::Lua => writer.write_all(b"lua")?,
+            ClientAddrView::Unknown => writer.write_all(b"-")?,
+        }
+        Ok(())
+    }
+
+    fn w_uint_bytes(writer: &mut W, bytes: &[u8]) -> Result<()> {
+        let first_nonzero = bytes
+            .iter()
+            .position(|byte| *byte != b'0')
+            .unwrap_or_else(|| bytes.len().saturating_sub(1));
+        writer.write_all(&bytes[first_nonzero..])?;
+        Ok(())
+    }
+
+    fn w_ipv4_host(writer: &mut W, host: &[u8]) -> Result<()> {
+        let mut octets = host.split(|byte| *byte == b'.').peekable();
+        while let Some(octet) = octets.next() {
+            Self::w_uint_bytes(writer, octet)?;
+            if octets.peek().is_some() {
+                writer.write_all(b".")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn w_timestamp(writer: &mut W, timestamp: &[u8]) -> Result<()> {
+        let Some(dot) = timestamp.iter().position(|byte| *byte == b'.') else {
+            writer.write_all(timestamp)?;
+            return Ok(());
+        };
+        let (integer, fraction_with_dot) = timestamp.split_at(dot);
+        let fraction = &fraction_with_dot[1..];
+        Self::w_uint_bytes(writer, integer)?;
+
+        if let Some(last_nonzero) = fraction.iter().rposition(|b| *b != b'0') {
+            writer.write_all(b".")?;
+            writer.write_all(&fraction[..=last_nonzero])?;
+        }
+        Ok(())
+    }
+
+    fn w_timestamp_view(writer: &mut W, line: &LineView<'_>) -> Result<()> {
+        if let Some(timestamp) = line.typed_timestamp {
+            write!(writer, "{timestamp}")?;
+            Ok(())
+        } else {
+            Self::w_timestamp(writer, line.timestamp)
+        }
     }
 
     fn w_server_port(writer: &mut W, server: &ServerAddr) -> Result<()> {
@@ -370,11 +633,34 @@ impl<W: Write> PlainWriter<W> {
     }
 
     fn new(writer: W, format: &str) -> Self {
+        let (format, parse_plan) = Self::compile_format(format);
+        let fast_format = match format.as_slice() {
+            [FormatToken::FullLine] => FastFormat::FullLine,
+            [
+                FormatToken::Timestamp,
+                FormatToken::Literal(first),
+                FormatToken::Database,
+                FormatToken::Literal(second),
+                FormatToken::ClientAddress,
+                FormatToken::Literal(third),
+                FormatToken::FullLine,
+            ] if first == b" [" && second == b" " && third == b"] " => {
+                FastFormat::DefaultSingle
+            }
+            _ => FastFormat::None,
+        };
         Self {
             writer,
-            format: Self::compile_format(format),
+            format,
+            parse_plan,
+            fast_format,
         }
     }
+}
+
+fn invalid_line(input: &[u8], error: impl std::fmt::Display) -> anyhow::Error {
+    let line = String::from_utf8_lossy(input);
+    anyhow!("Failed to parse line '{line}' ({error})")
 }
 
 impl<W: Write> OutputHandler for CsvWriter<W> {
@@ -484,6 +770,18 @@ mod tests {
         String::from_utf8(output).unwrap()
     }
 
+    fn render_raw(
+        format: &str,
+        server: &ServerAddr,
+        name: Option<&str>,
+        input: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut output = Vec::new();
+        PlainWriter::new(&mut output, format)
+            .write_raw_line(server, name, input)?;
+        Ok(output)
+    }
+
     fn ip(address: &str) -> IpAddr {
         address.parse().unwrap()
     }
@@ -559,20 +857,162 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "manual optimized-build throughput benchmark"]
-    fn benchmark_default_multi_source_format() {
+    fn byte_view_matches_typed_output_for_every_format_token() {
+        let input =
+            br#"1783484211.311904 [3 127.0.0.1:49152] "SET" "key" "value""#;
+        let (_, line) = Line::from_line_bytes(input, false).unwrap();
         let server = ServerAddr::from_tcp_addr("127.0.0.1", 6379);
-        let line = Line::new(
-            1_783_484_211.311_904,
-            0,
-            ClientAddr::from_addr(ip("127.0.0.1"), 49152),
-            "GET",
-            LineArgs::Raw(b"\"benchmark-key\""),
+        let formats = [
+            "literal",
+            "%%",
+            "%S",
+            "%sa",
+            "%sh",
+            "%sp",
+            "%sn",
+            "%ca",
+            "%ch",
+            "%cp",
+            "%t",
+            "%d",
+            "%C",
+            "%a",
+            "%l",
+            "%t [%d %ca] %l",
+            "%t [%S %d] %l",
+        ];
+
+        for format in formats {
+            let mut expected = Vec::new();
+            PlainWriter::new(&mut expected, format)
+                .write_line(&server, Some("primary"), &line)
+                .unwrap();
+            assert_eq!(
+                render_raw(format, &server, Some("primary"), input).unwrap(),
+                expected,
+                "format {format}"
+            );
+        }
+    }
+
+    #[test]
+    fn byte_view_matches_typed_client_address_variants() {
+        let server = ServerAddr::from_tcp_addr("2001:db8::1", 6379);
+        let inputs: &[&[u8]] = &[
+            br#"1783484211.311904 [0 [2001:0db8:0:0:0:0:0:1]:49152] "PING""#,
+            br#"1783484211.311904 [0 unix:/run/redis/client.sock] "PING""#,
+            br#"1783484211.311904 [0 lua] "PING""#,
+            br#"1783484211.311904 [0 ] "PING""#,
+        ];
+
+        for input in inputs {
+            let (_, line) = Line::from_line_bytes(input, false).unwrap();
+            let mut expected = Vec::new();
+            PlainWriter::new(&mut expected, "%S|%ca|%ch|%cp")
+                .write_line(&server, None, &line)
+                .unwrap();
+            assert_eq!(
+                render_raw("%S|%ca|%ch|%cp", &server, None, input).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn byte_view_matches_typed_numeric_canonicalization() {
+        let input = br#"0000000001.230000 [0003 001.002.003.004:00005] "PING""#;
+        let server = ServerAddr::from_tcp_addr("1.2.3.4", 6379);
+        let (_, line) = Line::from_line_bytes(input, false).unwrap();
+        let format = "%t|%d|%S|%ca|%ch|%cp";
+        let mut expected = Vec::new();
+        PlainWriter::new(&mut expected, format)
+            .write_line(&server, None, &line)
+            .unwrap();
+
+        assert_eq!(render_raw(format, &server, None, input).unwrap(), expected);
+
+        for input in [
+            &br#"0.10000000000000001 [0 1.2.3.4:5] "PING""#[..],
+            &br#"12345678901.123456 [0 1.2.3.4:5] "PING""#[..],
+        ] {
+            let (_, line) = Line::from_line_bytes(input, false).unwrap();
+            let mut expected = Vec::new();
+            PlainWriter::new(&mut expected, "%t")
+                .write_line(&server, None, &line)
+                .unwrap();
+            assert_eq!(
+                render_raw("%t", &server, None, input).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn byte_view_rejects_malformed_monitor_prefixes_before_writing() {
+        let server = ServerAddr::from_tcp_addr("127.0.0.1", 6379);
+        let malformed: &[&[u8]] = &[
+            b"",
+            br#"x.0 [0 127.0.0.1:1] "PING""#,
+            br#"18446744073709551616.0 [0 127.0.0.1:1] "PING""#,
+            br#"1.0 [18446744073709551616 127.0.0.1:1] "PING""#,
+            br#"1.0 [0 256.0.0.1:1] "PING""#,
+            br#"1.0 [0 127.0.0.1:65536] "PING""#,
+            br#"1.0 [0 [not-ip]:1] "PING""#,
+            br#"1.0 [0 127.0.0.1:1] "BAD-CMD""#,
+            b"1.0 [0 127.0.0.1:1] \"PING",
+        ];
+
+        for input in malformed {
+            let mut output = Vec::new();
+            let error = PlainWriter::new(&mut output, "%l")
+                .write_raw_line(&server, None, input)
+                .unwrap_err();
+            assert!(error.to_string().contains("Failed to parse line"));
+            assert!(output.is_empty());
+        }
+    }
+
+    #[test]
+    fn byte_view_preserves_raw_argument_validation_contract() {
+        let input = br#"1.0 [0 127.0.0.1:1] "SET" "unterminated"#;
+        let server = ServerAddr::from_tcp_addr("127.0.0.1", 6379);
+
+        assert_eq!(
+            render_raw("%l", &server, None, input).unwrap(),
+            b"\"SET\" \"unterminated\n"
         );
+    }
+
+    #[test]
+    #[ignore = "manual optimized-build throughput benchmark"]
+    fn benchmark_byte_view_default_multi_source_format() {
+        let server = ServerAddr::from_tcp_addr("127.0.0.1", 6379);
+        let line =
+            br#"1783484211.311904 [0 127.0.0.1:49152] "GET" "benchmark-key""#;
         let mut writer =
             PlainWriter::new(ByteCounter::default(), "%t [%S %d] %l");
 
         for _ in 0..10_000_000 {
+            writer
+                .write_raw_line(black_box(&server), None, black_box(line))
+                .unwrap();
+        }
+
+        black_box(writer.writer.0);
+    }
+
+    #[test]
+    #[ignore = "comparison baseline for the byte-view benchmark"]
+    fn benchmark_typed_default_multi_source_format() {
+        let server = ServerAddr::from_tcp_addr("127.0.0.1", 6379);
+        let input =
+            br#"1783484211.311904 [0 127.0.0.1:49152] "GET" "benchmark-key""#;
+        let mut writer =
+            PlainWriter::new(ByteCounter::default(), "%t [%S %d] %l");
+
+        for _ in 0..10_000_000 {
+            let (_, line) =
+                Line::from_line_bytes(black_box(input), false).unwrap();
             writer
                 .write_line(black_box(&server), None, black_box(&line))
                 .unwrap();

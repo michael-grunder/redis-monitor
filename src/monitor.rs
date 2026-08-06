@@ -55,6 +55,37 @@ pub struct Line<'a> {
     pub args: LineArgs<'a>,
 }
 
+#[derive(Debug, Copy, Clone, Default)]
+pub struct ParsePlan {
+    pub client_ip: bool,
+    pub timestamp: bool,
+}
+
+#[derive(Debug)]
+pub struct LineView<'a> {
+    pub timestamp: &'a [u8],
+    pub typed_timestamp: Option<f64>,
+    pub db: &'a [u8],
+    pub addr: ClientAddrView<'a>,
+    pub cmd: &'a str,
+    pub args: &'a [u8],
+    pub full_line: Option<&'a [u8]>,
+    pub single_default_tail: Option<&'a [u8]>,
+}
+
+#[derive(Debug)]
+pub enum ClientAddrView<'a> {
+    Path(&'a str),
+    Tcp {
+        host: &'a [u8],
+        port: &'a [u8],
+        ip: Option<IpAddr>,
+        bracketed: bool,
+    },
+    Lua,
+    Unknown,
+}
+
 #[derive(Debug)]
 pub enum ClientAddr<'a> {
     Path(&'a str),
@@ -110,6 +141,14 @@ fn digit1b(i: &[u8]) -> IResult<&[u8], &[u8]> {
 #[inline]
 fn parse_u64(i: &[u8]) -> IResult<&[u8], u64> {
     map_res(digit1b, lexical_core::parse::<u64>).parse(i)
+}
+
+#[inline]
+fn parse_u64_bytes(i: &[u8]) -> IResult<&[u8], &[u8]> {
+    map_res(digit1b, |digits| {
+        lexical_core::parse::<u64>(digits).map(|_| digits)
+    })
+    .parse(i)
 }
 
 #[inline]
@@ -494,6 +533,205 @@ impl<'a> Line<'a> {
             cmd,
             args,
         }
+    }
+}
+
+impl<'a> LineView<'a> {
+    fn is_canonical_uint(bytes: &[u8]) -> bool {
+        bytes.len() == 1 || bytes.first() != Some(&b'0')
+    }
+
+    fn is_canonical_client(client: &ClientAddrView<'_>) -> bool {
+        match client {
+            ClientAddrView::Tcp {
+                host,
+                port,
+                bracketed: false,
+                ..
+            } => {
+                host.split(|byte| *byte == b'.')
+                    .all(Self::is_canonical_uint)
+                    && Self::is_canonical_uint(port)
+            }
+            ClientAddrView::Lua => true,
+            ClientAddrView::Path(_)
+            | ClientAddrView::Tcp {
+                bracketed: true, ..
+            }
+            | ClientAddrView::Unknown => false,
+        }
+    }
+
+    fn parse_timestamp(
+        input: &'a [u8],
+        plan: ParsePlan,
+    ) -> IResult<&'a [u8], (&'a [u8], Option<f64>)> {
+        let start = input;
+        let (input, integer) = parse_u64_bytes(input)?;
+        let (input, _) = tag(".")(input)?;
+        let (input, fraction) = parse_u64_bytes(input)?;
+        let consumed = start.len() - input.len();
+        let timestamp = &start[..consumed];
+        let typed =
+            if plan.timestamp && (integer.len() > 10 || fraction.len() != 6) {
+                Some(parse_f64(start)?.1)
+            } else {
+                None
+            };
+        Ok((input, (timestamp, typed)))
+    }
+
+    fn parse_port(input: &'a [u8]) -> IResult<&'a [u8], &'a [u8]> {
+        map_res(digit1b, |digits| {
+            lexical_core::parse::<u16>(digits).map(|_| digits)
+        })
+        .parse(input)
+    }
+
+    fn parse_ipv4(
+        input: &'a [u8],
+        plan: ParsePlan,
+    ) -> IResult<&'a [u8], ClientAddrView<'a>> {
+        let host_start = input;
+        let (input, a) =
+            map_res(digit1b, lexical_core::parse::<u8>).parse(input)?;
+        let (input, _) = tag(".")(input)?;
+        let (input, b) =
+            map_res(digit1b, lexical_core::parse::<u8>).parse(input)?;
+        let (input, _) = tag(".")(input)?;
+        let (input, c) =
+            map_res(digit1b, lexical_core::parse::<u8>).parse(input)?;
+        let (input, _) = tag(".")(input)?;
+        let (input, d) =
+            map_res(digit1b, lexical_core::parse::<u8>).parse(input)?;
+        let host_len = host_start.len() - input.len();
+        let host = &host_start[..host_len];
+        let (input, _) = tag(":")(input)?;
+        let (input, port) = Self::parse_port(input)?;
+        let ip = plan
+            .client_ip
+            .then(|| IpAddr::V4(Ipv4Addr::new(a, b, c, d)));
+
+        Ok((
+            input,
+            ClientAddrView::Tcp {
+                host,
+                port,
+                ip,
+                bracketed: false,
+            },
+        ))
+    }
+
+    fn parse_ipv6(input: &'a [u8]) -> IResult<&'a [u8], ClientAddrView<'a>> {
+        let (input, _) = tag("[")(input)?;
+        let (input, host) = take_until("]")(input)?;
+        let (input, _) = tag("]")(input)?;
+        let (input, _) = tag(":")(input)?;
+        let (input, port) = Self::parse_port(input)?;
+        let host_str = std::str::from_utf8(host).map_err(|_| {
+            Err::Error(ParseError::from_error_kind(input, ErrorKind::Tag))
+        })?;
+        let ip = host_str.parse().map_err(|_| {
+            Err::Error(ParseError::from_error_kind(input, ErrorKind::Tag))
+        })?;
+
+        Ok((
+            input,
+            ClientAddrView::Tcp {
+                host,
+                port,
+                ip: Some(ip),
+                bracketed: true,
+            },
+        ))
+    }
+
+    fn parse_client(
+        input: &'a [u8],
+        plan: ParsePlan,
+    ) -> IResult<&'a [u8], ClientAddrView<'a>> {
+        if let Ok((input, path)) = Line::parse_unix(input) {
+            Ok((input, ClientAddrView::Path(path)))
+        } else if let Ok(result) = Self::parse_ipv4(input, plan) {
+            Ok(result)
+        } else if let Ok(result) = Self::parse_ipv6(input) {
+            Ok(result)
+        } else if let Ok((input, ())) = Line::parse_lua(input) {
+            Ok((input, ClientAddrView::Lua))
+        } else if let Ok((input, _)) = Line::parse_unknown(input) {
+            Ok((input, ClientAddrView::Unknown))
+        } else {
+            Err(Err::Error(ParseError::from_error_kind(
+                input,
+                ErrorKind::Tag,
+            )))
+        }
+    }
+
+    fn parse_source(
+        input: &'a [u8],
+        plan: ParsePlan,
+    ) -> IResult<&'a [u8], (&'a [u8], ClientAddrView<'a>, bool)> {
+        let (input, _) = tag("[")(input)?;
+        let (input, db) = parse_u64_bytes(input)?;
+        let before_space = input;
+        let (input, _) = space0b(input)?;
+        let canonical_space = before_space.len() - input.len() == 1
+            && before_space.first() == Some(&b' ');
+        let (input, addr) = Self::parse_client(input, plan)?;
+        let (input, _) = tag("]")(input)?;
+        let canonical = canonical_space
+            && Self::is_canonical_uint(db)
+            && Self::is_canonical_client(&addr);
+        Ok((input, (db, addr, canonical)))
+    }
+
+    pub fn from_line_bytes(
+        input: &'a [u8],
+        plan: ParsePlan,
+    ) -> IResult<&'a [u8], Self> {
+        let (input, (timestamp, typed_timestamp)) =
+            Self::parse_timestamp(input, plan)?;
+        let before_source_space = input;
+        let (input, _) = space0b(input)?;
+        let canonical_source_space = before_source_space.len() - input.len()
+            == 1
+            && before_source_space.first() == Some(&b' ');
+        let source_start = input;
+        let (input, (db, addr, canonical_source)) =
+            Self::parse_source(input, plan)?;
+        let before_command_space = input;
+        let (input, _) = space0b(input)?;
+        let canonical_command_space = before_command_space.len() - input.len()
+            == 1
+            && before_command_space.first() == Some(&b' ');
+        let full_line_start = input;
+        let (input, cmd) = Line::parse_quoted_ascii_cmd(input)?;
+        let before_args_space = input;
+        let (args, _) = space0b(input)?;
+        let canonical_args_space = before_args_space.len() - args.len() == 1
+            && before_args_space.first() == Some(&b' ');
+        let full_line = canonical_args_space.then_some(full_line_start);
+        let single_default_tail = (canonical_source_space
+            && canonical_source
+            && canonical_command_space
+            && canonical_args_space)
+            .then_some(source_start);
+
+        Ok((
+            args,
+            Self {
+                timestamp,
+                typed_timestamp,
+                db,
+                addr,
+                cmd,
+                args,
+                full_line,
+                single_default_tail,
+            },
+        ))
     }
 }
 
