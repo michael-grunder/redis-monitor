@@ -1,7 +1,7 @@
 # Performance opportunities
 
-Date: 2026-08-06  
-Revision reviewed: `c613143`  
+Date: 2026-08-06
+Revision reviewed: `c613143`
 Build profiled: `cargo build --release`
 
 This report ranks opportunities by expected benefit relative to implementation
@@ -37,39 +37,12 @@ wall-clock results should be treated as directional. The `perf` and allocation
 profiles were consistent across the single-source, two-source, and cluster
 workloads.
 
-## 1. Remove the per-record allocation in the default multi-instance format
-
-**Estimated improvement:** 5-15% more plain-output throughput for the default
-multi-instance format, with roughly two allocation calls removed per record.  
-**Implementation lift:** Small; approximately half a day including focused
-tests and a benchmark.  
-**Confidence:** High.
-
-`PlainWriter::w_client_server_short` compares a server host string with
-`chost.to_string()` for every `%S` token. Formatting an `Ipv4Addr` into a fresh
-`String` is especially costly because `%S` is the default when more than one
-instance is monitored.
-
-Heaptrack recorded only 2,133 allocation calls while processing 100,000
-single-instance records, but 405,017 calls while processing 200,000 records in
-the two-instance default format. It attributed 400,031 calls to growing the
-temporary string used to format the IPv4 address. The multi-instance `perf`
-profile also showed IPv4 formatting and `String` growth in this path.
-
-**Proposed change:** Normalize the server address once during cold setup. Store
-an optional parsed `IpAddr` (or an equivalent precomputed comparison key) next
-to the server display metadata, then compare `IpAddr` values directly. Keep the
-original host string for display and for hostnames that cannot be normalized.
-Also write the selected server/client port values directly without constructing
-temporary strings. Add cases for IPv4, IPv6, hostnames, Unix sockets, and
-different server/client hosts.
-
-## 2. Await full output queues instead of polling with `try_send` and yielding
+## 1. Await full output queues instead of polling with `try_send` and yielding
 
 **Estimated improvement:** 3-15% more throughput when output is saturated,
 with a larger reduction in producer CPU use and scheduler churn. Little change
-is expected when the queue never fills.  
-**Implementation lift:** Small; approximately half to one day.  
+is expected when the queue never fills.
+**Implementation lift:** Small; approximately half to one day.
 **Confidence:** High that CPU use improves; medium for the throughput estimate.
 
 Both `run_wire` and `run_stdin` retry `flume::Sender::try_send` in a loop and
@@ -86,11 +59,11 @@ slow-writer test should prove that no records are dropped, shutdown completes,
 and the producer does not spin. Benchmark both a `/dev/null` sink and a
 rate-limited pipe.
 
-## 3. Compile a byte-oriented parse plan for plain output
+## 2. Compile a byte-oriented parse plan for plain output
 
 **Estimated improvement:** 15-30% more plain-output throughput, depending on
-the selected format; likely largest for the single-instance default format.  
-**Implementation lift:** Medium; approximately two to four days.  
+the selected format; likely largest for the single-instance default format.
+**Implementation lift:** Medium; approximately two to four days.
 **Confidence:** Medium-high.
 
 Every accepted record is fully converted into `Line`: the timestamp is parsed
@@ -112,12 +85,12 @@ This must retain malformed-input validation and the current output contract,
 including escaping and spacing. Regression tests should compare every format
 token against the existing implementation before the old path is removed.
 
-## 4. Batch records and collapse the two queue handoffs
+## 3. Batch records and collapse the two queue handoffs
 
 **Estimated improvement:** 20-40% higher saturation throughput for short
 records and many producers, plus substantially fewer queue operations and
-reference-count updates.  
-**Implementation lift:** Large; approximately three to six days.  
+reference-count updates.
+**Implementation lift:** Large; approximately three to six days.
 **Confidence:** High that this is a major cost; medium for the gain until a
 prototype is measured.
 
@@ -145,12 +118,12 @@ before retaining a chunk and released after output. Keep a smaller item bound
 as a secondary guard. Tests must cover per-source ordering, cross-source
 behavior, oversized single frames, a slow writer, disconnect, and shutdown.
 
-## 5. Remove avoidable structured-output collections and address strings
+## 4. Remove avoidable structured-output collections and address strings
 
 **Estimated improvement:** 10-25% for JSON/CSV/PHP and 5-15% for RESP, with
-roughly two to four fewer allocations per common record.  
+roughly two to four fewer allocations per common record.
 **Implementation lift:** Medium; approximately two to four days in incremental
-steps.  
+steps.
 **Confidence:** High for allocation reduction, medium for elapsed-time gain.
 
 Structured output materializes a `Vec<Cow<[u8]>>` in `parse_escaped_args`.
@@ -180,13 +153,13 @@ a small inline vector of byte ranges with owned storage only for escaped
 arguments). Preserve the rule that malformed input is rejected before a partial
 record is committed to output.
 
-## 6. Remove the two-core ceiling for many-instance workloads
+## 5. Remove the two-core ceiling for many-instance workloads
 
 **Estimated improvement:** A 1.5-3x higher processing ceiling with many busy
 instances when parsing/filtering is the bottleneck; little gain when the final
-sink alone is saturated.  
+sink alone is saturated.
 **Implementation lift:** Large; approximately four to eight days after the
-queue and parsing work above.  
+queue and parsing work above.
 **Confidence:** High for the current ceiling, medium for the gain.
 
 The binary uses `#[tokio::main(flavor = "current_thread")]`, so all connections,
@@ -207,12 +180,12 @@ Measure with 1, 3, and 21 active sources, accept-most and reject-most filters,
 and both plain and JSON output. Preserve per-source ordering and document the
 cross-source ordering guarantee.
 
-## 7. Stop cloning every stdin record
+## 6. Stop cloning every stdin record
 
 **Estimated improvement:** 10-25% more stdin replay throughput and materially
-lower allocation pressure/peak retained memory.  
+lower allocation pressure/peak retained memory.
 **Implementation lift:** Medium; approximately one to two days, or smaller if
-implemented with the batch framing work.  
+implemented with the batch framing work.
 **Confidence:** High.
 
 `run_from_reader` reuses a `Vec` for reading but calls `buf.clone()` for every
@@ -227,11 +200,11 @@ Strip the optional leading `+` by slicing, never shifting the payload. Apply the
 same byte-budgeted backpressure used by network producers so replaying the 3.3
 MB fixture cannot multiply retained memory unexpectedly.
 
-## 8. Amortize optional statistics work
+## 7. Amortize optional statistics work
 
 **Estimated improvement:** 5-15% in `--stats` mode; negligible when statistics
-are disabled.  
-**Implementation lift:** Small to medium; approximately one to two days.  
+are disabled.
+**Implementation lift:** Small to medium; approximately one to two days.
 **Confidence:** Medium.
 
 With statistics enabled, the central loop scans the command again, hashes it,
@@ -246,11 +219,11 @@ maximum report delay remains bounded. Keep command counters local to ingest
 shards if parallel ingestion is introduced, then merge only at report time.
 Include stats accuracy and interval-boundary tests.
 
-## 9. Make output flush policy byte/time based
+## 8. Make output flush policy byte/time based
 
 **Estimated improvement:** 3-10% at sparse-to-medium rates or when records arrive
-one at a time; minimal change during full 1,024-record drains.  
-**Implementation lift:** Small to medium; approximately one to two days.  
+one at a time; minimal change during full 1,024-record drains.
+**Implementation lift:** Small to medium; approximately one to two days.
 **Confidence:** Medium-low until tested with a pipe or terminal sink.
 
 The output thread flushes after every receive/drain iteration. At saturation the
@@ -267,11 +240,11 @@ deterministic writer test.
 
 ## Suggested implementation order
 
-Implement findings 1 and 2 as isolated quick wins. Prototype finding 3 next,
-because it reduces work without changing concurrency. Findings 4 and 5 then
+Implement findings 1 as an isolated quick win. Prototype finding 2 next,
+because it reduces work without changing concurrency. Findings 3 and 4 then
 address the dominant queue and structured-output costs. Re-profile before
-undertaking finding 6: the earlier changes will determine whether ingest,
-formatting, or the sink is the remaining scaling limit. Findings 7-9 can be
+undertaking finding 5: the earlier changes will determine whether ingest,
+formatting, or the sink is the remaining scaling limit. Findings 6-8 can be
 scheduled by feature priority and can share the batching infrastructure.
 
 For every hot-path change, retain a release-mode replay benchmark plus an
