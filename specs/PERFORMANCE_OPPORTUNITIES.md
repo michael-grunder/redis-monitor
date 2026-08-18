@@ -37,63 +37,7 @@ wall-clock results should be treated as directional. The `perf` and allocation
 profiles were consistent across the single-source, two-source, and cluster
 workloads.
 
-## 1. Batch records and collapse the two queue handoffs
-
-**Status:** Implemented on 2026-08-17. Producers now send byte/count/deadline
-bounded batches directly to the output queue, with source metadata once per
-batch and line ranges into shared chunks. A shared 64 MiB permit budget bounds
-retained batch data; `--no-batch` restores per-record handoff for minimum
-latency.
-
-**Estimated improvement:** 20-40% higher saturation throughput for short
-records and many producers, plus substantially fewer queue operations and
-reference-count updates.
-**Implementation lift:** Large; approximately three to six days.
-**Confidence:** High that this is a major cost; medium for the gain until a
-prototype is measured.
-
-Each wire record currently travels through a Tokio MPSC channel and then a
-flume channel before reaching the writer. In the single-source live profile,
-self time in flume send/receive, its contended mutex, Tokio MPSC send/receive,
-and semaphore operations totaled roughly one third of sampled cycles.
-`BytesMut::split_to` plus shared-buffer clone/drop operations consumed another
-8%. Every message also clones the server and name `Arc`s.
-
-The bounds are expressed in records (16,384 plus 65,536), not bytes. That gives
-predictable item counts but not predictable memory: the replay contains a 3.3
-MB record, and a malicious or accidental stream of very large records can make
-the nominally bounded queues retain an impractical amount of memory.
-
-**Proposed change:** Let each monitor producer accumulate a small batch bounded
-by record count, total bytes, and a short latency deadline. Send source metadata
-once per batch, and represent records as ranges into one shared input chunk
-where practical. Route batches directly to the output queue unless the central
-task has a demonstrated ordering responsibility that cannot move into batch
-metadata.
-
-Backpressure should be governed by a global byte budget, using permits acquired
-before retaining a chunk and released after output. Keep a smaller item bound
-as a secondary guard. Tests must cover per-source ordering, cross-source
-behavior, oversized single frames, a slow writer, disconnect, and shutdown.
-
-An optimized stdin replay of the 69,827-record, 45,376,940-byte `monitor.log`
-fixture improved from 159.0 ms (439k records/s, 285 MB/s) to 132.8 ms (526k
-records/s, 342 MB/s), an approximately 20% throughput increase. Eight runs
-after two warmups used `hyperfine`, the portable release profile, `/dev/null`
-output, Linux 6.1, and a dual-socket Xeon Platinum 8160. The new `--no-batch`
-mode measured 158.8 ms. This replay validates the queue/framing change but does
-not replace a live many-producer saturation test.
-
-A four-source loopback stress run supplied 200,000 GET/SET records per source
-with 25 clients and pipeline depth 16. Both batched trials had consumed all
-800,000 records after the producers completed plus a 500 ms drain interval,
-with zero backpressure stalls. `--no-batch` had consumed 407,160 and 418,182
-records at the same point and reported roughly 339,000 stalls; a follow-up with
-a three-second drain consumed all 800,000 records, confirming lag rather than
-intentional dropping. This was a saturation/backpressure check rather than a
-latency benchmark.
-
-## 2. Remove avoidable structured-output collections and address strings
+## 1. Remove avoidable structured-output collections and address strings
 
 **Estimated improvement:** 10-25% for JSON/CSV/PHP and 5-15% for RESP, with
 roughly two to four fewer allocations per common record.
@@ -109,11 +53,11 @@ into `ByteBuf`s.
 
 On the replay workload, heaptrack measured:
 
-| Mode | Allocation calls | Calls/record |
-| --- | ---: | ---: |
-| Plain | 76,998 | 1.10 |
-| RESP | 257,929 | 3.69 |
-| JSON | 467,365 | 6.69 |
+| Mode  | Allocation calls | Calls/record |
+| ---   |             ---: |         ---: |
+| Plain |           76,998 |         1.10 |
+| RESP  |          257,929 |         3.69 |
+| JSON  |          467,365 |         6.69 |
 
 The plain count includes stdin ownership, so the difference is the useful
 comparison. Heaptrack identified repeated `RawVec` growth in
@@ -128,7 +72,7 @@ a small inline vector of byte ranges with owned storage only for escaped
 arguments). Preserve the rule that malformed input is rejected before a partial
 record is committed to output.
 
-## 3. Remove the two-core ceiling for many-instance workloads
+## 2. Remove the two-core ceiling for many-instance workloads
 
 **Estimated improvement:** A 1.5-3x higher processing ceiling with many busy
 instances when parsing/filtering is the bottleneck; little gain when the final
@@ -155,7 +99,7 @@ Measure with 1, 3, and 21 active sources, accept-most and reject-most filters,
 and both plain and JSON output. Preserve per-source ordering and document the
 cross-source ordering guarantee.
 
-## 4. Stop cloning every stdin record
+## 3. Stop cloning every stdin record
 
 **Estimated improvement:** 10-25% more stdin replay throughput and materially
 lower allocation pressure/peak retained memory.
@@ -175,7 +119,7 @@ Strip the optional leading `+` by slicing, never shifting the payload. Apply the
 same byte-budgeted backpressure used by network producers so replaying the 3.3
 MB fixture cannot multiply retained memory unexpectedly.
 
-## 5. Amortize optional statistics work
+## 4. Amortize optional statistics work
 
 **Estimated improvement:** 5-15% in `--stats` mode; negligible when statistics
 are disabled.
@@ -194,7 +138,7 @@ maximum report delay remains bounded. Keep command counters local to ingest
 shards if parallel ingestion is introduced, then merge only at report time.
 Include stats accuracy and interval-boundary tests.
 
-## 6. Make output flush policy byte/time based
+## 5. Make output flush policy byte/time based
 
 **Estimated improvement:** 3-10% at sparse-to-medium rates or when records arrive
 one at a time; minimal change during full 1,024-record drains.
