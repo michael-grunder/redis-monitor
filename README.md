@@ -75,6 +75,8 @@ Options:
           
       --stdin
           Read from stdin instead of connecting to servers
+      --no-batch
+          Disable producer batching for the lowest output latency
       --debug
           Output debug information such as detailed filter info
   -h, --help
@@ -103,6 +105,19 @@ Structured outputs (`json`, `php`, `csv`, and `resp`) parse MONITOR arguments as
 strings and preserve quoted argument content, including JSON-like values,
 serialized PHP values, and literal backslash sequences.
 Standalone `OK` replies from entering MONITOR mode are ignored.
+
+By default, each source batches up to 64 records or 256 KiB for at most 5 ms
+before handing them directly to the output thread. Queued and producer-held
+batches share a 64 MiB byte budget, with a bounded batch count as a secondary
+guard. This preserves every accepted record and applies backpressure instead of
+dropping data when output is slow. A record larger than the byte budget is
+allowed through while temporarily consuming the full budget.
+
+Records from an individual source retain their original order. With multiple
+sources, each source's batches are atomic at the output queue, but there is no
+total ordering guarantee between sources. Use `--no-batch` to hand off each
+accepted record individually when minimum output latency is more important than
+throughput under load.
 
 Examples:
   # Monitor localhost:6379 by default

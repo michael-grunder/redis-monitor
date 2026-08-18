@@ -39,6 +39,12 @@ workloads.
 
 ## 1. Batch records and collapse the two queue handoffs
 
+**Status:** Implemented on 2026-08-17. Producers now send byte/count/deadline
+bounded batches directly to the output queue, with source metadata once per
+batch and line ranges into shared chunks. A shared 64 MiB permit budget bounds
+retained batch data; `--no-batch` restores per-record handoff for minimum
+latency.
+
 **Estimated improvement:** 20-40% higher saturation throughput for short
 records and many producers, plus substantially fewer queue operations and
 reference-count updates.
@@ -69,6 +75,23 @@ Backpressure should be governed by a global byte budget, using permits acquired
 before retaining a chunk and released after output. Keep a smaller item bound
 as a secondary guard. Tests must cover per-source ordering, cross-source
 behavior, oversized single frames, a slow writer, disconnect, and shutdown.
+
+An optimized stdin replay of the 69,827-record, 45,376,940-byte `monitor.log`
+fixture improved from 159.0 ms (439k records/s, 285 MB/s) to 132.8 ms (526k
+records/s, 342 MB/s), an approximately 20% throughput increase. Eight runs
+after two warmups used `hyperfine`, the portable release profile, `/dev/null`
+output, Linux 6.1, and a dual-socket Xeon Platinum 8160. The new `--no-batch`
+mode measured 158.8 ms. This replay validates the queue/framing change but does
+not replace a live many-producer saturation test.
+
+A four-source loopback stress run supplied 200,000 GET/SET records per source
+with 25 clients and pipeline depth 16. Both batched trials had consumed all
+800,000 records after the producers completed plus a 500 ms drain interval,
+with zero backpressure stalls. `--no-batch` had consumed 407,160 and 418,182
+records at the same point and reported roughly 339,000 stalls; a follow-up with
+a three-second drain consumed all 800,000 records, confirming lag rather than
+intentional dropping. This was a saturation/backpressure check rather than a
+latency benchmark.
 
 ## 2. Remove avoidable structured-output collections and address strings
 

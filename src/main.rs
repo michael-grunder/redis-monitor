@@ -6,8 +6,8 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::{
-    collections::HashSet, convert::From, fmt, path::PathBuf, str::FromStr,
-    time::Instant,
+    collections::HashSet, convert::From, fmt, ops::Range, path::PathBuf,
+    str::FromStr, time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -17,7 +17,6 @@ use clap_complete::{Shell, generate};
 use colored::Color;
 use connection::{ServerAddr, TlsConfig};
 use filter::Filter;
-use futures::stream::FuturesUnordered;
 use output::OutputKind;
 use rand::{RngExt, rngs::ThreadRng};
 use redis::{
@@ -25,9 +24,10 @@ use redis::{
     RedisConnectionInfo, aio::ConnectionManager as RedisConnectionManager,
 };
 use tokio::{
-    io::{self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader},
-    sync::mpsc,
-    time::{Duration, sleep},
+    io::{self, AsyncRead, AsyncReadExt, BufReader},
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
+    task::JoinSet,
+    time::{Duration, sleep, sleep_until},
 };
 
 use crate::{
@@ -36,7 +36,6 @@ use crate::{
     connection::{Cluster, Monitor},
     filter::FilterPattern,
     output::OutputHandler,
-    stats::CommandStat,
 };
 
 mod commands;
@@ -163,6 +162,12 @@ struct Options {
 
     #[arg(
         long,
+        help = "Disable producer batching for the lowest output latency"
+    )]
+    no_batch: bool,
+
+    #[arg(
+        long,
         help = "Output debug information such as detailed filter info"
     )]
     debug: bool,
@@ -185,6 +190,12 @@ const GIT_DIRTY: &str = env!("GIT_DIRTY");
 
 const DEFAULT_SINGLE_FORMAT: &str = "%t [%d %ca] %l";
 const DEFAULT_MULTI_FORMAT: &str = "%t [%S %d] %l";
+const DEFAULT_BATCH_RECORDS: usize = 64;
+const DEFAULT_BATCH_BYTES: usize = 256 * 1024;
+const DEFAULT_BATCH_DELAY: Duration = Duration::from_millis(5);
+const OUTPUT_BYTE_BUDGET: usize = 64 * 1024 * 1024;
+const OUTPUT_BATCH_CAPACITY: usize = 1024;
+const OUTPUT_IMMEDIATE_CAPACITY: usize = 16_384;
 
 // Simple wrapper tat just eprintln!s with a [WARNING] prefix
 macro_rules !warn {
@@ -374,13 +385,43 @@ struct LineFilter {
     flags: commands::Filter,
 }
 
-#[derive(Debug)]
-struct MonitorMessage {
-    pub server: Arc<ServerAddr>,
-    pub name: Arc<Option<String>>,
+#[derive(Debug, Clone)]
+struct MonitorSource {
+    server: Arc<ServerAddr>,
+    name: Arc<Option<String>>,
     #[allow(dead_code)]
-    pub color: Option<Color>,
-    line: Bytes,
+    color: Option<Color>,
+}
+
+#[derive(Debug)]
+struct MonitorChunk {
+    data: Bytes,
+    lines: Vec<Range<usize>>,
+}
+
+#[derive(Debug)]
+struct MonitorBatch {
+    source: MonitorSource,
+    chunks: Vec<MonitorChunk>,
+    records: usize,
+    retained_bytes: usize,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+#[derive(Debug, Copy, Clone)]
+struct BatchConfig {
+    records: usize,
+    bytes: usize,
+    delay: Duration,
+}
+
+#[derive(Debug)]
+struct BatchSender {
+    io: IoHandle,
+    source: MonitorSource,
+    config: BatchConfig,
+    batch: Option<MonitorBatch>,
+    deadline: Option<tokio::time::Instant>,
 }
 
 type IoSender = flume::Sender<IoMessage>;
@@ -388,13 +429,14 @@ type IoSender = flume::Sender<IoMessage>;
 #[derive(Debug, Clone)]
 struct IoHandle {
     tx: IoSender,
+    budget: Arc<Semaphore>,
+    byte_budget: usize,
 }
 
 #[derive(Debug)]
 enum IoMessage {
     Preamble(Arc<[Monitor]>),
-    Stats(Vec<CommandStat>),
-    Message(MonitorMessage),
+    Batch(MonitorBatch),
     Shutdown,
 }
 
@@ -438,6 +480,176 @@ impl IoHandle {
         message: IoMessage,
     ) -> Result<(), flume::SendError<IoMessage>> {
         send_io_message(&self.tx, message, &IO_STATS).await
+    }
+
+    fn permit_count(&self, bytes: usize) -> u32 {
+        u32::try_from(bytes.min(self.byte_budget))
+            .expect("output byte budget must fit in u32")
+    }
+
+    fn try_reserve_bytes(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.budget)
+            .try_acquire_many_owned(self.permit_count(bytes))
+            .ok()
+    }
+
+    async fn reserve_bytes(&self, bytes: usize) -> OwnedSemaphorePermit {
+        Arc::clone(&self.budget)
+            .acquire_many_owned(self.permit_count(bytes))
+            .await
+            .expect("output byte-budget semaphore is never closed")
+    }
+}
+
+impl BatchConfig {
+    const fn new(enabled: bool) -> Self {
+        if enabled {
+            Self {
+                records: DEFAULT_BATCH_RECORDS,
+                bytes: DEFAULT_BATCH_BYTES,
+                delay: DEFAULT_BATCH_DELAY,
+            }
+        } else {
+            Self {
+                records: 1,
+                bytes: usize::MAX,
+                delay: Duration::ZERO,
+            }
+        }
+    }
+}
+
+impl MonitorBatch {
+    const fn new(source: MonitorSource) -> Self {
+        Self {
+            source,
+            chunks: Vec::new(),
+            records: 0,
+            retained_bytes: 0,
+            permit: None,
+        }
+    }
+
+    fn add_chunk(
+        &mut self,
+        data: Bytes,
+        lines: Vec<Range<usize>>,
+        permit: OwnedSemaphorePermit,
+    ) {
+        self.records += lines.len();
+        self.retained_bytes += data.len();
+        self.chunks.push(MonitorChunk { data, lines });
+
+        if let Some(current) = &mut self.permit {
+            current.merge(permit);
+        } else {
+            self.permit = Some(permit);
+        }
+    }
+
+    fn lines(&self) -> impl Iterator<Item = &[u8]> {
+        self.chunks.iter().flat_map(|chunk| {
+            chunk.lines.iter().map(|range| &chunk.data[range.clone()])
+        })
+    }
+}
+
+impl BatchSender {
+    const fn new(
+        io: IoHandle,
+        source: MonitorSource,
+        config: BatchConfig,
+    ) -> Self {
+        Self {
+            io,
+            source,
+            config,
+            batch: None,
+            deadline: None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.batch.as_ref().is_none_or(|batch| batch.records == 0)
+    }
+
+    fn remaining_records(&self) -> usize {
+        self.batch.as_ref().map_or(self.config.records, |batch| {
+            self.config.records.saturating_sub(batch.records)
+        })
+    }
+
+    fn remaining_bytes(&self) -> usize {
+        self.batch.as_ref().map_or(self.config.bytes, |batch| {
+            self.config.bytes.saturating_sub(batch.retained_bytes)
+        })
+    }
+
+    const fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadline
+    }
+
+    async fn reserve_chunk(
+        &mut self,
+        bytes: usize,
+    ) -> Result<OwnedSemaphorePermit, flume::SendError<IoMessage>> {
+        if let Some(permit) = self.io.try_reserve_bytes(bytes) {
+            return Ok(permit);
+        }
+
+        // Never wait for more byte-budget capacity while holding a partial
+        // batch: with many producers doing the same, that would deadlock.
+        self.flush().await?;
+        IO_STATS.stall();
+        Ok(self.io.reserve_bytes(bytes).await)
+    }
+
+    async fn add_chunk(
+        &mut self,
+        data: Bytes,
+        lines: Vec<Range<usize>>,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<(), flume::SendError<IoMessage>> {
+        debug_assert!(!lines.is_empty());
+
+        if !self.is_empty()
+            && (lines.len() > self.remaining_records()
+                || data.len() > self.remaining_bytes())
+        {
+            self.flush().await?;
+        }
+
+        let was_empty = self.is_empty();
+        self.batch
+            .get_or_insert_with(|| MonitorBatch::new(self.source.clone()))
+            .add_chunk(data, lines, permit);
+
+        if was_empty {
+            self.deadline =
+                Some(tokio::time::Instant::now() + self.config.delay);
+        }
+
+        let full = self.remaining_records() == 0
+            || self.remaining_bytes() == 0
+            || !self.config.delay.is_zero()
+                && self.deadline.is_some_and(|deadline| {
+                    deadline <= tokio::time::Instant::now()
+                });
+
+        if full || self.config.delay.is_zero() {
+            self.flush().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<(), flume::SendError<IoMessage>> {
+        self.deadline = None;
+        let Some(batch) = self.batch.take() else {
+            return Ok(());
+        };
+
+        self.io.send(IoMessage::Batch(batch)).await
     }
 }
 
@@ -567,18 +779,16 @@ impl LineFilter {
     }
 }
 
-impl MonitorMessage {
+impl MonitorSource {
     const fn new(
         server: Arc<ServerAddr>,
         name: Arc<Option<String>>,
         color: Option<Color>,
-        line: Bytes,
     ) -> Self {
         Self {
             server,
             name,
             color,
-            line,
         }
     }
 }
@@ -618,67 +828,257 @@ impl Backoff {
     }
 }
 
-async fn run_from_reader<R>(
-    name: &str,
-    mut reader: R,
-    tx: mpsc::Sender<MonitorMessage>,
-) where
-    R: AsyncBufRead + Unpin,
-{
-    let server = Arc::new(ServerAddr::from_path(name));
-    let name_arc = Arc::new(None::<String>);
+struct FrameScan {
+    end: usize,
+    lines: Vec<Range<usize>>,
+}
 
-    let mut buf = Vec::with_capacity(16 * 1024);
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum StreamExit {
+    End,
+    Shutdown,
+    OutputClosed,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum ReadEvent {
+    Data,
+    End,
+}
+
+fn scan_frames(
+    buf: &[u8],
+    filter: &LineFilter,
+    commands: Option<&commands::Lookup>,
+    stats: &mut LocalStats,
+    max_records: usize,
+    max_bytes: usize,
+) -> Option<FrameScan> {
+    let mut start = 0;
+    let mut records = 0;
+    let mut lines = Vec::new();
+
+    while records < max_records {
+        let Some(nl) = memchr::memchr(b'\n', &buf[start..])
+            .map(|relative| relative + start)
+        else {
+            break;
+        };
+        let wire_end = nl + 1;
+
+        if records > 0 && wire_end > max_bytes {
+            break;
+        }
+
+        let mut line_start = start;
+        let mut line_end = nl;
+        if line_end > line_start && buf[line_end - 1] == b'\r' {
+            line_end -= 1;
+        }
+        if line_start < line_end && buf[line_start] == b'+' {
+            line_start += 1;
+        }
+
+        stats.tick();
+        if filter.matches(commands, &buf[line_start..line_end]) {
+            lines.push(line_start..line_end);
+        } else {
+            stats.filtered();
+        }
+
+        start = wire_end;
+        records += 1;
+        if wire_end >= max_bytes {
+            break;
+        }
+    }
+
+    (records > 0).then_some(FrameScan { end: start, lines })
+}
+
+async fn drain_frames(
+    buf: &mut BytesMut,
+    filter: &LineFilter,
+    commands: Option<&commands::Lookup>,
+    stats: &mut LocalStats,
+    sender: &mut BatchSender,
+) -> Result<(), flume::SendError<IoMessage>> {
+    while let Some(first_nl) = memchr::memchr(b'\n', buf) {
+        let first_wire_len = first_nl + 1;
+        if !sender.is_empty()
+            && (sender.remaining_records() == 0
+                || first_wire_len > sender.remaining_bytes())
+        {
+            sender.flush().await?;
+        }
+
+        let Some(scan) = scan_frames(
+            buf,
+            filter,
+            commands,
+            stats,
+            sender.remaining_records(),
+            sender.remaining_bytes(),
+        ) else {
+            break;
+        };
+
+        if scan.lines.is_empty() {
+            let _ = buf.split_to(scan.end);
+            continue;
+        }
+
+        let permit = sender.reserve_chunk(scan.end).await?;
+        let data = buf.split_to(scan.end).freeze();
+        sender.add_chunk(data, scan.lines, permit).await?;
+    }
+
+    Ok(())
+}
+
+async fn consume_reader<R>(
+    mut reader: R,
+    filter: &LineFilter,
+    commands: Option<&commands::Lookup>,
+    stats: &mut LocalStats,
+    sender: &mut BatchSender,
+    shutdown: &mut watch::Receiver<bool>,
+    accept_trailing_frame: bool,
+) -> StreamExit
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = BytesMut::with_capacity(16 * 1024);
 
     loop {
-        buf.clear();
+        if drain_frames(&mut buf, filter, commands, stats, sender)
+            .await
+            .is_err()
+        {
+            return StreamExit::OutputClosed;
+        }
 
-        match reader.read_until(b'\n', &mut buf).await {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("{server} read error {e}");
-                break;
+        if *shutdown.borrow() {
+            let _ = sender.flush().await;
+            return StreamExit::Shutdown;
+        }
+
+        let read = async {
+            match reader.read_buf(&mut buf).await {
+                Ok(0) => ReadEvent::End,
+                Ok(_) => ReadEvent::Data,
+                Err(e) => {
+                    eprintln!("{} read error {e}", sender.source.server);
+                    ReadEvent::End
+                }
             }
-        }
+        };
 
-        while buf.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
-            buf.pop();
-        }
+        let outcome = if let Some(deadline) = sender.deadline() {
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        Some(StreamExit::Shutdown)
+                    } else {
+                        None
+                    }
+                }
+                () = sleep_until(deadline) => {
+                    if sender.flush().await.is_err() {
+                        Some(StreamExit::OutputClosed)
+                    } else {
+                        None
+                    }
+                }
+                read_event = read => match read_event {
+                    ReadEvent::Data => None,
+                    ReadEvent::End => Some(StreamExit::End),
+                },
+            }
+        } else {
+            tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        Some(StreamExit::Shutdown)
+                    } else {
+                        None
+                    }
+                }
+                read_event = read => match read_event {
+                    ReadEvent::Data => None,
+                    ReadEvent::End => Some(StreamExit::End),
+                },
+            }
+        };
 
-        if buf.first().is_some_and(|b| *b == b'+') {
-            buf.remove(0);
-        }
-
-        let line = Bytes::from(buf.clone());
-
-        let msg = MonitorMessage::new(
-            Arc::clone(&server),
-            Arc::clone(&name_arc),
-            None,
-            line,
-        );
-
-        if let Err(e) = tx.send(msg).await {
-            eprintln!("{server} tx.send failure: {e}");
-            break;
+        match outcome {
+            Some(StreamExit::End) => {
+                if accept_trailing_frame && !buf.is_empty() {
+                    buf.extend_from_slice(b"\n");
+                }
+                let _ = drain_frames(&mut buf, filter, commands, stats, sender)
+                    .await;
+                let _ = sender.flush().await;
+                return StreamExit::End;
+            }
+            Some(StreamExit::Shutdown) => {
+                let _ = sender.flush().await;
+                return StreamExit::Shutdown;
+            }
+            Some(StreamExit::OutputClosed) => {
+                return StreamExit::OutputClosed;
+            }
+            None => {}
         }
     }
 }
 
-async fn run_stdin_shim(tx: mpsc::Sender<MonitorMessage>) {
-    let stdin = io::stdin();
-    let reader = BufReader::new(stdin);
-    run_from_reader("stdin", reader, tx).await;
+async fn run_from_reader<R>(
+    name: &str,
+    reader: R,
+    io: IoHandle,
+    filter: LineFilter,
+    config: BatchConfig,
+    mut shutdown: watch::Receiver<bool>,
+) where
+    R: AsyncRead + Unpin,
+{
+    let source = MonitorSource::new(
+        Arc::new(ServerAddr::from_path(name)),
+        Arc::new(None),
+        None,
+    );
+    let mut sender = BatchSender::new(io, source, config);
+    let mut stats = LocalStats::new(1000);
+    let _ = consume_reader(
+        reader,
+        &filter,
+        None,
+        &mut stats,
+        &mut sender,
+        &mut shutdown,
+        true,
+    )
+    .await;
+    drop(sender);
+    stats.fold();
 }
 
 async fn run_monitor(
     mon: Monitor,
     filter: LineFilter,
-    tx: mpsc::Sender<MonitorMessage>,
+    io: IoHandle,
+    config: BatchConfig,
+    mut shutdown: watch::Receiver<bool>,
 ) {
-    let server = Arc::new(mon.address.clone());
-    let name = Arc::new(mon.name.clone());
+    let source = MonitorSource::new(
+        Arc::new(mon.address.clone()),
+        Arc::new(mon.name.clone()),
+        mon.color,
+    );
+    let mut sender = BatchSender::new(io, source, config);
     let mut backoff = Backoff::new();
     let mut stats = LocalStats::new(1000);
     let cmds = if filter.needs_cmds() {
@@ -688,67 +1088,51 @@ async fn run_monitor(
     };
 
     loop {
+        if *shutdown.borrow() {
+            break;
+        }
+
         match mon.clone().connect().await {
-            Ok((_, mut reader)) => {
+            Ok((_, reader)) => {
                 backoff.reset();
 
-                let mut buf = BytesMut::with_capacity(16 * 1024);
-
-                loop {
-                    while let Some(nl) = memchr::memchr(b'\n', &buf) {
-                        stats.tick();
-
-                        let mut line = buf.split_to(nl + 1).freeze();
-                        if line.ends_with(b"\n") {
-                            line.truncate(line.len() - 1);
-                        }
-                        if line.ends_with(b"\r") {
-                            line.truncate(line.len() - 1);
-                        }
-                        if line.starts_with(b"+") {
-                            line = line.slice(1..);
-                        }
-
-                        if !filter.matches(cmds.as_ref(), line.as_ref()) {
-                            stats.filtered();
-                            continue;
-                        }
-
-                        let msg = MonitorMessage::new(
-                            Arc::clone(&server),
-                            Arc::clone(&name),
-                            mon.color,
-                            line,
-                        );
-
-                        if let Err(e) = tx.send(msg).await {
-                            eprintln!("{server} tx.send failure: {e}");
-                            break;
-                        }
-                    }
-
-                    match reader.read_buf(&mut buf).await {
-                        Ok(0) => {
-                            eprintln!("{server} connection closed");
-                            break;
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            eprintln!("{server} read error {e}");
-                            break;
-                        }
+                match consume_reader(
+                    reader,
+                    &filter,
+                    cmds.as_ref(),
+                    &mut stats,
+                    &mut sender,
+                    &mut shutdown,
+                    false,
+                )
+                .await
+                {
+                    StreamExit::Shutdown | StreamExit::OutputClosed => break,
+                    StreamExit::End => {
+                        eprintln!("{} connection closed", sender.source.server);
                     }
                 }
             }
             Err(e) => {
                 if backoff.retries == 0 {
-                    eprintln!("{server} Error connecting {e}");
+                    eprintln!("{} Error connecting {e}", sender.source.server);
                 }
             }
         }
 
-        sleep(backoff.delay()).await;
+        tokio::select! {
+            () = sleep(backoff.delay()) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
     }
+
+    let _ = sender.flush().await;
+    drop(sender);
+    stats.fold();
 }
 
 #[derive(Debug)]
@@ -835,31 +1219,68 @@ fn connection_info_from_monitor(mon: &Monitor) -> ConnectionInfo {
         .set_redis_settings(redis)
 }
 
+struct OutputStats {
+    commands: stats::CommandStats,
+    interval: Duration,
+    tick: Instant,
+}
+
+impl OutputStats {
+    fn new(interval: Duration) -> Self {
+        Self {
+            commands: stats::CommandStats::new(),
+            interval,
+            tick: Instant::now(),
+        }
+    }
+
+    fn record(&mut self, line: &[u8], w: &mut dyn OutputHandler) {
+        self.commands.try_incr(line, line.len());
+        if self.tick.elapsed() >= self.interval {
+            if let Err(e) = w
+                .write_stats(&self.commands.get_stats())
+                .and_then(|()| w.flush())
+            {
+                eprintln!("Error writing stats: {e}");
+            }
+            self.tick = Instant::now();
+        }
+    }
+}
+
 impl IoMessage {
-    fn process(self, w: &mut dyn OutputHandler) -> Result<Control> {
+    fn process(
+        self,
+        w: &mut dyn OutputHandler,
+        stats: &mut Option<OutputStats>,
+    ) -> Control {
         match self {
             Self::Preamble(servers) => {
                 eprintln!("{}", format_preamble(&servers));
             }
-            Self::Stats(s) => {
-                w.write_stats(&s)?;
-                w.flush()?;
-            }
-            Self::Message(m) => {
-                if m.line.as_ref() == b"OK" {
-                    return Ok(Control::Continue);
-                }
+            Self::Batch(batch) => {
+                for line in batch.lines() {
+                    if line == b"OK" {
+                        continue;
+                    }
 
-                w.write_raw_line(
-                    &m.server,
-                    m.name.as_ref().as_deref(),
-                    &m.line,
-                )?;
+                    if let Some(stats) = stats.as_mut() {
+                        stats.record(line, w);
+                    }
+
+                    if let Err(e) = w.write_raw_line(
+                        &batch.source.server,
+                        batch.source.name.as_ref().as_deref(),
+                        line,
+                    ) {
+                        eprintln!("Error handling record: {e}");
+                    }
+                }
             }
-            Self::Shutdown => return Ok(Control::Shutdown),
+            Self::Shutdown => return Control::Shutdown,
         }
 
-        Ok(Control::Continue)
+        Control::Continue
     }
 }
 
@@ -877,40 +1298,38 @@ fn start_io_thread(
     output_kind: OutputKind,
     format: &str,
     size: usize,
+    byte_budget: usize,
+    stats_interval: Option<Duration>,
 ) -> (IoHandle, std::thread::JoinHandle<Result<()>>) {
-    const BATCH_MAX: usize = 1024;
+    const DRAIN_MAX: usize = 16;
 
     let (tx, rx) = flume::bounded::<IoMessage>(size);
+    let budget = Arc::new(Semaphore::new(byte_budget));
 
     let fmt = format.to_string();
     let jh = std::thread::spawn(move || -> Result<()> {
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::with_capacity(1 << 20, stdout.lock());
         let mut writer = output_kind.get_writer(&mut out, &fmt);
+        let mut stats = stats_interval.map(OutputStats::new);
         let mut last = Instant::now();
         let mut shutdown = false;
 
         while !shutdown {
             let Ok(first) = rx.recv() else { break };
 
-            match first.process(writer.as_mut()) {
-                Ok(Control::Shutdown) => break,
-                Ok(Control::Continue) => {}
-                Err(e) => {
-                    eprintln!("Error handling message: {e}");
-                }
+            match first.process(writer.as_mut(), &mut stats) {
+                Control::Shutdown => break,
+                Control::Continue => {}
             }
 
-            for msg in rx.try_iter().take(BATCH_MAX - 1) {
-                match msg.process(writer.as_mut()) {
-                    Ok(Control::Shutdown) => {
+            for msg in rx.try_iter().take(DRAIN_MAX - 1) {
+                match msg.process(writer.as_mut(), &mut stats) {
+                    Control::Shutdown => {
                         shutdown = true;
                         break;
                     }
-                    Ok(Control::Continue) => {}
-                    Err(e) => {
-                        eprintln!("Error handling message: {e}");
-                    }
+                    Control::Continue => {}
                 }
             }
 
@@ -929,7 +1348,14 @@ fn start_io_thread(
         Ok(())
     });
 
-    (IoHandle { tx }, jh)
+    (
+        IoHandle {
+            tx,
+            budget,
+            byte_budget,
+        },
+        jh,
+    )
 }
 
 fn version_string() -> String {
@@ -941,13 +1367,41 @@ fn version_string() -> String {
     format!("redis-monitor v{VERSION} (git {git_display})")
 }
 
-async fn run_stdin(opt: Options) -> Result<()> {
+async fn finish_io(
+    io_tx: IoHandle,
+    io_jh: std::thread::JoinHandle<Result<()>>,
+) {
+    let _ = io_tx.send(IoMessage::Shutdown).await;
+    if let Err(e) = io_jh
+        .join()
+        .unwrap_or_else(|e| Err(anyhow!("IO thread panicked: {e:?}")))
+    {
+        eprintln!("IO thread error: {e}");
+    }
+}
+
+async fn run_stdin(
+    opt: Options,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
     let format = opt
         .format
         .clone()
         .unwrap_or_else(|| DEFAULT_SINGLE_FORMAT.to_string());
+    let batch_config = BatchConfig::new(!opt.no_batch);
+    let queue_size = if opt.no_batch {
+        OUTPUT_IMMEDIATE_CAPACITY
+    } else {
+        OUTPUT_BATCH_CAPACITY
+    };
 
-    let (io_tx, io_jh) = start_io_thread(opt.output, &format, 65536);
+    let (io_tx, io_jh) = start_io_thread(
+        opt.output,
+        &format,
+        queue_size,
+        OUTPUT_BYTE_BUDGET,
+        None,
+    );
 
     let pseudo = Monitor::new(
         Some("stdin"),
@@ -963,37 +1417,25 @@ async fn run_stdin(opt: Options) -> Result<()> {
         .send(IoMessage::Preamble(Arc::clone(&preamble)))
         .await?;
 
-    let (tx, mut rx) = mpsc::channel::<MonitorMessage>(16384);
-
-    tokio::spawn(async move {
-        run_stdin_shim(tx).await;
-    });
-
     let filter: LineFilter = LineFilter::from_options(&opt);
+    let stdin = io::stdin();
+    let reader = BufReader::new(stdin);
+    run_from_reader(
+        "stdin",
+        reader,
+        io_tx.clone(),
+        filter,
+        batch_config,
+        shutdown,
+    )
+    .await;
 
-    while let Some(message) = rx.recv().await {
-        if !filter.matches(None, &message.line) {
-            continue;
-        }
-
-        if io_tx.send(IoMessage::Message(message)).await.is_err() {
-            eprintln!("io thread disconnected");
-            break;
-        }
-    }
-
-    let _ = io_tx.send(IoMessage::Shutdown).await;
-    if let Err(e) = io_jh
-        .join()
-        .unwrap_or_else(|e| Err(anyhow!("IO thread panicked: {e:?}")))
-    {
-        eprintln!("IO thread error: {e}");
-    }
+    finish_io(io_tx, io_jh).await;
 
     Ok(())
 }
 
-async fn run_wire(opt: Options) -> Result<()> {
+async fn run_wire(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
     let cfg = Map::load(opt.config_file.as_deref())?;
     let instances: Vec<String> = if opt.instances.is_empty() {
         vec!["localhost:6379".to_string()]
@@ -1011,9 +1453,7 @@ async fn run_wire(opt: Options) -> Result<()> {
         process_instances(&cfg, &opt, tls.as_ref(), &auth)
     };
 
-    let (tx, mut rx) = mpsc::channel::<MonitorMessage>(16384);
-
-    let tasks = FuturesUnordered::new();
+    let mut tasks = JoinSet::new();
 
     let format = opt.format.clone().unwrap_or_else(|| {
         if seeds.len() > 1 {
@@ -1023,17 +1463,26 @@ async fn run_wire(opt: Options) -> Result<()> {
         }
     });
 
-    let mut stats = if opt.output == OutputKind::Plain {
-        opt.stats.map(|_| stats::CommandStats::new())
+    let stats_interval = if opt.output == OutputKind::Plain {
+        opt.stats.map(Duration::from_secs_f64)
     } else {
         None
     };
-
-    let interval = Duration::from_secs_f64(opt.stats.unwrap_or(1.0));
     let filter = LineFilter::from_options(&opt);
-    let mut tick = Instant::now();
+    let batch_config = BatchConfig::new(!opt.no_batch);
+    let queue_size = if opt.no_batch {
+        OUTPUT_IMMEDIATE_CAPACITY
+    } else {
+        OUTPUT_BATCH_CAPACITY
+    };
 
-    let (io_tx, io_jh) = start_io_thread(opt.output, &format, 65536);
+    let (io_tx, io_jh) = start_io_thread(
+        opt.output,
+        &format,
+        queue_size,
+        OUTPUT_BYTE_BUDGET,
+        stats_interval,
+    );
 
     let preamble: Arc<[Monitor]> = Arc::from(seeds);
     io_tx
@@ -1041,50 +1490,37 @@ async fn run_wire(opt: Options) -> Result<()> {
         .await?;
 
     for mon in preamble.iter().cloned() {
-        let tx_task = tx.clone();
+        let io_task = io_tx.clone();
         let filter_clone = filter.clone();
-        tasks.push(tokio::spawn(async move {
-            run_monitor(mon, filter_clone, tx_task).await;
-        }));
+        let shutdown_task = shutdown.clone();
+        tasks.spawn(async move {
+            run_monitor(
+                mon,
+                filter_clone,
+                io_task,
+                batch_config,
+                shutdown_task,
+            )
+            .await;
+        });
     }
 
-    drop(tx);
-
-    while let Some(message) = rx.recv().await {
-        if let Some(ref mut stats) = stats {
-            stats.try_incr(&message.line, message.line.len());
-            if tick.elapsed() >= interval {
-                let s = stats.get_stats();
-                if let Err(e) = io_tx.send(IoMessage::Stats(s)).await {
-                    eprintln!("Failed to send stats: {e}");
-                    break;
-                }
-                tick = Instant::now();
-            }
-        }
-
-        if io_tx.send(IoMessage::Message(message)).await.is_err() {
-            eprintln!("io thread disconnected");
-            break;
+    while let Some(result) = tasks.join_next().await {
+        if let Err(e) = result {
+            eprintln!("Monitor task failed: {e}");
         }
     }
 
-    let _ = io_tx.send(IoMessage::Shutdown).await;
-    if let Err(e) = io_jh
-        .join()
-        .unwrap_or_else(|e| Err(anyhow!("IO thread panicked: {e:?}")))
-    {
-        eprintln!("IO thread error: {e}");
-    }
+    finish_io(io_tx, io_jh).await;
 
     Ok(())
 }
 
-async fn run(opt: Options) -> Result<()> {
+async fn run(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
     if opt.stdin {
-        run_stdin(opt).await
+        run_stdin(opt, shutdown).await
     } else {
-        run_wire(opt).await
+        run_wire(opt, shutdown).await
     }
 }
 
@@ -1108,13 +1544,16 @@ async fn main() -> Result<()> {
         eprintln!("{filter:#?}");
     }
 
-    let ctrl_c = tokio::signal::ctrl_c();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let run = run(opt, shutdown_rx);
+    tokio::pin!(run);
 
     let res = tokio::select! {
-        r = run(opt) => r,
-        _ = ctrl_c => {
+        r = &mut run => r,
+        _ = tokio::signal::ctrl_c() => {
             eprintln!("\nCtrl-C received, shutting down...");
-            Ok(())
+            let _ = shutdown_tx.send(true);
+            run.await
         }
     };
 
@@ -1127,6 +1566,7 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use crate::monitor::Line;
+    use tokio::io::AsyncWriteExt;
 
     #[derive(Default)]
     struct TestWriter {
@@ -1149,33 +1589,283 @@ mod tests {
         }
     }
 
-    fn test_message(line: &'static [u8]) -> IoMessage {
-        IoMessage::Message(MonitorMessage::new(
-            Arc::new(ServerAddr::from_path("stdin")),
+    fn test_source(name: &str) -> MonitorSource {
+        MonitorSource::new(
+            Arc::new(ServerAddr::from_path(name)),
             Arc::new(None),
             None,
-            Bytes::from_static(line),
-        ))
+        )
+    }
+
+    fn test_batch(source: &str, lines: &[&[u8]]) -> MonitorBatch {
+        let len = lines.iter().map(|line| line.len()).sum::<usize>();
+        let mut data = Vec::with_capacity(len);
+        let mut ranges = Vec::with_capacity(lines.len());
+        for line in lines {
+            let start = data.len();
+            data.extend_from_slice(line);
+            ranges.push(start..data.len());
+        }
+
+        let budget = Arc::new(Semaphore::new(len.max(1)));
+        let permit = budget
+            .try_acquire_many_owned(u32::try_from(len.max(1)).unwrap())
+            .unwrap();
+        let mut batch = MonitorBatch::new(test_source(source));
+        batch.add_chunk(Bytes::from(data), ranges, permit);
+        batch
+    }
+
+    fn test_message(line: &'static [u8]) -> IoMessage {
+        IoMessage::Batch(test_batch("stdin", &[line]))
+    }
+
+    fn test_io(
+        capacity: usize,
+        byte_budget: usize,
+    ) -> (IoHandle, flume::Receiver<IoMessage>) {
+        let (tx, rx) = flume::bounded(capacity);
+        (
+            IoHandle {
+                tx,
+                budget: Arc::new(Semaphore::new(byte_budget)),
+                byte_budget,
+            },
+            rx,
+        )
+    }
+
+    fn empty_filter() -> LineFilter {
+        LineFilter::new(Filter::new(Vec::new()), commands::Filter::default())
+    }
+
+    async fn reader_batches(
+        input: &[u8],
+        config: BatchConfig,
+    ) -> Vec<MonitorBatch> {
+        let (io, rx) = test_io(32, 1024 * 1024);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        run_from_reader(
+            "stdin",
+            input,
+            io,
+            empty_filter(),
+            config,
+            shutdown_rx,
+        )
+        .await;
+
+        rx.try_iter()
+            .filter_map(|message| match message {
+                IoMessage::Batch(batch) => Some(batch),
+                IoMessage::Preamble(_) | IoMessage::Shutdown => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn batching_is_enabled_by_default_and_can_be_disabled() {
+        assert!(!Options::try_parse_from(["redis-monitor"]).unwrap().no_batch);
+        assert!(
+            Options::try_parse_from(["redis-monitor", "--no-batch"])
+                .unwrap()
+                .no_batch
+        );
+    }
+
+    #[tokio::test]
+    async fn batches_records_by_default_and_preserves_source_order() {
+        let batches = reader_batches(
+            b"one\ntwo\nthree\n",
+            BatchConfig {
+                records: 3,
+                bytes: 1024,
+                delay: Duration::from_mins(1),
+            },
+        )
+        .await;
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].lines().collect::<Vec<_>>(),
+            [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()]
+        );
+        drop(batches);
+    }
+
+    #[tokio::test]
+    async fn no_batch_sends_each_record_immediately() {
+        let batches =
+            reader_batches(b"one\ntwo\nthree\n", BatchConfig::new(false)).await;
+
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].lines().next(), Some(b"one".as_slice()));
+        assert_eq!(batches[1].lines().next(), Some(b"two".as_slice()));
+        assert_eq!(batches[2].lines().next(), Some(b"three".as_slice()));
+        drop(batches);
+    }
+
+    #[tokio::test]
+    async fn stdin_preserves_a_final_record_without_a_newline() {
+        let batches = reader_batches(b"one", BatchConfig::new(true)).await;
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].lines().next(), Some(b"one".as_slice()));
+        drop(batches);
+    }
+
+    #[tokio::test]
+    async fn byte_limit_splits_batches_without_dropping_records() {
+        let batches = reader_batches(
+            b"one\ntwo\n",
+            BatchConfig {
+                records: 64,
+                bytes: 4,
+                delay: Duration::from_mins(1),
+            },
+        )
+        .await;
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].lines().next(), Some(b"one".as_slice()));
+        assert_eq!(batches[1].lines().next(), Some(b"two".as_slice()));
+        drop(batches);
+    }
+
+    #[test]
+    fn truncated_wire_frame_is_not_scanned() {
+        let mut stats = LocalStats::new(1000);
+
+        assert!(
+            scan_frames(
+                b"partial",
+                &empty_filter(),
+                None,
+                &mut stats,
+                64,
+                1024,
+            )
+            .is_none()
+        );
+        assert_eq!(stats.total, 0);
+    }
+
+    #[test]
+    fn batches_from_different_sources_remain_atomic() {
+        let (tx, rx) = flume::bounded(3);
+        tx.send(IoMessage::Batch(test_batch("a", &[b"a1", b"a2"])))
+            .unwrap();
+        tx.send(IoMessage::Batch(test_batch("b", &[b"b1", b"b2"])))
+            .unwrap();
+
+        let IoMessage::Batch(a) = rx.recv().unwrap() else {
+            panic!("expected source a batch");
+        };
+        let IoMessage::Batch(b) = rx.recv().unwrap() else {
+            panic!("expected source b batch");
+        };
+
+        assert_eq!(a.source.server.to_string(), "a");
+        assert_eq!(a.lines().collect::<Vec<_>>(), [b"a1", b"a2"]);
+        assert_eq!(b.source.server.to_string(), "b");
+        assert_eq!(b.lines().collect::<Vec<_>>(), [b"b1", b"b2"]);
+    }
+
+    #[tokio::test]
+    async fn oversized_record_uses_the_whole_budget_but_is_accepted() {
+        let (io, _rx) = test_io(1, 4);
+        let permit = io.reserve_bytes(1024).await;
+
+        assert_eq!(io.budget.available_permits(), 0);
+        drop(permit);
+        assert_eq!(io.budget.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn byte_budget_blocks_a_second_batch_until_output_releases_first() {
+        let (io, rx) = test_io(2, 5);
+        io.send(IoMessage::Batch({
+            let mut batch = MonitorBatch::new(test_source("first"));
+            batch.add_chunk(
+                Bytes::from_static(b"first"),
+                std::iter::once(0..5).collect(),
+                io.reserve_bytes(5).await,
+            );
+            batch
+        }))
+        .await
+        .unwrap();
+
+        let mut blocked = Box::pin(io.reserve_bytes(5));
+        for _ in 0..100 {
+            assert!(futures::poll!(blocked.as_mut()).is_pending());
+        }
+
+        drop(rx.recv().unwrap());
+        drop(blocked.await);
+        assert_eq!(io.budget.available_permits(), 5);
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_a_partial_batch() {
+        let (io, rx) = test_io(2, 1024);
+        let observer = io.clone();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut input, reader) = tokio::io::duplex(64);
+        let task = tokio::spawn(run_from_reader(
+            "stdin",
+            reader,
+            io,
+            empty_filter(),
+            BatchConfig {
+                records: 64,
+                bytes: 1024,
+                delay: Duration::from_mins(1),
+            },
+            shutdown_rx,
+        ));
+
+        input.write_all(b"one\n").await.unwrap();
+        for _ in 0..100 {
+            if observer.budget.available_permits() < 1024 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(observer.budget.available_permits() < 1024);
+        drop(observer);
+
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap();
+        let IoMessage::Batch(batch) = rx.recv().unwrap() else {
+            panic!("expected flushed batch");
+        };
+        assert_eq!(batch.lines().next(), Some(b"one".as_slice()));
     }
 
     #[test]
     fn ignores_standalone_ok_reply_after_parse_failure() {
         let mut writer = TestWriter::default();
+        let mut stats = None;
 
-        let control = test_message(b"OK").process(&mut writer).unwrap();
+        let control = test_message(b"OK").process(&mut writer, &mut stats);
 
         assert!(matches!(control, Control::Continue));
         assert_eq!(writer.lines, 0);
     }
 
     #[test]
-    fn reports_other_parse_failures() {
+    fn malformed_record_does_not_discard_the_rest_of_its_batch() {
         let mut writer = TestWriter::default();
+        let mut stats = None;
+        let valid = b"1.000000 [0 127.0.0.1:1] \"PING\"";
 
-        let err = test_message(b"PONG").process(&mut writer).unwrap_err();
+        let control =
+            IoMessage::Batch(test_batch("stdin", &[b"PONG", valid.as_slice()]))
+                .process(&mut writer, &mut stats);
 
-        assert!(err.to_string().contains("Failed to parse line 'PONG'"));
-        assert_eq!(writer.lines, 0);
+        assert!(matches!(control, Control::Continue));
+        assert_eq!(writer.lines, 1);
     }
 
     #[tokio::test]
@@ -1192,16 +1882,16 @@ mod tests {
         }
         assert_eq!(stats.snapshot().2, 1);
 
-        let IoMessage::Message(first) = rx.recv().unwrap() else {
+        let IoMessage::Batch(first) = rx.recv().unwrap() else {
             panic!("expected first record");
         };
-        assert_eq!(first.line, b"first"[..]);
+        assert_eq!(first.lines().next(), Some(b"first".as_slice()));
 
         blocked.await.unwrap();
-        let IoMessage::Message(second) = rx.recv().unwrap() else {
+        let IoMessage::Batch(second) = rx.recv().unwrap() else {
             panic!("expected second record");
         };
-        assert_eq!(second.line, b"second"[..]);
+        assert_eq!(second.lines().next(), Some(b"second".as_slice()));
 
         send_io_message(&tx, IoMessage::Shutdown, &stats)
             .await

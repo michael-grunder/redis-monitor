@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- Batch records per producer and route them directly to the output thread,
+  reducing queue contention and repeated source-metadata updates. Batching is
+  bounded by record count, bytes, and a 5 ms deadline, and can be disabled with
+  `--no-batch` for minimum output latency.
+- Bound queued record data with a shared 64 MiB byte budget while retaining a
+  smaller item-count guard and lossless backpressure, including support for
+  oversized individual records.
 - Elide per-record address allocations in plain multi-source output by
   normalizing server IP addresses once and writing address components directly.
 - Await capacity on saturated output queues instead of polling, and count each
