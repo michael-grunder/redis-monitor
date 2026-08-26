@@ -272,44 +272,46 @@ fn process_cluster_instances(
     opt: &Options,
     tls: Option<&Arc<TlsConfig>>,
     auth: &ServerAuth,
-) -> Vec<Monitor> {
-    let addresses = opt.instances.iter().map(|addr| {
-        ServerAddr::from_str(addr).unwrap_or_else(|_| {
-            panic!("Unable to interpret '{addr:?}' as a server address");
-        })
-    });
+) -> Result<Vec<Monitor>> {
+    let mut monitors = HashSet::new();
 
-    addresses
-        .flat_map(|address| {
-            Cluster::from_seed(&address)
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "Unable to interpret '{address:?}' as a cluster address"
-                    );
-                })
-                .get_nodes()
-                .iter()
-                .flat_map(|primary| {
-                    let mut nodes = vec![primary];
-                    if opt.replicas {
-                        nodes.extend(&primary.replicas);
-                    }
+    for input in &opt.instances {
+        let address = ServerAddr::from_str(input).with_context(|| {
+            format!("Invalid Redis Cluster seed address '{input}'")
+        })?;
+        let cluster = Cluster::from_seed(&address).with_context(|| {
+            format!(
+                "Failed to discover a Redis Cluster from seed '{input}' \
+                 (resolved to {address}). The seed must be reachable and have \
+                 Redis Cluster enabled; remove --cluster to monitor a \
+                 standalone instance"
+            )
+        })?;
 
-                    nodes.into_iter().map(|n| {
-                        Monitor::new(
-                            Some(&n.id),
-                            n.addr.clone(),
-                            tls.cloned(),
-                            auth.clone(),
-                            None,
-                        )
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect()
+        for primary in cluster.get_nodes() {
+            if opt.replicas {
+                monitors.extend(primary.replicas.iter().map(|replica| {
+                    Monitor::new(
+                        Some(&replica.id),
+                        replica.addr.clone(),
+                        tls.cloned(),
+                        auth.clone(),
+                        None,
+                    )
+                }));
+            }
+
+            monitors.insert(Monitor::new(
+                Some(&primary.id),
+                primary.addr.clone(),
+                tls.cloned(),
+                auth.clone(),
+                None,
+            ));
+        }
+    }
+
+    Ok(monitors.into_iter().collect())
 }
 
 // Take the array of instances provided on the command line and attempt to map
@@ -1431,6 +1433,7 @@ async fn run_stdin(
     .await;
 
     finish_io(io_tx, io_jh).await;
+    print_final_stats();
 
     Ok(())
 }
@@ -1448,7 +1451,7 @@ async fn run_wire(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
     let opt = Options { instances, ..opt };
 
     let seeds = if opt.cluster {
-        process_cluster_instances(&opt, tls.as_ref(), &auth)
+        process_cluster_instances(&opt, tls.as_ref(), &auth)?
     } else {
         process_instances(&cfg, &opt, tls.as_ref(), &auth)
     };
@@ -1512,6 +1515,7 @@ async fn run_wire(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
     }
 
     finish_io(io_tx, io_jh).await;
+    print_final_stats();
 
     Ok(())
 }
@@ -1556,8 +1560,6 @@ async fn main() -> Result<()> {
             run.await
         }
     };
-
-    print_final_stats();
 
     res
 }
