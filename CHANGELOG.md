@@ -31,8 +31,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
-- Report Redis Cluster seed discovery failures with the failing input, resolved
-  address, underlying cause, and a standalone-mode hint instead of panicking.
+- Report invalid instance arguments, config discovery and validation failures,
+  TLS certificate errors, and named or direct Redis Cluster discovery failures
+  with contextual nonzero exits instead of panicking.
+- Reject malformed `CLUSTER SLOTS` node data, including incomplete nodes and
+  out-of-range ports, without panicking.
+- Propagate output-thread failures to the process exit status.
 - Ignore standalone `OK` replies from Redis MONITOR setup instead of reporting
   them as parse errors.
 - Preserve quoted JSON-like, serialized PHP, and literal-backslash Redis MONITOR arguments when serializing structured outputs.

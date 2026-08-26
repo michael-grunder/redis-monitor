@@ -323,35 +323,30 @@ fn process_instances(
     opt: &Options,
     tls: Option<&Arc<TlsConfig>>,
     auth: &ServerAuth,
-) -> Vec<Monitor> {
-    opt.instances
-        .iter()
-        .flat_map(|inst| {
-            cfg.get(inst).map_or_else(
-                || {
-                    ServerAddr::from_str(inst).map_or_else(
-                        |_| {
-                            panic!(
-                            "Unable to parse '{inst}' as an address or named instance"
-                        );
-                        },
-                        |addr| {
-                            let monitor = Monitor::new(
-                                None,
-                                addr,
-                                tls.cloned(),
-                                auth.clone(),
-                                None,
-                            );
+) -> Result<Vec<Monitor>> {
+    let mut monitors = Vec::new();
 
-                            vec![monitor]
-                        }
-                    )
-                },
-                |entry| Monitor::from_config_entry(inst, entry),
-            )
-        })
-        .collect()
+    for instance in &opt.instances {
+        if let Some(entry) = cfg.get(instance) {
+            monitors.extend(Monitor::from_config_entry(instance, entry)?);
+        } else {
+            let address = ServerAddr::from_str(instance).with_context(|| {
+                format!(
+                    "Unable to parse '{instance}' as a Redis address, and no \
+                     configuration entry with that name exists"
+                )
+            })?;
+            monitors.push(Monitor::new(
+                None,
+                address,
+                tls.cloned(),
+                auth.clone(),
+                None,
+            ));
+        }
+    }
+
+    Ok(monitors)
 }
 
 #[derive(Debug, Default)]
@@ -720,10 +715,10 @@ impl fmt::Debug for LineFilter {
 }
 
 impl LineFilter {
-    fn from_options(opt: &Options) -> Self {
-        let names: Filter = opt.filter.clone().into();
+    fn from_options(opt: &Options) -> Result<Self> {
+        let names = Filter::try_from(opt.filter.clone())?;
         let flags = opt.flags.clone().into();
-        Self::new(names, flags)
+        Ok(Self::new(names, flags))
     }
 
     const fn new(names: Filter, flags: commands::Filter) -> Self {
@@ -1372,14 +1367,12 @@ fn version_string() -> String {
 async fn finish_io(
     io_tx: IoHandle,
     io_jh: std::thread::JoinHandle<Result<()>>,
-) {
+) -> Result<()> {
     let _ = io_tx.send(IoMessage::Shutdown).await;
-    if let Err(e) = io_jh
+    let result = io_jh
         .join()
-        .unwrap_or_else(|e| Err(anyhow!("IO thread panicked: {e:?}")))
-    {
-        eprintln!("IO thread error: {e}");
-    }
+        .map_err(|error| anyhow!("Output thread panicked: {error:?}"))?;
+    result.context("Output thread failed")
 }
 
 async fn run_stdin(
@@ -1419,7 +1412,7 @@ async fn run_stdin(
         .send(IoMessage::Preamble(Arc::clone(&preamble)))
         .await?;
 
-    let filter: LineFilter = LineFilter::from_options(&opt);
+    let filter = LineFilter::from_options(&opt)?;
     let stdin = io::stdin();
     let reader = BufReader::new(stdin);
     run_from_reader(
@@ -1432,7 +1425,7 @@ async fn run_stdin(
     )
     .await;
 
-    finish_io(io_tx, io_jh).await;
+    finish_io(io_tx, io_jh).await?;
     print_final_stats();
 
     Ok(())
@@ -1453,7 +1446,7 @@ async fn run_wire(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
     let seeds = if opt.cluster {
         process_cluster_instances(&opt, tls.as_ref(), &auth)?
     } else {
-        process_instances(&cfg, &opt, tls.as_ref(), &auth)
+        process_instances(&cfg, &opt, tls.as_ref(), &auth)?
     };
 
     let mut tasks = JoinSet::new();
@@ -1471,7 +1464,7 @@ async fn run_wire(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
     } else {
         None
     };
-    let filter = LineFilter::from_options(&opt);
+    let filter = LineFilter::from_options(&opt)?;
     let batch_config = BatchConfig::new(!opt.no_batch);
     let queue_size = if opt.no_batch {
         OUTPUT_IMMEDIATE_CAPACITY
@@ -1514,7 +1507,7 @@ async fn run_wire(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
         }
     }
 
-    finish_io(io_tx, io_jh).await;
+    finish_io(io_tx, io_jh).await?;
     print_final_stats();
 
     Ok(())
@@ -1544,7 +1537,7 @@ async fn main() -> Result<()> {
     }
 
     if opt.debug {
-        let filter = LineFilter::from_options(&opt);
+        let filter = LineFilter::from_options(&opt)?;
         eprintln!("{filter:#?}");
     }
 
@@ -1638,7 +1631,10 @@ mod tests {
     }
 
     fn empty_filter() -> LineFilter {
-        LineFilter::new(Filter::new(Vec::new()), commands::Filter::default())
+        LineFilter::new(
+            Filter::new(Vec::new()).unwrap(),
+            commands::Filter::default(),
+        )
     }
 
     async fn reader_batches(

@@ -6,7 +6,7 @@ use std::{
 };
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use regex::bytes::Regex;
 
 #[derive(Debug, Clone)]
@@ -93,8 +93,10 @@ pub struct Filter {
     exclude: Vec<Matcher>,
 }
 
-impl From<Vec<FilterPattern>> for Filter {
-    fn from(patterns: Vec<FilterPattern>) -> Self {
+impl TryFrom<Vec<FilterPattern>> for Filter {
+    type Error = anyhow::Error;
+
+    fn try_from(patterns: Vec<FilterPattern>) -> Result<Self> {
         Self::new(patterns)
     }
 }
@@ -113,7 +115,7 @@ impl Filter {
             .collect()
     }
 
-    pub fn new(patterns: Vec<FilterPattern>) -> Self {
+    pub fn new(patterns: Vec<FilterPattern>) -> Result<Self> {
         let mut include = Vec::new();
         let mut exclude = Vec::new();
 
@@ -130,10 +132,12 @@ impl Filter {
         let (inc_lits, inc_res) = Self::split_patterns(include);
         let (exc_lits, exc_res) = Self::split_patterns(exclude);
 
-        let include = Self::build_matchers(&inc_lits, inc_res);
-        let exclude = Self::build_matchers(&exc_lits, exc_res);
+        let include = Self::build_matchers(&inc_lits, inc_res)
+            .context("Failed to compile inclusive command filters")?;
+        let exclude = Self::build_matchers(&exc_lits, exc_res)
+            .context("Failed to compile exclusive command filters")?;
 
-        Self { include, exclude }
+        Ok(Self { include, exclude })
     }
 
     fn split_patterns(patterns: Vec<Pattern>) -> (Vec<Vec<u8>>, Vec<Regex>) {
@@ -150,16 +154,16 @@ impl Filter {
         (lits, res)
     }
 
-    fn build_matchers(lits: &[Vec<u8>], res: Vec<Regex>) -> Vec<Matcher> {
+    fn build_matchers(
+        lits: &[Vec<u8>],
+        res: Vec<Regex>,
+    ) -> Result<Vec<Matcher>> {
         let mut out = Vec::new();
 
         if !lits.is_empty() {
             let ac = AhoCorasickBuilder::new()
                 .ascii_case_insensitive(true)
-                .build(lits)
-                .unwrap_or_else(|e| {
-                    panic!("Failed to build Aho-Corasick automaton: {e}")
-                });
+                .build(lits)?;
             out.push(Matcher::Literals(ac));
         }
 
@@ -167,7 +171,7 @@ impl Filter {
             out.push(Matcher::Regexes(res));
         }
 
-        out
+        Ok(out)
     }
 
     const fn has_includes(&self) -> bool {

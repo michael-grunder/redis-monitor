@@ -506,7 +506,11 @@ impl<'a> Line<'a> {
     pub fn write_resp(&self, writer: &mut dyn Write) -> Result<()> {
         let args = match &self.args {
             LineArgs::Parsed(v) => v,
-            LineArgs::Raw(_) => panic!("write_resp needs Parsed args"),
+            LineArgs::Raw(_) => {
+                return Err(anyhow::anyhow!(
+                    "RESP output requires parsed MONITOR arguments"
+                ));
+            }
         };
 
         let total_count = 1 + args.len();
@@ -802,7 +806,19 @@ fn bytes_to_structured_string(bytes: &[u8]) -> Cow<'_, str> {
 mod tests {
     use serde_json::Value;
 
-    use super::{Line, LineArgs};
+    use super::{ClientAddr, Line, LineArgs};
+
+    #[test]
+    fn resp_writer_rejects_unparsed_arguments_without_panicking() {
+        let line =
+            Line::new(1.0, 0, ClientAddr::Unknown, "PING", LineArgs::Raw(b""));
+        let error = line.write_resp(&mut Vec::new()).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "RESP output requires parsed MONITOR arguments"
+        );
+    }
 
     #[test]
     fn parses_argument_containing_unescaped_json_quotes() {

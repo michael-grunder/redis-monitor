@@ -9,7 +9,7 @@ use std::{
     str::FromStr,
 };
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use colored::Color;
 use config::{Config, File, FileFormat};
 use redis::cmd;
@@ -126,11 +126,12 @@ impl ServerAuth {
 }
 
 impl Map {
-    fn find() -> Option<PathBuf> {
-        let search_paths: Vec<PathBuf> = vec![
-            env::current_dir().unwrap(),
-            env::var("HOME").unwrap().into(),
-        ];
+    fn find() -> Result<Option<PathBuf>> {
+        let mut search_paths = vec![env::current_dir()
+            .context("Failed to determine the current directory while looking for a config file")?];
+        if let Some(home) = env::var_os("HOME") {
+            search_paths.push(home.into());
+        }
 
         for path in &search_paths {
             for file in DEFAULT_CFGFILE_NAMES {
@@ -145,13 +146,13 @@ impl Map {
                     let check: PathBuf = [path, &f].iter().collect();
 
                     if check.exists() {
-                        return Some(check);
+                        return Ok(Some(check));
                     }
                 }
             }
         }
 
-        None
+        Ok(None)
     }
 
     fn from_toml_file<P: AsRef<str>>(
@@ -171,16 +172,15 @@ impl Map {
         Ok(s)
     }
 
-    fn from_default_toml_file() -> Option<HashMap<String, Entry>> {
-        Self::find().map(|file| {
-            let str = file.to_str().unwrap_or_else(|| {
-                panic!("Invalid UTF-8 in config file path: {}", file.display());
-            });
+    fn from_default_toml_file() -> Result<Option<HashMap<String, Entry>>> {
+        let Some(file) = Self::find()? else {
+            return Ok(None);
+        };
+        let path = file.to_str().ok_or_else(|| {
+            anyhow!("Invalid UTF-8 in config file path: {}", file.display())
+        })?;
 
-            Self::from_toml_file(str).unwrap_or_else(|e| {
-                panic!("Failed to read config file {}: {e}", file.display());
-            })
-        })
+        Self::from_toml_file(path).map(Some)
     }
 
     pub fn load(path: Option<&Path>) -> Result<Self> {
@@ -194,7 +194,7 @@ impl Map {
                 })?;
                 Some(Self::from_toml_file(path_str)?)
             }
-            None => Self::from_default_toml_file(),
+            None => Self::from_default_toml_file()?,
         };
 
         Ok(Self(cfg.unwrap_or_default()))
@@ -221,15 +221,26 @@ impl Entry {
         ServerAuth::from_user_pass(self.user.as_deref(), self.pass.as_deref())
     }
 
-    pub fn get_addresses(&self) -> Vec<ServerAddr> {
+    pub fn get_addresses(&self) -> Result<Vec<ServerAddr>> {
         if let Some((host, port)) = self.host_port() {
-            vec![ServerAddr::from_tcp_addr(host, port)]
+            Ok(vec![ServerAddr::from_tcp_addr(host, port)])
+        } else if self.host.is_some() || self.port.is_some() {
+            bail!("'host' and 'port' must be specified together")
         } else if let Some(addresses) = &self.addresses {
-            addresses.to_owned()
+            if addresses.is_empty() {
+                bail!("'addresses' must contain at least one Redis address")
+            }
+            Ok(addresses.to_owned())
         } else if let Some(path) = &self.path {
-            vec![ServerAddr::from_path(path)]
+            if path.is_empty() {
+                bail!("'path' must not be empty")
+            }
+            Ok(vec![ServerAddr::from_path(path)])
         } else {
-            panic!("Could not determine one or more Redis addresses");
+            bail!(
+                "missing Redis address; specify 'host' with 'port', \
+                 'addresses', or 'path'"
+            )
         }
     }
 

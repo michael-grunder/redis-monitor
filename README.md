@@ -108,6 +108,9 @@ Standalone `OK` replies from entering MONITOR mode are ignored.
 When `--cluster` is used, every instance must be a reachable Redis Cluster seed.
 Discovery failures exit nonzero with the failing seed, underlying Redis or I/O
 error, and a hint to remove `--cluster` for standalone instances.
+Invalid instance arguments, malformed discovered or explicit config files,
+incomplete named instances, invalid TLS files, and malformed cluster metadata
+also exit nonzero with contextual errors rather than panic.
 
 By default, each source batches up to 64 records or 256 KiB for at most 5 ms
 before handing them directly to the output thread. Queued and producer-held

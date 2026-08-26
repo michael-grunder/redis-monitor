@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use colored::Color;
 use redis::{Client, Connection, Value};
 use rustls::client::danger::ServerCertVerifier;
@@ -299,30 +299,51 @@ impl Cluster {
         host: &Value,
         port: &Value,
         id: &Value,
-    ) -> Option<(String, u16, String)> {
+    ) -> Result<(String, u16, String)> {
         match (host, port, id) {
             (
                 Value::BulkString(host),
                 Value::Int(port),
                 Value::BulkString(id),
-            ) => Some((
-                String::from_utf8_lossy(host).to_string(),
-                u16::try_from(*port).expect("Failed to convert port to u16"),
-                String::from_utf8_lossy(id).to_string(),
-            )),
-            _ => None,
+            ) => {
+                let port = u16::try_from(*port).map_err(|_| {
+                    anyhow!(
+                        "Redis Cluster returned an out-of-range node port: \
+                         {port}"
+                    )
+                })?;
+                Ok((
+                    String::from_utf8_lossy(host).to_string(),
+                    port,
+                    String::from_utf8_lossy(id).to_string(),
+                ))
+            }
+            _ => bail!(
+                "Redis Cluster returned a node with invalid host, port, or ID \
+                 fields"
+            ),
         }
     }
 
-    fn parse_nodes(nodes: &[Value]) -> Vec<(String, u16, String)> {
+    fn parse_nodes(nodes: &[Value]) -> Result<Vec<(String, u16, String)>> {
         nodes
             .iter()
-            .filter_map(|node| {
-                if let Value::Array(node) = node {
-                    Self::parse_slot_bulk(&node[0], &node[1], &node[2])
-                } else {
-                    None
-                }
+            .enumerate()
+            .map(|(index, node)| {
+                let Value::Array(node) = node else {
+                    bail!("Redis Cluster node {index} is not an array");
+                };
+                let [host, port, id, ..] = node.as_slice() else {
+                    bail!(
+                        "Redis Cluster node {index} has {} fields; expected at \
+                         least 3",
+                        node.len()
+                    );
+                };
+
+                Self::parse_slot_bulk(host, port, id).with_context(|| {
+                    format!("Invalid Redis Cluster node {index}")
+                })
             })
             .collect()
     }
@@ -333,18 +354,24 @@ impl Cluster {
     }
 
     pub fn from_seeds(seeds: &[ServerAddr]) -> Result<Self> {
+        let mut last_error = None;
         for seed in seeds {
-            if let Ok(mut con) = seed.get_connection()
-                && let Ok(primaries) = Self::exec_slots(&mut con)
-            {
-                return Ok(Self::new(primaries));
+            match Self::from_seed(seed) {
+                Ok(cluster) => return Ok(cluster),
+                Err(error) => last_error = Some((seed, error)),
             }
         }
 
-        Err(anyhow!(
-            "Unable to map cluster with any of the {} provided seeds",
-            seeds.len()
-        ))
+        let Some((seed, error)) = last_error else {
+            bail!("No Redis Cluster seeds were configured");
+        };
+        Err(error).with_context(|| {
+            format!(
+                "Failed to discover a Redis Cluster from any of the {} \
+                 configured seeds; last attempted {seed}",
+                seeds.len()
+            )
+        })
     }
 
     fn exec_slots(con: &mut Connection) -> Result<HashSet<ClusterNode>> {
@@ -355,28 +382,42 @@ impl Cluster {
             .query(con)
             .map_err(|e| anyhow!("Failed to execute CLUSTER SLOTS: {e}"))?;
 
-        if let Value::Array(items) = value {
-            let mut iter = items.into_iter();
+        let Value::Array(items) = value else {
+            bail!("CLUSTER SLOTS returned a non-array response");
+        };
 
-            while let Some(Value::Array(item)) = iter.next() {
-                if item.len() < 3 {
-                    continue;
-                }
-
-                let entries = Self::parse_nodes(&item[2..]);
-
-                if entries.is_empty() {
-                    continue;
-                }
-
-                let mut primary: ClusterNode = (&entries[0]).into();
-
-                for replica in &entries[1..] {
-                    primary.add_replica(replica.into());
-                }
-
-                primaries.insert(primary);
+        for (slot_index, item) in items.into_iter().enumerate() {
+            let Value::Array(item) = item else {
+                bail!("CLUSTER SLOTS entry {slot_index} is not an array");
+            };
+            if item.len() < 3 {
+                bail!(
+                    "CLUSTER SLOTS entry {slot_index} has {} fields; expected \
+                     at least 3",
+                    item.len()
+                );
             }
+
+            let entries = Self::parse_nodes(&item[2..]).with_context(|| {
+                format!("Invalid CLUSTER SLOTS entry {slot_index}")
+            })?;
+            let Some((primary, replicas)) = entries.split_first() else {
+                bail!(
+                    "CLUSTER SLOTS entry {slot_index} does not contain a \
+                     primary node"
+                );
+            };
+            let mut primary: ClusterNode = primary.into();
+
+            for replica in replicas {
+                primary.add_replica(replica.into());
+            }
+
+            primaries.insert(primary);
+        }
+
+        if primaries.is_empty() {
+            bail!("CLUSTER SLOTS returned no primary nodes");
         }
 
         Ok(primaries)
@@ -388,40 +429,49 @@ impl Cluster {
 }
 
 impl Monitor {
-    pub fn from_config_entry(name: &str, entry: &Entry) -> Vec<Self> {
-        if entry.cluster {
-            let c = Cluster::from_seeds(&entry.get_addresses())
-                .expect("Can't get cluster nodes");
-            c.get_nodes()
-                .iter()
-                .map(|primary| {
-                    let tls = entry.get_tls_config().unwrap_or_else(|e| {
-                        panic!("Failed to create TLS config: {e}")
-                    });
+    pub fn from_config_entry(name: &str, entry: &Entry) -> Result<Vec<Self>> {
+        let addresses = entry.get_addresses().with_context(|| {
+            format!("Invalid configuration for instance '{name}'")
+        })?;
 
+        if entry.cluster {
+            let tls = entry
+                .get_tls_config()
+                .with_context(|| {
+                    format!("Failed to configure TLS for instance '{name}'")
+                })?
+                .map(Arc::new);
+            let c = Cluster::from_seeds(&addresses).with_context(|| {
+                format!(
+                    "Failed to discover the cluster for configured instance \
+                     '{name}'"
+                )
+            })?;
+            Ok(c.get_nodes()
+                .into_iter()
+                .map(|primary| {
                     Self::new(
                         Some(name),
-                        primary.addr.clone(),
-                        tls.map(Arc::new),
+                        primary.addr,
+                        tls.clone(),
                         entry.get_auth(),
                         entry.get_color(),
                     )
                 })
-                .collect()
+                .collect())
         } else {
-            entry
-                .get_addresses()
-                .iter()
+            Ok(addresses
+                .into_iter()
                 .map(|addr| {
                     Self::new(
                         Some(name),
-                        addr.to_owned(),
+                        addr,
                         None, // TODO: TLS config
                         entry.get_auth(),
                         entry.get_color(),
                     )
                 })
-                .collect()
+                .collect())
         }
     }
 
@@ -549,7 +599,9 @@ impl TlsConfig {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| anyhow!("Failed to parse certs: {e}"))?;
 
-        Ok(parsed[0].clone())
+        parsed.into_iter().next().ok_or_else(|| {
+            anyhow!("No certificate found in cert file: {}", path.display())
+        })
     }
 
     fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
