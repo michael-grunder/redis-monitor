@@ -42,6 +42,7 @@ mod commands;
 mod config;
 mod connection;
 mod filter;
+mod input;
 mod monitor;
 mod output;
 mod stats;
@@ -379,7 +380,9 @@ struct Backoff {
 struct LineFilter {
     empty: bool,
     names: Filter,
+    interactive_names: Filter,
     flags: commands::Filter,
+    updates: Option<watch::Receiver<Filter>>,
 }
 
 #[derive(Debug, Clone)]
@@ -709,7 +712,9 @@ impl fmt::Debug for LineFilter {
         f.debug_struct("LineFilter")
             .field("empty", &self.empty)
             .field("names", &self.names)
+            .field("interactive_names", &self.interactive_names)
             .field("flags", &self.flags)
+            .field("updates", &self.updates.is_some())
             .finish()
     }
 }
@@ -721,13 +726,39 @@ impl LineFilter {
         Ok(Self::new(names, flags))
     }
 
-    const fn new(names: Filter, flags: commands::Filter) -> Self {
+    fn new(names: Filter, flags: commands::Filter) -> Self {
         let empty = names.is_empty() && flags.is_empty();
         Self {
             empty,
             names,
+            interactive_names: Filter::default(),
             flags,
+            updates: None,
         }
+    }
+
+    fn with_updates(mut self, updates: watch::Receiver<Filter>) -> Self {
+        self.updates = Some(updates);
+        self
+    }
+
+    fn refresh_interactive_names(&mut self) {
+        let names = self.updates.as_mut().and_then(|updates| {
+            updates
+                .has_changed()
+                .unwrap_or(false)
+                .then(|| updates.borrow_and_update().clone())
+        });
+        if let Some(names) = names {
+            self.set_interactive_names(names);
+        }
+    }
+
+    fn set_interactive_names(&mut self, names: Filter) {
+        self.interactive_names = names;
+        self.empty = self.names.is_empty()
+            && self.interactive_names.is_empty()
+            && self.flags.is_empty();
     }
 
     #[inline]
@@ -764,7 +795,7 @@ impl LineFilter {
             return true;
         };
 
-        if !self.names.matches(cmd) {
+        if !self.names.matches(cmd) || !self.interactive_names.matches(cmd) {
             return false;
         }
 
@@ -935,7 +966,7 @@ async fn drain_frames(
 
 async fn consume_reader<R>(
     mut reader: R,
-    filter: &LineFilter,
+    filter: &mut LineFilter,
     commands: Option<&commands::Lookup>,
     stats: &mut LocalStats,
     sender: &mut BatchSender,
@@ -948,6 +979,8 @@ where
     let mut buf = BytesMut::with_capacity(16 * 1024);
 
     loop {
+        filter.refresh_interactive_names();
+
         if drain_frames(&mut buf, filter, commands, stats, sender)
             .await
             .is_err()
@@ -1036,7 +1069,7 @@ async fn run_from_reader<R>(
     name: &str,
     reader: R,
     io: IoHandle,
-    filter: LineFilter,
+    mut filter: LineFilter,
     config: BatchConfig,
     mut shutdown: watch::Receiver<bool>,
 ) where
@@ -1051,7 +1084,7 @@ async fn run_from_reader<R>(
     let mut stats = LocalStats::new(1000);
     let _ = consume_reader(
         reader,
-        &filter,
+        &mut filter,
         None,
         &mut stats,
         &mut sender,
@@ -1065,7 +1098,7 @@ async fn run_from_reader<R>(
 
 async fn run_monitor(
     mon: Monitor,
-    filter: LineFilter,
+    mut filter: LineFilter,
     io: IoHandle,
     config: BatchConfig,
     mut shutdown: watch::Receiver<bool>,
@@ -1095,7 +1128,7 @@ async fn run_monitor(
 
                 match consume_reader(
                     reader,
-                    &filter,
+                    &mut filter,
                     cmds.as_ref(),
                     &mut stats,
                     &mut sender,
@@ -1297,6 +1330,7 @@ fn start_io_thread(
     size: usize,
     byte_budget: usize,
     stats_interval: Option<Duration>,
+    terminal_ui: Option<Arc<input::TerminalUi>>,
 ) -> (IoHandle, std::thread::JoinHandle<Result<()>>) {
     const DRAIN_MAX: usize = 16;
 
@@ -1314,6 +1348,8 @@ fn start_io_thread(
 
         while !shutdown {
             let Ok(first) = rx.recv() else { break };
+            let _output_guard =
+                terminal_ui.as_ref().map(|ui| ui.begin_output());
 
             match first.process(writer.as_mut(), &mut stats) {
                 Control::Shutdown => break,
@@ -1396,6 +1432,7 @@ async fn run_stdin(
         queue_size,
         OUTPUT_BYTE_BUDGET,
         None,
+        None,
     );
 
     let pseudo = Monitor::new(
@@ -1431,7 +1468,11 @@ async fn run_stdin(
     Ok(())
 }
 
-async fn run_wire(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
+async fn run_wire(
+    opt: Options,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
     let cfg = Map::load(opt.config_file.as_deref())?;
     let instances: Vec<String> = if opt.instances.is_empty() {
         vec!["localhost:6379".to_string()]
@@ -1465,6 +1506,14 @@ async fn run_wire(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
         None
     };
     let filter = LineFilter::from_options(&opt)?;
+    let (filter_tx, filter_rx) = watch::channel(Filter::default());
+    let interactive_input = input::TerminalInput::start(filter_tx, shutdown_tx)
+        .map_err(|error| {
+            warn!("interactive filtering unavailable: {error}");
+        })
+        .ok()
+        .flatten();
+    let terminal_ui = interactive_input.as_ref().map(input::TerminalInput::ui);
     let batch_config = BatchConfig::new(!opt.no_batch);
     let queue_size = if opt.no_batch {
         OUTPUT_IMMEDIATE_CAPACITY
@@ -1478,6 +1527,7 @@ async fn run_wire(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
         queue_size,
         OUTPUT_BYTE_BUDGET,
         stats_interval,
+        terminal_ui,
     );
 
     let preamble: Arc<[Monitor]> = Arc::from(seeds);
@@ -1487,7 +1537,7 @@ async fn run_wire(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
 
     for mon in preamble.iter().cloned() {
         let io_task = io_tx.clone();
-        let filter_clone = filter.clone();
+        let filter_clone = filter.clone().with_updates(filter_rx.clone());
         let shutdown_task = shutdown.clone();
         tasks.spawn(async move {
             run_monitor(
@@ -1507,17 +1557,22 @@ async fn run_wire(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
         }
     }
 
+    drop(interactive_input);
     finish_io(io_tx, io_jh).await?;
     print_final_stats();
 
     Ok(())
 }
 
-async fn run(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
+async fn run(
+    opt: Options,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
     if opt.stdin {
         run_stdin(opt, shutdown).await
     } else {
-        run_wire(opt, shutdown).await
+        run_wire(opt, shutdown_tx, shutdown).await
     }
 }
 
@@ -1542,7 +1597,7 @@ async fn main() -> Result<()> {
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let run = run(opt, shutdown_rx);
+    let run = run(opt, shutdown_tx.clone(), shutdown_rx);
     tokio::pin!(run);
 
     let res = tokio::select! {
@@ -1635,6 +1690,27 @@ mod tests {
             Filter::new(Vec::new()).unwrap(),
             commands::Filter::default(),
         )
+    }
+
+    #[test]
+    fn interactive_filter_narrows_and_can_restore_command_line_filter() {
+        let base = Filter::new(vec!["get".parse().unwrap()]).unwrap();
+        let mut filter = LineFilter::new(base, commands::Filter::default());
+        let get = b"1.000000 [0 127.0.0.1:1] \"GET\" \"key\"";
+        let mget = b"1.000000 [0 127.0.0.1:1] \"MGET\" \"key\"";
+
+        assert!(filter.matches(None, get));
+        assert!(filter.matches(None, mget));
+
+        filter.set_interactive_names(
+            Filter::new(vec!["mget".parse().unwrap()]).unwrap(),
+        );
+        assert!(!filter.matches(None, get));
+        assert!(filter.matches(None, mget));
+
+        filter.set_interactive_names(Filter::default());
+        assert!(filter.matches(None, get));
+        assert!(filter.matches(None, mget));
     }
 
     async fn reader_batches(

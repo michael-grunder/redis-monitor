@@ -125,6 +125,15 @@ total ordering guarantee between sources. Use `--no-batch` to hand off each
 accepted record individually when minimum output latency is more important than
 throughput under load.
 
+When monitoring Redis directly from an interactive terminal, press `/` to edit
+a live command-name filter and Enter to apply it. The prompt starts with the
+current live filter, so press `/`, erase it with Backspace, and press Enter to
+clear it. Escape cancels an edit. Live filters use the same syntax as
+`--filter`, including `!` exclusions and `/.../` regular expressions, and are
+applied in addition to filters supplied on the command line. Interactive
+filtering is disabled with `--stdin`, because standard input carries the
+MONITOR stream in that mode.
+
 Examples:
   # Monitor localhost:6379 by default
   redis-monitor

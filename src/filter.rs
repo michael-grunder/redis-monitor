@@ -87,7 +87,7 @@ impl Matcher {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Filter {
     include: Vec<Matcher>,
     exclude: Vec<Matcher>,

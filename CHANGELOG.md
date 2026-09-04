@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+### Added
+
+- Add interactive `/` command-name filtering while monitoring from a terminal,
+  with editable current filters, Backspace-to-clear behavior, and support for
+  the existing literal, negative, and regular-expression filter syntax.
+
 ### Changed
 
 - Batch records per producer and route them directly to the output thread,
