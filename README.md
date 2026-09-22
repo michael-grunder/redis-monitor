@@ -75,8 +75,8 @@ Options:
           
       --stdin
           Read from stdin instead of connecting to servers
-      --no-batch
-          Disable producer batching for the lowest output latency
+      --batch
+          Enable producer batching for higher throughput (may delay records by 5 ms)
       --debug
           Output debug information such as detailed filter info
   -h, --help
@@ -112,18 +112,21 @@ Invalid instance arguments, malformed discovered or explicit config files,
 incomplete named instances, invalid TLS files, and malformed cluster metadata
 also exit nonzero with contextual errors rather than panic.
 
-By default, each source batches up to 64 records or 256 KiB for at most 5 ms
-before handing them directly to the output thread. Queued and producer-held
-batches share a 64 MiB byte budget, with a bounded batch count as a secondary
+By default, each source hands off accepted records individually to the output
+thread for minimum output latency. Use `--batch` to improve throughput under
+load by batching up to 64 records or 256 KiB per source for at most 5 ms before
+handoff. In both modes, queued and producer-held records share a 64 MiB byte
+budget, with a bounded queue length as a secondary
 guard. This preserves every accepted record and applies backpressure instead of
 dropping data when output is slow. A record larger than the byte budget is
 allowed through while temporarily consuming the full budget.
 
-Records from an individual source retain their original order. With multiple
-sources, each source's batches are atomic at the output queue, but there is no
-total ordering guarantee between sources. Use `--no-batch` to hand off each
-accepted record individually when minimum output latency is more important than
-throughput under load.
+Records from an individual source retain their original order in both modes.
+There is no total ordering guarantee between sources, and output is not sorted
+by timestamp. With `--batch`, each source's batches are atomic at the output
+queue, so batching can further change how records from different sources are
+interleaved. The former `--no-batch` flag has been removed; omit `--batch` for
+individual record handoff.
 
 Examples:
   # Monitor localhost:6379 by default

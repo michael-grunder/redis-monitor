@@ -162,9 +162,9 @@ struct Options {
 
     #[arg(
         long,
-        help = "Disable producer batching for the lowest output latency"
+        help = "Enable producer batching for higher throughput (may delay records by 5 ms)"
     )]
-    no_batch: bool,
+    batch: bool,
 
     #[arg(
         long,
@@ -1383,11 +1383,11 @@ async fn run_stdin(
         .format
         .clone()
         .unwrap_or_else(|| DEFAULT_SINGLE_FORMAT.to_string());
-    let batch_config = BatchConfig::new(!opt.no_batch);
-    let queue_size = if opt.no_batch {
-        OUTPUT_IMMEDIATE_CAPACITY
-    } else {
+    let batch_config = BatchConfig::new(opt.batch);
+    let queue_size = if opt.batch {
         OUTPUT_BATCH_CAPACITY
+    } else {
+        OUTPUT_IMMEDIATE_CAPACITY
     };
 
     let (io_tx, io_jh) = start_io_thread(
@@ -1465,11 +1465,11 @@ async fn run_wire(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
         None
     };
     let filter = LineFilter::from_options(&opt)?;
-    let batch_config = BatchConfig::new(!opt.no_batch);
-    let queue_size = if opt.no_batch {
-        OUTPUT_IMMEDIATE_CAPACITY
-    } else {
+    let batch_config = BatchConfig::new(opt.batch);
+    let queue_size = if opt.batch {
         OUTPUT_BATCH_CAPACITY
+    } else {
+        OUTPUT_IMMEDIATE_CAPACITY
     };
 
     let (io_tx, io_jh) = start_io_thread(
@@ -1662,26 +1662,28 @@ mod tests {
     }
 
     #[test]
-    fn batching_is_enabled_by_default_and_can_be_disabled() {
-        assert!(!Options::try_parse_from(["redis-monitor"]).unwrap().no_batch);
+    fn batching_is_disabled_by_default_and_can_be_enabled() {
+        assert!(!Options::try_parse_from(["redis-monitor"]).unwrap().batch);
         assert!(
-            Options::try_parse_from(["redis-monitor", "--no-batch"])
+            Options::try_parse_from(["redis-monitor", "--batch"])
                 .unwrap()
-                .no_batch
+                .batch
+        );
+        assert_eq!(
+            Options::try_parse_from(["redis-monitor", "--no-batch"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::UnknownArgument
         );
     }
 
     #[tokio::test]
-    async fn batches_records_by_default_and_preserves_source_order() {
-        let batches = reader_batches(
-            b"one\ntwo\nthree\n",
-            BatchConfig {
-                records: 3,
-                bytes: 1024,
-                delay: Duration::from_mins(1),
-            },
-        )
-        .await;
+    async fn batch_flag_batches_records_and_preserves_source_order() {
+        let opt =
+            Options::try_parse_from(["redis-monitor", "--batch"]).unwrap();
+        let batches =
+            reader_batches(b"one\ntwo\nthree\n", BatchConfig::new(opt.batch))
+                .await;
 
         assert_eq!(batches.len(), 1);
         assert_eq!(
@@ -1692,15 +1694,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_batch_sends_each_record_immediately() {
+    async fn default_sends_each_record_individually() {
+        let opt = Options::try_parse_from(["redis-monitor"]).unwrap();
         let batches =
-            reader_batches(b"one\ntwo\nthree\n", BatchConfig::new(false)).await;
+            reader_batches(b"one\ntwo\nthree\n", BatchConfig::new(opt.batch))
+                .await;
 
         assert_eq!(batches.len(), 3);
         assert_eq!(batches[0].lines().next(), Some(b"one".as_slice()));
         assert_eq!(batches[1].lines().next(), Some(b"two".as_slice()));
         assert_eq!(batches[2].lines().next(), Some(b"three".as_slice()));
         drop(batches);
+    }
+
+    #[tokio::test]
+    async fn default_sends_record_without_waiting_for_more_input() {
+        let opt = Options::try_parse_from(["redis-monitor"]).unwrap();
+        let (io, rx) = test_io(2, 1024);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut input, reader) = tokio::io::duplex(64);
+        input.write_all(b"one\n").await.unwrap();
+
+        let mut task = Box::pin(run_from_reader(
+            "stdin",
+            reader,
+            io,
+            empty_filter(),
+            BatchConfig::new(opt.batch),
+            shutdown_rx,
+        ));
+        assert!(futures::poll!(task.as_mut()).is_pending());
+        let IoMessage::Batch(batch) = rx.try_recv().unwrap() else {
+            panic!("expected immediate record");
+        };
+        assert_eq!(batch.lines().collect::<Vec<_>>(), [b"one".as_slice()]);
+
+        drop(input);
+        task.await;
     }
 
     #[tokio::test]

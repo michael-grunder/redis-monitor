@@ -10,8 +10,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - Batch records per producer and route them directly to the output thread,
   reducing queue contention and repeated source-metadata updates. Batching is
-  bounded by record count, bytes, and a 5 ms deadline, and can be disabled with
-  `--no-batch` for minimum output latency.
+  bounded by record count, bytes, and a 5 ms deadline, and is opt-in with
+  `--batch`. By default, hand off each accepted record individually for minimum
+  output latency. This replaces `--no-batch` and applies to both stdin and live
+  connections; per-source order is preserved, with no cross-source ordering
+  guarantee.
 - Bound queued record data with a shared 64 MiB byte budget while retaining a
   smaller item-count guard and lossless backpressure, including support for
   oversized individual records.
