@@ -10,7 +10,7 @@ use std::{
     str::FromStr, time::Instant,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Bytes, BytesMut};
 use clap::{ArgAction, CommandFactory, Parser};
 use clap_complete::{Shell, generate};
@@ -19,12 +19,9 @@ use connection::{ServerAddr, TlsConfig};
 use filter::Filter;
 use output::OutputKind;
 use rand::{RngExt, rngs::ThreadRng};
-use redis::{
-    Client, ConnectionAddr, ConnectionInfo, IntoConnectionInfo,
-    RedisConnectionInfo, aio::ConnectionManager as RedisConnectionManager,
-};
+use redis::{Client, aio::ConnectionManager as RedisConnectionManager};
 use tokio::{
-    io::{self, AsyncRead, AsyncReadExt, BufReader},
+    io::{self, AsyncRead, AsyncReadExt},
     sync::{OwnedSemaphorePermit, Semaphore, watch},
     task::JoinSet,
     time::{Duration, sleep, sleep_until},
@@ -35,7 +32,7 @@ use crate::{
     config::{Map, ServerAuth},
     connection::{Cluster, Monitor},
     filter::FilterPattern,
-    output::OutputHandler,
+    output::{InvalidLine, OutputHandler},
 };
 
 mod commands;
@@ -154,8 +151,13 @@ struct Options {
     #[arg(short, long, help = "Display the version and exit")]
     version: bool,
 
-    #[arg(long, value_parser = validate_positive_f64)]
-    stats: Option<f64>,
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        value_parser = parse_interval,
+        help = "Periodically report per-command statistics (plain output only)"
+    )]
+    stats: Option<Duration>,
 
     #[arg(long, help = "Read from stdin instead of connecting to servers")]
     stdin: bool,
@@ -196,6 +198,8 @@ const DEFAULT_BATCH_DELAY: Duration = Duration::from_millis(5);
 const OUTPUT_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 const OUTPUT_BATCH_CAPACITY: usize = 1024;
 const OUTPUT_IMMEDIATE_CAPACITY: usize = 16_384;
+const READ_CHUNK: usize = 64 * 1024;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Simple wrapper tat just eprintln!s with a [WARNING] prefix
 macro_rules !warn {
@@ -204,22 +208,16 @@ macro_rules !warn {
     };
 }
 
-fn validate_positive_f64(s: &str) -> Result<f64> {
-    match s.parse::<f64>() {
-        Ok(val) if val > 0.0 => Ok(val),
-        Ok(_) => Err(anyhow!("Value must be positive".to_string())),
-        Err(_) => Err(anyhow!("Invalid number".to_string())),
+fn parse_interval(s: &str) -> Result<Duration> {
+    let secs: f64 = s.parse().context("Invalid number")?;
+    if secs.is_nan() || secs <= 0.0 {
+        bail!("Value must be positive");
     }
-}
-
-impl From<Vec<String>> for commands::Filter {
-    fn from(flags: Vec<String>) -> Self {
-        Options::parse_flags(flags.iter().map(String::as_str))
-    }
+    Duration::try_from_secs_f64(secs).map_err(|_| anyhow!("Value is too large"))
 }
 
 impl Options {
-    fn parse_flags<'a, I>(it: I) -> commands::Filter
+    fn parse_flags<'a, I>(it: I) -> Result<commands::Filter>
     where
         I: IntoIterator<Item = &'a str>,
     {
@@ -237,14 +235,16 @@ impl Options {
                     acl |= c;
                 } else if let Ok(f) = Flags::from_str(s) {
                     flags |= f;
+                } else {
+                    bail!("Unknown command flag or @category '{s}'");
                 }
             }
         }
 
-        commands::Filter {
+        Ok(commands::Filter {
             flags: (!flags.is_empty()).then_some(flags),
             categories: (!acl.is_empty()).then_some(acl),
-        }
+        })
     }
 
     fn get_tls_config(&self) -> Result<Option<Arc<TlsConfig>>> {
@@ -279,14 +279,15 @@ fn process_cluster_instances(
         let address = ServerAddr::from_str(input).with_context(|| {
             format!("Invalid Redis Cluster seed address '{input}'")
         })?;
-        let cluster = Cluster::from_seed(&address).with_context(|| {
-            format!(
-                "Failed to discover a Redis Cluster from seed '{input}' \
+        let cluster = Cluster::from_seed(&address, auth, tls.map(Arc::as_ref))
+            .with_context(|| {
+                format!(
+                    "Failed to discover a Redis Cluster from seed '{input}' \
                  (resolved to {address}). The seed must be reachable and have \
                  Redis Cluster enabled; remove --cluster to monitor a \
                  standalone instance"
-            )
-        })?;
+                )
+            })?;
 
         for primary in cluster.get_nodes() {
             if opt.replicas {
@@ -378,6 +379,7 @@ struct Backoff {
 #[derive(Clone)]
 struct LineFilter {
     empty: bool,
+    db: Option<u64>,
     names: Filter,
     flags: commands::Filter,
 }
@@ -499,6 +501,11 @@ impl IoHandle {
 }
 
 impl BatchConfig {
+    /// With batching enabled, producers hold records for up to
+    /// `DEFAULT_BATCH_DELAY` to coalesce them. Otherwise nothing is ever held
+    /// back: every complete record already in the read buffer is handed off
+    /// at once, so records that arrived in the same read share a message but
+    /// no record waits for later input.
     const fn new(enabled: bool) -> Self {
         if enabled {
             Self {
@@ -508,8 +515,8 @@ impl BatchConfig {
             }
         } else {
             Self {
-                records: 1,
-                bytes: usize::MAX,
+                records: usize::MAX,
+                bytes: DEFAULT_BATCH_BYTES,
                 delay: Duration::ZERO,
             }
         }
@@ -708,6 +715,7 @@ impl fmt::Debug for LineFilter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LineFilter")
             .field("empty", &self.empty)
+            .field("db", &self.db)
             .field("names", &self.names)
             .field("flags", &self.flags)
             .finish()
@@ -717,14 +725,19 @@ impl fmt::Debug for LineFilter {
 impl LineFilter {
     fn from_options(opt: &Options) -> Result<Self> {
         let names = Filter::try_from(opt.filter.clone())?;
-        let flags = opt.flags.clone().into();
-        Ok(Self::new(names, flags))
+        let flags = Options::parse_flags(opt.flags.iter().map(String::as_str))?;
+        Ok(Self::new(opt.db, names, flags))
     }
 
-    const fn new(names: Filter, flags: commands::Filter) -> Self {
-        let empty = names.is_empty() && flags.is_empty();
+    const fn new(
+        db: Option<u64>,
+        names: Filter,
+        flags: commands::Filter,
+    ) -> Self {
+        let empty = db.is_none() && names.is_empty() && flags.is_empty();
         Self {
             empty,
+            db,
             names,
             flags,
         }
@@ -740,6 +753,18 @@ impl LineFilter {
         Some(&line[start + 1..end])
     }
 
+    /// The database number from `<timestamp> [<db> <client>] ...`.
+    #[inline]
+    fn db(line: &[u8]) -> Option<u64> {
+        let start = memchr::memchr(b'[', line)? + 1;
+        let digits = &line[start..];
+        let len = digits
+            .iter()
+            .position(|b| !b.is_ascii_digit())
+            .unwrap_or(digits.len());
+        lexical_core::parse(&digits[..len]).ok()
+    }
+
     #[inline]
     const fn needs_cmds(&self) -> bool {
         !self.flags.is_empty()
@@ -752,6 +777,16 @@ impl LineFilter {
         line: &[u8],
     ) -> bool {
         if self.empty {
+            return true;
+        }
+
+        if let Some(db) = self.db
+            && Self::db(line) != Some(db)
+        {
+            return false;
+        }
+
+        if self.names.is_empty() && self.flags.is_empty() {
             return true;
         }
 
@@ -933,6 +968,11 @@ async fn drain_frames(
     Ok(())
 }
 
+/// Resolves once shutdown is requested (or the shutdown sender is gone).
+async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
+    let _ = shutdown.wait_for(|stop| *stop).await;
+}
+
 async fn consume_reader<R>(
     mut reader: R,
     filter: &LineFilter,
@@ -945,7 +985,7 @@ async fn consume_reader<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut buf = BytesMut::with_capacity(16 * 1024);
+    let mut buf = BytesMut::new();
 
     loop {
         if drain_frames(&mut buf, filter, commands, stats, sender)
@@ -960,6 +1000,9 @@ where
             return StreamExit::Shutdown;
         }
 
+        // Guarantee a reasonably sized read: when the buffer is exactly full,
+        // `BytesMut` would otherwise offer only a few bytes of spare capacity.
+        buf.reserve(READ_CHUNK);
         let read = async {
             match reader.read_buf(&mut buf).await {
                 Ok(0) => ReadEvent::End,
@@ -974,13 +1017,7 @@ where
         let outcome = if let Some(deadline) = sender.deadline() {
             tokio::select! {
                 biased;
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        Some(StreamExit::Shutdown)
-                    } else {
-                        None
-                    }
-                }
+                () = shutdown_requested(shutdown) => Some(StreamExit::Shutdown),
                 () = sleep_until(deadline) => {
                     if sender.flush().await.is_err() {
                         Some(StreamExit::OutputClosed)
@@ -996,13 +1033,7 @@ where
         } else {
             tokio::select! {
                 biased;
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        Some(StreamExit::Shutdown)
-                    } else {
-                        None
-                    }
-                }
+                () = shutdown_requested(shutdown) => Some(StreamExit::Shutdown),
                 read_event = read => match read_event {
                     ReadEvent::Data => None,
                     ReadEvent::End => Some(StreamExit::End),
@@ -1078,21 +1109,35 @@ async fn run_monitor(
     let mut sender = BatchSender::new(io, source, config);
     let mut backoff = Backoff::new();
     let mut stats = LocalStats::new(1000);
-    let cmds = if filter.needs_cmds() {
-        load_cmds(&mon).await
-    } else {
-        None
-    };
+    let mut cmds = None;
 
     loop {
-        if *shutdown.borrow() {
-            break;
-        }
+        let connected = tokio::select! {
+            biased;
+            () = shutdown_requested(&mut shutdown) => break,
+            result = tokio::time::timeout(CONNECT_TIMEOUT, mon.connect()) => {
+                result.unwrap_or_else(|_| {
+                    Err(anyhow!("timed out after {CONNECT_TIMEOUT:?}"))
+                })
+            }
+        };
 
-        match mon.clone().connect().await {
-            Ok((_, reader)) => {
+        match connected {
+            Ok((stream, pending)) => {
                 backoff.reset();
 
+                // Load metadata lazily so a server that is down at startup
+                // still gets flag filtering once it becomes reachable.
+                if cmds.is_none() && filter.needs_cmds() {
+                    cmds = tokio::select! {
+                        biased;
+                        () = shutdown_requested(&mut shutdown) => break,
+                        cmds = load_cmds(&mon) => cmds,
+                    };
+                }
+
+                // Replay anything that arrived along with the MONITOR reply.
+                let reader = std::io::Cursor::new(pending).chain(stream);
                 match consume_reader(
                     reader,
                     &filter,
@@ -1118,12 +1163,9 @@ async fn run_monitor(
         }
 
         tokio::select! {
+            biased;
+            () = shutdown_requested(&mut shutdown) => break,
             () = sleep(backoff.delay()) => {}
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    break;
-                }
-            }
         }
     }
 
@@ -1139,43 +1181,38 @@ enum Control {
 }
 
 async fn load_cmds(mon: &Monitor) -> Option<commands::Lookup> {
-    let addr = mon.address.to_string();
-
-    let mut manager = match connection_manager_for_monitor(mon).await {
-        Ok(manager) => manager,
-        Err(err) => {
-            eprintln!(
-                "{addr} failed to create COMMAND metadata connection: {err}"
-            );
-            return None;
-        }
+    let addr = &mon.address;
+    let load = async {
+        let client = Client::open(connection::connection_info(
+            addr,
+            &mon.auth,
+            mon.tls.as_deref(),
+        ))
+        .context("Failed to create Redis client")?;
+        let mut manager: RedisConnectionManager = client
+            .get_connection_manager()
+            .await
+            .context("Failed to open async connection")?;
+        Command::load(&mut manager).await
     };
 
-    if let Err(err) = mon.auth.auth(&mut manager).await {
-        eprintln!("{addr} AUTH failed while loading COMMAND metadata: {err}");
-        return None;
-    }
-
-    match Command::load(&mut manager).await {
-        Ok(commands) => Some(commands.into()),
-        Err(err) => {
-            eprintln!("{addr} failed to load COMMAND metadata: {err}");
+    match tokio::time::timeout(CONNECT_TIMEOUT, load).await {
+        Ok(Ok(commands)) => Some(commands.into()),
+        Ok(Err(err)) => {
+            eprintln!(
+                "{addr} failed to load COMMAND metadata; --flags will not \
+                 filter this source: {err:#}"
+            );
+            None
+        }
+        Err(_) => {
+            eprintln!(
+                "{addr} timed out loading COMMAND metadata; --flags will not \
+                 filter this source"
+            );
             None
         }
     }
-}
-
-async fn connection_manager_for_monitor(
-    mon: &Monitor,
-) -> Result<RedisConnectionManager> {
-    let addr = mon.address.to_string();
-    let client = Client::open(connection_info_from_monitor(mon))
-        .with_context(|| format!("Failed to create Redis client for {addr}"))?;
-
-    client
-        .get_connection_manager()
-        .await
-        .with_context(|| format!("Failed to open async connection to {addr}"))
 }
 
 fn print_final_stats() {
@@ -1184,36 +1221,6 @@ fn print_final_stats() {
         "Processed {total} lines (filtered: {filtered}), backpressure stalls: \
         {stalls}"
     );
-}
-
-fn connection_info_from_monitor(mon: &Monitor) -> ConnectionInfo {
-    let addr = match &mon.address {
-        ServerAddr::Tcp(host, port, _) => {
-            if mon.tls.is_some() {
-                ConnectionAddr::TcpTls {
-                    host: host.clone(),
-                    port: *port,
-                    insecure: mon.tls.as_ref().is_some_and(|cfg| cfg.insecure),
-                    tls_params: None,
-                }
-            } else {
-                ConnectionAddr::Tcp(host.clone(), *port)
-            }
-        }
-        ServerAddr::Unix(path) => ConnectionAddr::Unix(PathBuf::from(path)),
-    };
-
-    let mut redis = RedisConnectionInfo::default();
-    if let Some(user) = &mon.auth.user {
-        redis = redis.set_username(user);
-    }
-    if let Some(pass) = &mon.auth.pass {
-        redis = redis.set_password(pass);
-    }
-
-    addr.into_connection_info()
-        .expect("ConnectionAddr::into_connection_info cannot fail")
-        .set_redis_settings(redis)
 }
 
 struct OutputStats {
@@ -1231,13 +1238,14 @@ impl OutputStats {
         }
     }
 
-    fn record(&mut self, line: &[u8], w: &mut dyn OutputHandler) {
+    fn record(&mut self, line: &[u8]) {
         self.commands.try_incr(line, line.len());
+    }
+
+    /// Checked once per output drain rather than per record.
+    fn report_if_due(&mut self, w: &mut dyn OutputHandler) {
         if self.tick.elapsed() >= self.interval {
-            if let Err(e) = w
-                .write_stats(&self.commands.get_stats())
-                .and_then(|()| w.flush())
-            {
+            if let Err(e) = w.write_stats(&self.commands.get_stats()) {
                 eprintln!("Error writing stats: {e}");
             }
             self.tick = Instant::now();
@@ -1246,11 +1254,13 @@ impl OutputStats {
 }
 
 impl IoMessage {
+    /// Write the message. Unparseable records are reported and skipped;
+    /// any other error means the output itself failed and is returned.
     fn process(
         self,
         w: &mut dyn OutputHandler,
-        stats: &mut Option<OutputStats>,
-    ) -> Control {
+        mut stats: Option<&mut OutputStats>,
+    ) -> Result<Control> {
         match self {
             Self::Preamble(servers) => {
                 eprintln!("{}", format_preamble(&servers));
@@ -1261,23 +1271,27 @@ impl IoMessage {
                         continue;
                     }
 
-                    if let Some(stats) = stats.as_mut() {
-                        stats.record(line, w);
+                    if let Some(stats) = stats.as_deref_mut() {
+                        stats.record(line);
                     }
 
-                    if let Err(e) = w.write_raw_line(
+                    match w.write_raw_line(
                         &batch.source.server,
                         batch.source.name.as_ref().as_deref(),
                         line,
                     ) {
-                        eprintln!("Error handling record: {e}");
+                        Ok(()) => {}
+                        Err(e) if e.is::<InvalidLine>() => {
+                            eprintln!("Error handling record: {e}");
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
             }
-            Self::Shutdown => return Control::Shutdown,
+            Self::Shutdown => return Ok(Control::Shutdown),
         }
 
-        Control::Continue
+        Ok(Control::Continue)
     }
 }
 
@@ -1291,15 +1305,60 @@ fn format_preamble(monitor: &[Monitor]) -> String {
     format!("MONITOR: {addresses}")
 }
 
+fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)
+    })
+}
+
+fn run_output(
+    rx: &flume::Receiver<IoMessage>,
+    writer: &mut dyn OutputHandler,
+    mut stats: Option<OutputStats>,
+) -> Result<()> {
+    const DRAIN_MAX: usize = 16;
+
+    let mut last = Instant::now();
+
+    'outer: while let Ok(first) = rx.recv() {
+        let drained =
+            std::iter::once(first).chain(rx.try_iter().take(DRAIN_MAX - 1));
+        for msg in drained {
+            let control = msg.process(writer, stats.as_mut())?;
+            if matches!(control, Control::Shutdown) {
+                break 'outer;
+            }
+        }
+
+        if let Some(stats) = stats.as_mut() {
+            stats.report_if_due(writer);
+        }
+
+        if last.elapsed() >= Duration::from_secs(1) {
+            let (curr, tot) = IO_STATS.fold();
+            if curr > 0 {
+                warn!("backpressure stalls (curr: {curr}, total: {tot})");
+            }
+
+            last = Instant::now();
+        }
+
+        writer.flush()?;
+    }
+
+    writer.flush()
+}
+
 fn start_io_thread(
     output_kind: OutputKind,
     format: &str,
     size: usize,
     byte_budget: usize,
     stats_interval: Option<Duration>,
+    shutdown: watch::Sender<bool>,
 ) -> (IoHandle, std::thread::JoinHandle<Result<()>>) {
-    const DRAIN_MAX: usize = 16;
-
     let (tx, rx) = flume::bounded::<IoMessage>(size);
     let budget = Arc::new(Semaphore::new(byte_budget));
 
@@ -1308,41 +1367,21 @@ fn start_io_thread(
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::with_capacity(1 << 20, stdout.lock());
         let mut writer = output_kind.get_writer(&mut out, &fmt);
-        let mut stats = stats_interval.map(OutputStats::new);
-        let mut last = Instant::now();
-        let mut shutdown = false;
+        let stats = stats_interval.map(OutputStats::new);
 
-        while !shutdown {
-            let Ok(first) = rx.recv() else { break };
+        let result = run_output(&rx, writer.as_mut(), stats);
 
-            match first.process(writer.as_mut(), &mut stats) {
-                Control::Shutdown => break,
-                Control::Continue => {}
-            }
+        // If output stopped early, make sure no producer keeps waiting on
+        // it: dropping the receiver releases queued byte-budget permits and
+        // fails pending sends, and the shutdown signal stops idle sources.
+        drop(rx);
+        shutdown.send_replace(true);
 
-            for msg in rx.try_iter().take(DRAIN_MAX - 1) {
-                match msg.process(writer.as_mut(), &mut stats) {
-                    Control::Shutdown => {
-                        shutdown = true;
-                        break;
-                    }
-                    Control::Continue => {}
-                }
-            }
-
-            if last.elapsed() >= Duration::from_secs(1) {
-                let (curr, tot) = IO_STATS.fold();
-                if curr > 0 {
-                    warn!("backpressure stalls (curr: {curr}, total: {tot})");
-                }
-
-                last = Instant::now();
-            }
-
-            writer.flush()?;
+        match result {
+            // The reader went away (e.g. `redis-monitor | head`).
+            Err(e) if is_broken_pipe(&e) => Ok(()),
+            result => result,
         }
-
-        Ok(())
     });
 
     (
@@ -1375,27 +1414,39 @@ async fn finish_io(
     result.context("Output thread failed")
 }
 
-async fn run_stdin(
-    opt: Options,
-    shutdown: watch::Receiver<bool>,
-) -> Result<()> {
+const fn queue_size(batch: bool) -> usize {
+    if batch {
+        OUTPUT_BATCH_CAPACITY
+    } else {
+        OUTPUT_IMMEDIATE_CAPACITY
+    }
+}
+
+fn stats_interval(opt: &Options) -> Option<Duration> {
+    opt.stats.filter(|_| opt.output == OutputKind::Plain)
+}
+
+async fn run_stdin(opt: Options, shutdown: watch::Sender<bool>) -> Result<()> {
+    if !opt.flags.is_empty() {
+        bail!(
+            "--flags needs COMMAND metadata from a live server and cannot be \
+             used with --stdin"
+        );
+    }
+    let filter = LineFilter::from_options(&opt)?;
+
     let format = opt
         .format
         .clone()
         .unwrap_or_else(|| DEFAULT_SINGLE_FORMAT.to_string());
-    let batch_config = BatchConfig::new(opt.batch);
-    let queue_size = if opt.batch {
-        OUTPUT_BATCH_CAPACITY
-    } else {
-        OUTPUT_IMMEDIATE_CAPACITY
-    };
 
     let (io_tx, io_jh) = start_io_thread(
         opt.output,
         &format,
-        queue_size,
+        queue_size(opt.batch),
         OUTPUT_BYTE_BUDGET,
-        None,
+        stats_interval(&opt),
+        shutdown.clone(),
     );
 
     let pseudo = Monitor::new(
@@ -1412,16 +1463,13 @@ async fn run_stdin(
         .send(IoMessage::Preamble(Arc::clone(&preamble)))
         .await?;
 
-    let filter = LineFilter::from_options(&opt)?;
-    let stdin = io::stdin();
-    let reader = BufReader::new(stdin);
     run_from_reader(
         "stdin",
-        reader,
+        io::stdin(),
         io_tx.clone(),
         filter,
-        batch_config,
-        shutdown,
+        BatchConfig::new(opt.batch),
+        shutdown.subscribe(),
     )
     .await;
 
@@ -1431,7 +1479,8 @@ async fn run_stdin(
     Ok(())
 }
 
-async fn run_wire(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
+async fn run_wire(opt: Options, shutdown: watch::Sender<bool>) -> Result<()> {
+    let filter = LineFilter::from_options(&opt)?;
     let cfg = Map::load(opt.config_file.as_deref())?;
     let instances: Vec<String> = if opt.instances.is_empty() {
         vec!["localhost:6379".to_string()]
@@ -1459,25 +1508,14 @@ async fn run_wire(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
         }
     });
 
-    let stats_interval = if opt.output == OutputKind::Plain {
-        opt.stats.map(Duration::from_secs_f64)
-    } else {
-        None
-    };
-    let filter = LineFilter::from_options(&opt)?;
     let batch_config = BatchConfig::new(opt.batch);
-    let queue_size = if opt.batch {
-        OUTPUT_BATCH_CAPACITY
-    } else {
-        OUTPUT_IMMEDIATE_CAPACITY
-    };
-
     let (io_tx, io_jh) = start_io_thread(
         opt.output,
         &format,
-        queue_size,
+        queue_size(opt.batch),
         OUTPUT_BYTE_BUDGET,
-        stats_interval,
+        stats_interval(&opt),
+        shutdown.clone(),
     );
 
     let preamble: Arc<[Monitor]> = Arc::from(seeds);
@@ -1486,19 +1524,13 @@ async fn run_wire(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
         .await?;
 
     for mon in preamble.iter().cloned() {
-        let io_task = io_tx.clone();
-        let filter_clone = filter.clone();
-        let shutdown_task = shutdown.clone();
-        tasks.spawn(async move {
-            run_monitor(
-                mon,
-                filter_clone,
-                io_task,
-                batch_config,
-                shutdown_task,
-            )
-            .await;
-        });
+        tasks.spawn(run_monitor(
+            mon,
+            filter.clone(),
+            io_tx.clone(),
+            batch_config,
+            shutdown.subscribe(),
+        ));
     }
 
     while let Some(result) = tasks.join_next().await {
@@ -1513,7 +1545,7 @@ async fn run_wire(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
     Ok(())
 }
 
-async fn run(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
+async fn run(opt: Options, shutdown: watch::Sender<bool>) -> Result<()> {
     if opt.stdin {
         run_stdin(opt, shutdown).await
     } else {
@@ -1521,8 +1553,27 @@ async fn run(opt: Options, shutdown: watch::Receiver<bool>) -> Result<()> {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+async fn async_main(opt: Options) -> Result<()> {
+    let (shutdown_tx, _) = watch::channel(false);
+    let run = run(opt, shutdown_tx.clone());
+    tokio::pin!(run);
+
+    tokio::select! {
+        r = &mut run => r,
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!(
+                "\nCtrl-C received, shutting down (press again to force)..."
+            );
+            shutdown_tx.send_replace(true);
+            tokio::select! {
+                r = &mut run => r,
+                _ = tokio::signal::ctrl_c() => std::process::exit(130),
+            }
+        }
+    }
+}
+
+fn main() -> Result<()> {
     let opt: Options = Options::parse();
 
     if opt.version {
@@ -1541,20 +1592,15 @@ async fn main() -> Result<()> {
         eprintln!("{filter:#?}");
     }
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let run = run(opt, shutdown_rx);
-    tokio::pin!(run);
-
-    let res = tokio::select! {
-        r = &mut run => r,
-        _ = tokio::signal::ctrl_c() => {
-            eprintln!("\nCtrl-C received, shutting down...");
-            let _ = shutdown_tx.send(true);
-            run.await
-        }
-    };
-
-    res
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("Failed to start the async runtime")?;
+    let result = runtime.block_on(async_main(opt));
+    // A stdin read parked on the blocking pool cannot be cancelled; don't let
+    // it hold the process open after everything else has finished.
+    runtime.shutdown_timeout(Duration::from_millis(100));
+    result
 }
 
 #[cfg(test)]
@@ -1577,6 +1623,24 @@ mod tests {
         ) -> Result<()> {
             self.lines += 1;
             Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer whose output has gone away, like stdout piped into `head`.
+    struct ClosedWriter;
+
+    impl OutputHandler for ClosedWriter {
+        fn write_line(
+            &mut self,
+            _server: &ServerAddr,
+            _name: Option<&str>,
+            _line: &Line,
+        ) -> Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into())
         }
 
         fn flush(&mut self) -> Result<()> {
@@ -1632,6 +1696,7 @@ mod tests {
 
     fn empty_filter() -> LineFilter {
         LineFilter::new(
+            None,
             Filter::new(Vec::new()).unwrap(),
             commands::Filter::default(),
         )
@@ -1694,17 +1759,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_sends_each_record_individually() {
+    async fn default_hands_off_each_read_without_holding_records() {
         let opt = Options::try_parse_from(["redis-monitor"]).unwrap();
-        let batches =
-            reader_batches(b"one\ntwo\nthree\n", BatchConfig::new(opt.batch))
-                .await;
+        let (io, rx) = test_io(4, 1024);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut input, reader) = tokio::io::duplex(64);
+        let mut task = Box::pin(run_from_reader(
+            "stdin",
+            reader,
+            io,
+            empty_filter(),
+            BatchConfig::new(opt.batch),
+            shutdown_rx,
+        ));
 
-        assert_eq!(batches.len(), 3);
-        assert_eq!(batches[0].lines().next(), Some(b"one".as_slice()));
-        assert_eq!(batches[1].lines().next(), Some(b"two".as_slice()));
-        assert_eq!(batches[2].lines().next(), Some(b"three".as_slice()));
-        drop(batches);
+        // Records that arrive together are handed off together...
+        input.write_all(b"one\ntwo\n").await.unwrap();
+        assert!(futures::poll!(task.as_mut()).is_pending());
+        let IoMessage::Batch(batch) = rx.try_recv().unwrap() else {
+            panic!("expected immediate batch");
+        };
+        assert_eq!(batch.lines().collect::<Vec<_>>(), [b"one", b"two"]);
+        assert!(rx.try_recv().is_err());
+
+        // ...and a later record is not held back waiting for more input.
+        input.write_all(b"three\n").await.unwrap();
+        assert!(futures::poll!(task.as_mut()).is_pending());
+        let IoMessage::Batch(batch) = rx.try_recv().unwrap() else {
+            panic!("expected immediate batch");
+        };
+        assert_eq!(batch.lines().collect::<Vec<_>>(), [b"three"]);
+
+        drop(input);
+        task.await;
     }
 
     #[tokio::test]
@@ -1874,9 +1961,8 @@ mod tests {
     #[test]
     fn ignores_standalone_ok_reply_after_parse_failure() {
         let mut writer = TestWriter::default();
-        let mut stats = None;
 
-        let control = test_message(b"OK").process(&mut writer, &mut stats);
+        let control = test_message(b"OK").process(&mut writer, None).unwrap();
 
         assert!(matches!(control, Control::Continue));
         assert_eq!(writer.lines, 0);
@@ -1885,12 +1971,12 @@ mod tests {
     #[test]
     fn malformed_record_does_not_discard_the_rest_of_its_batch() {
         let mut writer = TestWriter::default();
-        let mut stats = None;
         let valid = b"1.000000 [0 127.0.0.1:1] \"PING\"";
 
         let control =
             IoMessage::Batch(test_batch("stdin", &[b"PONG", valid.as_slice()]))
-                .process(&mut writer, &mut stats);
+                .process(&mut writer, None)
+                .unwrap();
 
         assert!(matches!(control, Control::Continue));
         assert_eq!(writer.lines, 1);
@@ -1940,5 +2026,138 @@ mod tests {
                 .is_err()
         );
         assert_eq!(stats.snapshot().2, 0);
+    }
+
+    #[test]
+    fn output_failure_is_returned_rather_than_logged_per_record() {
+        let valid: &[u8] = b"1.000000 [0 127.0.0.1:1] \"PING\"";
+        let error = IoMessage::Batch(test_batch("stdin", &[valid, valid]))
+            .process(&mut ClosedWriter, None)
+            .unwrap_err();
+
+        assert!(is_broken_pipe(&error));
+    }
+
+    #[test]
+    fn output_loop_stops_on_output_failure() {
+        let (tx, rx) = flume::bounded(4);
+        tx.send(test_message(b"1.000000 [0 127.0.0.1:1] \"PING\""))
+            .unwrap();
+        tx.send(test_message(b"1.000000 [0 127.0.0.1:1] \"PING\""))
+            .unwrap();
+
+        let error = run_output(&rx, &mut ClosedWriter, None).unwrap_err();
+
+        assert!(is_broken_pipe(&error));
+        assert_eq!(rx.len(), 1, "the loop must stop at the first failure");
+    }
+
+    fn db_filter(db: u64) -> LineFilter {
+        LineFilter::new(
+            Some(db),
+            Filter::new(Vec::new()).unwrap(),
+            commands::Filter::default(),
+        )
+    }
+
+    #[test]
+    fn db_filter_selects_only_the_requested_database() {
+        let filter = db_filter(3);
+
+        assert!(filter.matches(None, br#"1.0 [3 127.0.0.1:1] "GET" "k""#));
+        assert!(!filter.matches(None, br#"1.0 [0 127.0.0.1:1] "GET" "k""#));
+        assert!(!filter.matches(None, br#"1.0 [30 127.0.0.1:1] "GET" "k""#));
+        assert!(!filter.matches(None, b"1.0 "));
+        assert!(!filter.matches(None, b"OK"));
+        assert!(
+            !filter.matches(
+                None,
+                br#"1.0 [99999999999999999999 127.0.0.1:1] "GET""#
+            )
+        );
+    }
+
+    #[test]
+    fn db_option_is_applied_to_the_line_filter() {
+        let opt =
+            Options::try_parse_from(["redis-monitor", "--db", "2"]).unwrap();
+        let filter = LineFilter::from_options(&opt).unwrap();
+
+        assert!(filter.matches(None, br#"1.0 [2 127.0.0.1:1] "GET""#));
+        assert!(!filter.matches(None, br#"1.0 [1 127.0.0.1:1] "GET""#));
+    }
+
+    #[test]
+    fn flags_reject_unknown_names() {
+        let error = Options::parse_flags(["write,wrtie"]).unwrap_err();
+        assert!(error.to_string().contains("wrtie"));
+
+        let filter = Options::parse_flags(["write, @hash", "fast"]).unwrap();
+        assert_eq!(filter.flags, Some(Flags::WRITE | Flags::FAST));
+        assert_eq!(filter.categories, Some(Categories::HASH));
+        assert!(Options::parse_flags([" , "]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stats_interval_must_be_positive_and_finite() {
+        assert_eq!(parse_interval("0.5").unwrap(), Duration::from_millis(500));
+        for bad in ["0", "-1", "nan", "inf", "1e300", "x"] {
+            assert!(parse_interval(bad).is_err(), "accepted {bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stdin_rejects_flag_filters_it_cannot_apply() {
+        let opt = Options::try_parse_from([
+            "redis-monitor",
+            "--stdin",
+            "--flags",
+            "write",
+        ])
+        .unwrap();
+        let (shutdown, _) = watch::channel(false);
+
+        let error = run(opt, shutdown).await.unwrap_err();
+
+        assert!(error.to_string().contains("--flags"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_a_stalled_connection_attempt() {
+        // Accept the connection but never answer MONITOR.
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+
+        let (io, _rx) = test_io(4, 1024);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let monitor = Monitor::new(
+            None,
+            ServerAddr::from_tcp_addr("127.0.0.1", port),
+            None,
+            ServerAuth::default(),
+            None,
+        );
+        let mut task = Box::pin(run_monitor(
+            monitor,
+            empty_filter(),
+            io,
+            BatchConfig::new(false),
+            shutdown_rx,
+        ));
+        // Drive the task until it is parked in the handshake.
+        for _ in 0..10 {
+            assert!(futures::poll!(task.as_mut()).is_pending());
+            tokio::task::yield_now().await;
+        }
+
+        shutdown_tx.send_replace(true);
+        assert!(futures::poll!(task.as_mut()).is_ready());
+        server.abort();
     }
 }

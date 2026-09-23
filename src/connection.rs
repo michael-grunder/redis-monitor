@@ -5,16 +5,20 @@ use std::{
     fs,
     hash::{Hash, Hasher},
     io::{Cursor, Write},
-    net::IpAddr,
-    path::Path,
+    net::{IpAddr, Ipv6Addr},
+    path::{Path, PathBuf},
     pin::Pin,
     str::FromStr,
     sync::Arc,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use bytes::BytesMut;
 use colored::Color;
-use redis::{Client, Connection, Value};
+use redis::{
+    Client, Connection, ConnectionAddr, ConnectionInfo, IntoConnectionInfo,
+    RedisConnectionInfo, Value,
+};
 use rustls::client::danger::ServerCertVerifier;
 use rustls::{
     ClientConfig, RootCertStore,
@@ -197,6 +201,10 @@ impl Hash for ClusterNode {
 impl std::fmt::Display for ServerAddr {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
+            // Bracket IPv6 literals so the port separator is unambiguous.
+            Self::Tcp(host, port, _) if host.contains(':') => {
+                write!(f, "[{host}]:{port}")
+            }
             Self::Tcp(host, port, _) => write!(f, "{host}:{port}"),
             Self::Unix(path) => write!(f, "{path}"),
         }
@@ -222,17 +230,13 @@ impl ServerAddr {
         Self::Unix(path.as_ref().to_string())
     }
 
-    pub fn get_url_string(&self) -> String {
-        match self {
-            Self::Tcp(host, port, _) => format!("redis://{host}:{port}"),
-            Self::Unix(path) => format!("unix://{path}"),
-        }
-    }
-
-    fn get_connection(&self) -> Result<Connection> {
-        let uri = self.get_url_string();
-        let cli = Client::open(&*uri)
-            .with_context(|| format!("Failed to open connection to {uri}"))?;
+    fn get_connection(
+        &self,
+        auth: &ServerAuth,
+        tls: Option<&TlsConfig>,
+    ) -> Result<Connection> {
+        let cli = Client::open(connection_info(self, auth, tls))
+            .with_context(|| format!("Failed to open connection to {self}"))?;
         let con = cli.get_connection().map_err(|e| {
             anyhow!("Failed to get connection from client: {e}")
         })?;
@@ -241,28 +245,84 @@ impl ServerAddr {
     }
 }
 
+/// Build `redis` crate connection settings for an auxiliary (non-MONITOR)
+/// connection such as cluster discovery or `COMMAND` metadata.
+pub fn connection_info(
+    address: &ServerAddr,
+    auth: &ServerAuth,
+    tls: Option<&TlsConfig>,
+) -> ConnectionInfo {
+    let addr = match address {
+        ServerAddr::Tcp(host, port, _) => tls.map_or_else(
+            || ConnectionAddr::Tcp(host.clone(), *port),
+            |tls| ConnectionAddr::TcpTls {
+                host: host.clone(),
+                port: *port,
+                insecure: tls.insecure,
+                tls_params: None,
+            },
+        ),
+        ServerAddr::Unix(path) => ConnectionAddr::Unix(PathBuf::from(path)),
+    };
+
+    let mut redis = RedisConnectionInfo::default();
+    if let Some(user) = &auth.user {
+        redis = redis.set_username(user);
+    }
+    if let Some(pass) = &auth.pass {
+        redis = redis.set_password(pass);
+    }
+
+    addr.into_connection_info()
+        .expect("ConnectionAddr::into_connection_info cannot fail")
+        .set_redis_settings(redis)
+}
+
+const DEFAULT_PORT: u16 = 6379;
+
 impl std::str::FromStr for ServerAddr {
     type Err = anyhow::Error;
 
+    /// Accepts `port`, `host`, `host:port`, `[ipv6]`, `[ipv6]:port`, a bare
+    /// IPv6 literal, or a unix socket path (anything containing `/`).
     fn from_str(addr: &str) -> Result<Self, Self::Err> {
-        addr.parse::<u16>().map_or_else(
-            |_| {
-                if addr.contains('/') {
-                    Ok(Self::from_path(addr))
-                } else {
-                    let v: Vec<&str> = addr.split(':').collect();
+        let parse_port = |port: &str| {
+            port.parse::<u16>()
+                .with_context(|| format!("Invalid port '{port}' in '{addr}'"))
+        };
 
-                    let port = if v.len() == 2 {
-                        v[1].parse::<u16>()?
-                    } else {
-                        6379
-                    };
+        if let Ok(port) = addr.parse::<u16>() {
+            return Ok(Self::from_tcp_addr("127.0.0.1", port));
+        }
+        if addr.contains('/') {
+            return Ok(Self::from_path(addr));
+        }
+        if addr.parse::<Ipv6Addr>().is_ok() {
+            return Ok(Self::from_tcp_addr(addr, DEFAULT_PORT));
+        }
 
-                    Ok(Self::from_tcp_addr(v[0], port))
-                }
-            },
-            |port| Ok(Self::from_tcp_addr("127.0.0.1", port)),
-        )
+        let (host, port) = if let Some(rest) = addr.strip_prefix('[') {
+            let (host, rest) = rest.split_once(']').ok_or_else(|| {
+                anyhow!("Missing ']' in bracketed address '{addr}'")
+            })?;
+            let port = match rest {
+                "" => DEFAULT_PORT,
+                _ => parse_port(rest.strip_prefix(':').ok_or_else(|| {
+                    anyhow!("Expected ':<port>' after ']' in '{addr}'")
+                })?)?,
+            };
+            (host, port)
+        } else if let Some((host, port)) = addr.split_once(':') {
+            (host, parse_port(port)?)
+        } else {
+            (addr, DEFAULT_PORT)
+        };
+
+        if host.is_empty() {
+            bail!("Missing host in address '{addr}'");
+        }
+
+        Ok(Self::from_tcp_addr(host, port))
     }
 }
 
@@ -348,15 +408,23 @@ impl Cluster {
             .collect()
     }
 
-    pub fn from_seed(seed: &ServerAddr) -> Result<Self> {
-        let mut con = seed.get_connection()?;
+    pub fn from_seed(
+        seed: &ServerAddr,
+        auth: &ServerAuth,
+        tls: Option<&TlsConfig>,
+    ) -> Result<Self> {
+        let mut con = seed.get_connection(auth, tls)?;
         Ok(Self::new(Self::exec_slots(&mut con)?))
     }
 
-    pub fn from_seeds(seeds: &[ServerAddr]) -> Result<Self> {
+    pub fn from_seeds(
+        seeds: &[ServerAddr],
+        auth: &ServerAuth,
+        tls: Option<&TlsConfig>,
+    ) -> Result<Self> {
         let mut last_error = None;
         for seed in seeds {
-            match Self::from_seed(seed) {
+            match Self::from_seed(seed, auth, tls) {
                 Ok(cluster) => return Ok(cluster),
                 Err(error) => last_error = Some((seed, error)),
             }
@@ -433,15 +501,20 @@ impl Monitor {
         let addresses = entry.get_addresses().with_context(|| {
             format!("Invalid configuration for instance '{name}'")
         })?;
+        let tls = entry
+            .get_tls_config()
+            .with_context(|| {
+                format!("Failed to configure TLS for instance '{name}'")
+            })?
+            .map(Arc::new);
 
         if entry.cluster {
-            let tls = entry
-                .get_tls_config()
-                .with_context(|| {
-                    format!("Failed to configure TLS for instance '{name}'")
-                })?
-                .map(Arc::new);
-            let c = Cluster::from_seeds(&addresses).with_context(|| {
+            let c = Cluster::from_seeds(
+                &addresses,
+                &entry.get_auth(),
+                tls.as_deref(),
+            )
+            .with_context(|| {
                 format!(
                     "Failed to discover the cluster for configured instance \
                      '{name}'"
@@ -466,7 +539,7 @@ impl Monitor {
                     Self::new(
                         Some(name),
                         addr,
-                        None, // TODO: TLS config
+                        tls.clone(),
                         entry.get_auth(),
                         entry.get_color(),
                     )
@@ -514,11 +587,11 @@ impl Monitor {
         Ok(())
     }
 
-    async fn read_line_reply(s: &mut Stream) -> Result<String> {
-        let mut reader = BufReader::new(s);
+    async fn read_line_reply(reader: &mut BufReader<Stream>) -> Result<String> {
         let mut line = String::new();
 
         reader.read_line(&mut line).await?;
+        let line = line.trim_end();
 
         match line.chars().next() {
             Some('+') => Ok(line[1..].to_string()),
@@ -528,7 +601,10 @@ impl Monitor {
         }
     }
 
-    async fn try_auth(auth: &ServerAuth, s: &mut Stream) -> Result<()> {
+    async fn try_auth(
+        auth: &ServerAuth,
+        s: &mut BufReader<Stream>,
+    ) -> Result<()> {
         let resp = match (&auth.user, &auth.pass) {
             (Some(user), Some(pass)) => {
                 Self::to_resp(&["AUTH", user.as_str(), pass.as_str()])
@@ -537,23 +613,26 @@ impl Monitor {
             _ => return Ok(()),
         };
 
-        Self::send_resp(&resp, s).await?;
+        Self::send_resp(&resp, s.get_mut()).await?;
         Self::read_line_reply(s).await?;
 
         Ok(())
     }
 
-    async fn try_monitor(s: &mut Stream) -> Result<()> {
+    async fn try_monitor(s: &mut BufReader<Stream>) -> Result<()> {
         let resp = Self::to_resp(&["MONITOR"]);
 
-        Self::send_resp(&resp, s).await?;
+        Self::send_resp(&resp, s.get_mut()).await?;
         Self::read_line_reply(s).await?;
 
         Ok(())
     }
 
-    pub async fn connect(self) -> Result<(Self, BufReader<Stream>)> {
-        let mut stream = match &self.address {
+    /// Connect, authenticate, and enter MONITOR mode. Returns the stream and
+    /// any bytes that arrived after the MONITOR reply: a busy server often
+    /// sends its first records in the same segment as `+OK`.
+    pub async fn connect(&self) -> Result<(Stream, BytesMut)> {
+        let stream = match &self.address {
             ServerAddr::Tcp(host, port, _) => {
                 let stream = TcpStream::connect((host.as_str(), *port)).await?;
 
@@ -570,10 +649,12 @@ impl Monitor {
             }
         };
 
-        Self::try_auth(&self.auth, &mut stream).await?;
-        Self::try_monitor(&mut stream).await?;
+        let mut reader = BufReader::new(stream);
+        Self::try_auth(&self.auth, &mut reader).await?;
+        Self::try_monitor(&mut reader).await?;
 
-        Ok((self, BufReader::new(stream)))
+        let pending = BytesMut::from(reader.buffer());
+        Ok((reader.into_inner(), pending))
     }
 }
 
@@ -760,5 +841,89 @@ mod tests {
             serde_json::to_string(&address).unwrap(),
             r#"{"Tcp":["127.0.0.1",6379]}"#
         );
+    }
+
+    #[test]
+    fn parses_host_port_and_ipv6_forms() {
+        let cases: &[(&str, &str, u16)] = &[
+            ("7000", "127.0.0.1", 7000),
+            ("redis.example", "redis.example", 6379),
+            ("redis.example:7000", "redis.example", 7000),
+            ("::1", "::1", 6379),
+            ("[::1]", "::1", 6379),
+            ("[2001:db8::1]:7000", "2001:db8::1", 7000),
+        ];
+
+        for (input, host, port) in cases {
+            let ServerAddr::Tcp(h, p, _) = input.parse::<ServerAddr>().unwrap()
+            else {
+                panic!("expected TCP address for {input}");
+            };
+            assert_eq!((h.as_str(), p), (*host, *port), "{input}");
+        }
+
+        assert!(matches!(
+            "/tmp/redis.sock".parse::<ServerAddr>().unwrap(),
+            ServerAddr::Unix(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_addresses() {
+        for input in [
+            "",
+            ":6379",
+            "host:",
+            "host:99999",
+            "[::1",
+            "[::1]x",
+            "a:b:c",
+        ] {
+            assert!(input.parse::<ServerAddr>().is_err(), "accepted {input}");
+        }
+    }
+
+    #[test]
+    fn ipv6_addresses_display_with_brackets() {
+        assert_eq!(
+            ServerAddr::from_tcp_addr("::1", 6379).to_string(),
+            "[::1]:6379"
+        );
+        assert_eq!(
+            ServerAddr::from_tcp_addr("127.0.0.1", 6379).to_string(),
+            "127.0.0.1:6379"
+        );
+    }
+
+    #[tokio::test]
+    async fn records_sent_with_the_monitor_reply_are_kept() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 64];
+            let _ = socket.read(&mut request).await.unwrap();
+            // A busy server's first record often shares a segment with +OK.
+            socket
+                .write_all(b"+OK\r\n+1.0 [0 127.0.0.1:1] \"PING\"\r\n")
+                .await
+                .unwrap();
+            socket
+        });
+
+        let monitor = super::Monitor::new(
+            None,
+            ServerAddr::from_tcp_addr("127.0.0.1", port),
+            None,
+            crate::ServerAuth::default(),
+            None,
+        );
+        let (_stream, pending) = monitor.connect().await.unwrap();
+
+        assert_eq!(&pending[..], b"+1.0 [0 127.0.0.1:1] \"PING\"\r\n");
+        drop(server.await.unwrap());
     }
 }

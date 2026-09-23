@@ -35,11 +35,12 @@ impl CommandStats {
     }
 
     pub fn incr(&mut self, cmd: &str, bytes: usize) {
-        match self.0.get_mut(cmd) {
-            Some(v) => v.incr(bytes),
-            None => {
-                self.0.insert(cmd.to_string(), Stat::new());
-            }
+        if let Some(stat) = self.0.get_mut(cmd) {
+            stat.incr(bytes);
+        } else {
+            let mut stat = Stat::new();
+            stat.incr(bytes);
+            self.0.insert(cmd.to_owned(), stat);
         }
     }
 
@@ -66,5 +67,26 @@ impl CommandStats {
                 bytes: stat.bytes,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CommandStats;
+
+    #[test]
+    fn first_occurrence_of_a_command_is_counted() {
+        let mut stats = CommandStats::new();
+        stats.try_incr(br#"1.0 [0 127.0.0.1:1] "GET" "k""#, 10);
+        stats.try_incr(br#"1.0 [0 127.0.0.1:1] "GET" "k""#, 5);
+        stats.try_incr(br#"1.0 [0 127.0.0.1:1] "SET" "k" "v""#, 7);
+
+        let mut stats = stats.get_stats();
+        stats.sort_by(|a, b| a.name.cmp(&b.name));
+        let counts: Vec<_> = stats
+            .iter()
+            .map(|s| (s.name.as_str(), s.count, s.bytes))
+            .collect();
+        assert_eq!(counts, [("GET", 2, 15), ("SET", 1, 7)]);
     }
 }

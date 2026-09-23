@@ -1,27 +1,23 @@
 use std::process::Command;
 
+/// Run a git command, returning its trimmed stdout, or `None` when git is
+/// unavailable or this is not a git checkout (e.g. a packaged source tree).
+fn git(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 fn main() {
-    let output = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .expect("Failed to execute git rev-parse");
-    let git_hash = String::from_utf8(output.stdout)
-        .expect("Invalid UTF-8")
-        .trim()
-        .to_string();
+    let git_hash = git(&["rev-parse", "--short", "HEAD"])
+        .unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=GIT_HASH={git_hash}");
 
-    println!("cargo:rustc-env=GIT_HASH={}", git_hash);
-
-    let status_output = Command::new("git")
-        .args(["diff", "--shortstat"])
-        .output()
-        .expect("Failed to execute git diff");
-
-    let git_dirty = if !status_output.stdout.is_empty() {
-        "yes"
-    } else {
-        "no"
+    let git_dirty = match git(&["diff", "--shortstat"]) {
+        Some(stat) if !stat.is_empty() => "yes",
+        _ => "no",
     };
-
     println!("cargo:rustc-env=GIT_DIRTY={git_dirty}");
 }

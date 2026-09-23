@@ -71,8 +71,8 @@ Options:
           Path to client private key for TLS
   -v, --version
           Display the version and exit
-      --stats <STATS>
-          
+      --stats <SECONDS>
+          Periodically report per-command statistics (plain output only)
       --stdin
           Read from stdin instead of connecting to servers
       --batch
@@ -103,8 +103,21 @@ Format specifiers:
 
 Structured outputs (`json`, `php`, `csv`, and `resp`) parse MONITOR arguments as
 strings and preserve quoted argument content, including JSON-like values,
-serialized PHP values, and literal backslash sequences.
+serialized PHP values, and literal backslash sequences. CSV output starts with a
+`timestamp,db,addr,cmd,args` header and writes one column per argument.
+Module commands with punctuation in their names, such as `FT.SEARCH` or
+`JSON.SET`, are parsed like any other command.
 Standalone `OK` replies from entering MONITOR mode are ignored.
+
+Instances may be given as `port`, `host`, `host:port`, `[ipv6]:port`, a bare
+IPv6 address, or a unix socket path. `--db` keeps only commands executed against
+that database. Unknown `--flags` names are rejected, and `--flags` cannot be used
+with `--stdin` because it needs `COMMAND` metadata from a live server; that
+metadata is loaded on the first successful connection to each source.
+Connection attempts time out after 10 seconds and are retried with backoff.
+Ctrl-C shuts down gracefully; press it a second time to exit immediately. If
+the output is closed (for example `redis-monitor | head`), every source stops
+and the process exits successfully.
 When `--cluster` is used, every instance must be a reachable Redis Cluster seed.
 Discovery failures exit nonzero with the failing seed, underlying Redis or I/O
 error, and a hint to remove `--cluster` for standalone instances.
@@ -112,10 +125,11 @@ Invalid instance arguments, malformed discovered or explicit config files,
 incomplete named instances, invalid TLS files, and malformed cluster metadata
 also exit nonzero with contextual errors rather than panic.
 
-By default, each source hands off accepted records individually to the output
-thread for minimum output latency. Use `--batch` to improve throughput under
-load by batching up to 64 records or 256 KiB per source for at most 5 ms before
-handoff. In both modes, queued and producer-held records share a 64 MiB byte
+By default, each source never holds a record back: after every read it hands
+all complete accepted records (up to 256 KiB) to the output thread at once, so
+records that arrived together share one handoff without adding latency. Use
+`--batch` to additionally hold records for up to 5 ms, batching up to 64
+records or 256 KiB per source before handoff. In both modes, queued and producer-held records share a 64 MiB byte
 budget, with a bounded queue length as a secondary
 guard. This preserves every accepted record and applies backpressure instead of
 dropping data when output is slow. A record larger than the byte budget is
@@ -123,9 +137,10 @@ allowed through while temporarily consuming the full budget.
 
 Records from an individual source retain their original order in both modes.
 There is no total ordering guarantee between sources, and output is not sorted
-by timestamp. With `--batch`, each source's batches are atomic at the output
-queue, so batching can further change how records from different sources are
-interleaved. The former `--no-batch` flag has been removed; omit `--batch` for
+by timestamp. Each handoff is atomic at the output queue, so records from one
+source that arrived in the same read are never interleaved with another
+source's; with `--batch`, the longer hold can further change how records from
+different sources are interleaved. The former `--no-batch` flag has been removed; omit `--batch` for
 individual record handoff.
 
 Examples:

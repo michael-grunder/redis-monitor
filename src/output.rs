@@ -1,8 +1,8 @@
-use std::{io::Write, str::FromStr};
+use std::{borrow::Cow, fmt::Write as _, io::Write, str::FromStr};
 
 use anyhow::{Error, Result, anyhow};
 use serde::{Serialize, Serializer, ser::SerializeStruct};
-use serde_bytes::{ByteBuf as SerByteBuf, Bytes as SerBytes};
+use serde_bytes::Bytes as SerBytes;
 use serde_php as php;
 
 use crate::{
@@ -14,6 +14,22 @@ use crate::{
 };
 
 struct PhpLine<'a>(&'a Line<'a>);
+
+/// Serializes arguments as a sequence of byte strings without copying them.
+struct ByteArgs<'a>(&'a [Cow<'a, [u8]>]);
+
+/// A MONITOR record that could not be parsed. Callers report and skip these;
+/// every other writer error is an output failure.
+#[derive(Debug)]
+pub struct InvalidLine(String);
+
+impl std::fmt::Display for InvalidLine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidLine {}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum OutputKind {
@@ -81,12 +97,7 @@ impl Serialize for PhpLine<'_> {
 
         match &l.args {
             LineArgs::Parsed(v) => {
-                // Vec<Vec<u8>> -> Vec<ByteBuf>
-                let vb: Vec<SerByteBuf> = v
-                    .iter()
-                    .map(|b| SerByteBuf::from(b.clone().into_owned()))
-                    .collect();
-                st.serialize_field("args", &vb)?;
+                st.serialize_field("args", &ByteArgs(v))?;
             }
             LineArgs::Raw(raw) => {
                 // Borrowed bytes are fine as &Bytes.
@@ -97,6 +108,15 @@ impl Serialize for PhpLine<'_> {
         st.end()
     }
 }
+impl Serialize for ByteArgs<'_> {
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        s.collect_seq(self.0.iter().map(|arg| SerBytes::new(arg)))
+    }
+}
+
 impl OutputKind {
     pub fn get_writer<'a, W: Write + 'a>(
         self,
@@ -109,6 +129,8 @@ impl OutputKind {
                 writer: csv::WriterBuilder::new()
                     .flexible(true)
                     .from_writer(writer),
+                wrote_header: false,
+                field: String::new(),
             }),
             Self::Json => Box::new(JsonWriter { writer }),
             Self::Php => Box::new(PhpWriter { writer }),
@@ -169,6 +191,9 @@ struct PlainWriter<W: Write> {
 #[derive(Debug)]
 struct CsvWriter<W: Write> {
     writer: csv::Writer<W>,
+    wrote_header: bool,
+    /// Reused scratch space for formatting numeric fields.
+    field: String,
 }
 
 #[derive(Debug)]
@@ -660,22 +685,59 @@ impl<W: Write> PlainWriter<W> {
 
 fn invalid_line(input: &[u8], error: impl std::fmt::Display) -> anyhow::Error {
     let line = String::from_utf8_lossy(input);
-    anyhow!("Failed to parse line '{line}' ({error})")
+    InvalidLine(format!("Failed to parse line '{line}' ({error})")).into()
+}
+
+/// Surface I/O failures as `std::io::Error` so callers can recognize them.
+fn csv_error(error: csv::Error) -> anyhow::Error {
+    match error.into_kind() {
+        csv::ErrorKind::Io(error) => error.into(),
+        kind => anyhow!("CSV write error: {kind:?}"),
+    }
+}
+
+impl<W: Write> CsvWriter<W> {
+    fn write_display(&mut self, value: impl std::fmt::Display) -> Result<()> {
+        self.field.clear();
+        write!(self.field, "{value}")?;
+        self.writer.write_field(&self.field).map_err(csv_error)
+    }
 }
 
 impl<W: Write> OutputHandler for CsvWriter<W> {
+    /// Writes `timestamp,db,addr,cmd` followed by one column per argument.
     fn write_line(
         &mut self,
         _server: &ServerAddr,
         _name: Option<&str>,
         line: &Line,
     ) -> Result<()> {
-        self.writer.serialize(line)?;
-        Ok(())
+        if !self.wrote_header {
+            self.writer
+                .write_record(["timestamp", "db", "addr", "cmd", "args"])
+                .map_err(csv_error)?;
+            self.wrote_header = true;
+        }
+
+        self.write_display(line.timestamp)?;
+        self.write_display(line.db)?;
+        self.write_display(&line.addr)?;
+        self.writer.write_field(line.cmd).map_err(csv_error)?;
+        match &line.args {
+            LineArgs::Parsed(args) => {
+                for arg in args {
+                    self.writer.write_field(arg).map_err(csv_error)?;
+                }
+            }
+            LineArgs::Raw(raw) => {
+                self.writer.write_field(raw).map_err(csv_error)?;
+            }
+        }
+        self.writer.write_record(None::<&[u8]>).map_err(csv_error)
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.writer.flush().map_err(|e| anyhow!(e))
+        self.writer.flush().map_err(Into::into)
     }
 }
 
@@ -686,16 +748,15 @@ impl<W: Write> OutputHandler for JsonWriter<W> {
         _name: Option<&str>,
         parsed: &Line,
     ) -> Result<()> {
-        serde_json::to_writer(&mut self.writer, parsed)?;
-        writeln!(&mut self.writer)?;
+        serde_json::to_writer(&mut self.writer, parsed)
+            .map_err(std::io::Error::from)?;
+        self.writer.write_all(b"\n")?;
         Ok(())
     }
 
     fn write_stats(&mut self, stats: &[CommandStat]) -> Result<()> {
-        let data = serde_json::to_value(stats)
-            .map_err(|e| anyhow!("Failed to serialize stats to JSON: {e}"))?;
-
-        self.writer.write_all(data.to_string().as_bytes())?;
+        serde_json::to_writer(&mut self.writer, stats)
+            .map_err(std::io::Error::from)?;
         self.writer.write_all(b"\n")?;
 
         Ok(())
@@ -958,7 +1019,8 @@ mod tests {
             br#"1.0 [0 256.0.0.1:1] "PING""#,
             br#"1.0 [0 127.0.0.1:65536] "PING""#,
             br#"1.0 [0 [not-ip]:1] "PING""#,
-            br#"1.0 [0 127.0.0.1:1] "BAD-CMD""#,
+            br#"1.0 [0 127.0.0.1:1] "BAD CMD""#,
+            br#"1.0 [0 127.0.0.1:1] "BAD\"CMD""#,
             b"1.0 [0 127.0.0.1:1] \"PING",
         ];
 
@@ -1019,5 +1081,67 @@ mod tests {
         }
 
         black_box(writer.writer.0);
+    }
+
+    fn render_kind(kind: super::OutputKind, input: &[u8]) -> Vec<u8> {
+        let server = ServerAddr::from_tcp_addr("127.0.0.1", 6379);
+        let mut output = Vec::new();
+        {
+            let mut writer = kind.get_writer(&mut output, "");
+            writer.write_raw_line(&server, None, input).unwrap();
+            writer.write_raw_line(&server, None, input).unwrap();
+            writer.flush().unwrap();
+        }
+        output
+    }
+
+    #[test]
+    fn csv_writes_one_column_per_argument() {
+        let input = br#"1783484211.311904 [3 127.0.0.1:49152] "SET" "k" "a,b""#;
+
+        assert_eq!(
+            String::from_utf8(render_kind(super::OutputKind::Csv, input))
+                .unwrap(),
+            "timestamp,db,addr,cmd,args\n\
+             1783484211.311904,3,127.0.0.1:49152,SET,k,\"a,b\"\n\
+             1783484211.311904,3,127.0.0.1:49152,SET,k,\"a,b\"\n"
+        );
+    }
+
+    #[test]
+    fn php_serializes_arguments_as_byte_strings() {
+        let input =
+            br#"1783484211.311904 [0 127.0.0.1:49152] "SET" "k" "\xff""#;
+        let output = render_kind(super::OutputKind::Php, input);
+        let expected: &[u8] = b"a:5:{s:9:\"timestamp\";d:1783484211.311904;\
+            s:2:\"db\";i:0;s:4:\"addr\";s:15:\"127.0.0.1:49152\";\
+            s:3:\"cmd\";s:3:\"SET\";\
+            s:4:\"args\";a:2:{i:0;s:1:\"k\";i:1;s:1:\"\xff\";}}\n";
+
+        assert_eq!(output, [expected, expected].concat());
+    }
+
+    #[test]
+    fn json_writes_client_address_and_arguments() {
+        let input =
+            br#"1783484211.311904 [0 127.0.0.1:49152] "JSON.SET" "k" "$""#;
+        let output = render_kind(super::OutputKind::Json, input);
+        let line = String::from_utf8(output).unwrap();
+
+        assert_eq!(
+            line.lines().next().unwrap(),
+            r#"{"timestamp":1783484211.311904,"db":0,"addr":"127.0.0.1:49152","cmd":"JSON.SET","args":["k","$"]}"#
+        );
+    }
+
+    #[test]
+    fn plain_output_accepts_module_command_names() {
+        let server = ServerAddr::from_tcp_addr("127.0.0.1", 6379);
+        let input = br#"1.5 [0 127.0.0.1:1] "FT.SEARCH" "idx" "*""#;
+
+        assert_eq!(
+            render_raw("%C|%l", &server, None, input).unwrap(),
+            b"FT.SEARCH|\"FT.SEARCH\" \"idx\" \"*\"\n"
+        );
     }
 }

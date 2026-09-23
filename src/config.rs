@@ -12,7 +12,6 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use colored::Color;
 use config::{Config, File, FileFormat};
-use redis::cmd;
 use serde::{Deserialize, Deserializer, de};
 
 use crate::connection::{ServerAddr, TlsConfig};
@@ -96,31 +95,6 @@ impl ServerAuth {
         Self {
             user: user.map(std::borrow::ToOwned::to_owned),
             pass: pass.map(std::borrow::ToOwned::to_owned),
-        }
-    }
-
-    pub async fn auth(
-        &self,
-        con: &mut redis::aio::ConnectionManager,
-    ) -> Result<()> {
-        if self.user.is_none() && self.pass.is_none() {
-            return Ok(());
-        }
-
-        let mut command = cmd("AUTH");
-
-        if let Some(user) = &self.user {
-            command.arg(user);
-        }
-        if let Some(pass) = &self.pass {
-            command.arg(pass);
-        }
-
-        match command.query_async(con).await {
-            Ok(redis::Value::Okay) => Ok(()),
-            other => {
-                bail!("AUTH failed: unexpected response from Redis: {other:?}")
-            }
         }
     }
 }

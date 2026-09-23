@@ -18,31 +18,10 @@ use nom::{
 };
 use serde::{Serialize, Serializer};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub enum LineArgs<'a> {
-    #[serde(with = "serde_bytes")]
     Raw(&'a [u8]),
-    #[serde(with = "serde_vec_bytes")]
     Parsed(Vec<Cow<'a, [u8]>>),
-}
-
-// helper so Vec<Cow<[u8]>> serializes as bytes not arrays of ints
-mod serde_vec_bytes {
-    use std::borrow::Cow;
-
-    use serde::{Serializer, ser::SerializeSeq};
-    use serde_bytes::Bytes;
-
-    pub fn serialize<S>(v: &Vec<Cow<[u8]>>, s: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut seq = s.serialize_seq(Some(v.len()))?;
-        for arg in v {
-            seq.serialize_element(&Bytes::new(arg))?;
-        }
-        seq.end()
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -152,35 +131,20 @@ fn parse_u64_bytes(i: &[u8]) -> IResult<&[u8], &[u8]> {
 }
 
 #[inline]
-fn parse_f64(i: &[u8]) -> IResult<&[u8], f64> {
-    // Parse <digits> '.' <digits> with no allocation.
-    let (i, int_bytes) = digit1b(i)?;
+fn parse_f64(input: &[u8]) -> IResult<&[u8], f64> {
+    // Validate <digits> '.' <digits>, then parse the span with correct
+    // rounding so the value round-trips to the text MONITOR printed.
+    let (i, _) = digit1b(input)?;
     let (i, _) = tag(".")(i)?;
-    let (i, frac_bytes) = digit1b(i)?;
+    let (i, _) = digit1b(i)?;
+    let text = &input[..input.len() - i.len()];
 
-    // Fast integer parses from bytes.
-    let int = lexical_core::parse::<u64>(int_bytes).map_err(|_| {
+    let val = lexical_core::parse::<f64>(text).map_err(|_| {
         nom::Err::Failure(nom::error::Error::new(
-            i,
+            input,
             nom::error::ErrorKind::Float,
         ))
     })?;
-    let frac = lexical_core::parse::<u64>(frac_bytes).map_err(|_| {
-        nom::Err::Failure(nom::error::Error::new(
-            i,
-            nom::error::ErrorKind::Float,
-        ))
-    })?;
-
-    // Mother of god, Rust sometimes...
-    let len_clamped = frac_bytes.len().min(i32::MAX as usize);
-    let exp = i32::try_from(len_clamped).unwrap_or(i32::MAX);
-    let scale = 10f64.powi(exp);
-
-    debug_assert!(int <= (1u64 << 53));
-
-    #[allow(clippy::cast_precision_loss)]
-    let val = (int as f64) + (frac as f64) / scale;
 
     Ok((i, val))
 }
@@ -208,16 +172,18 @@ impl<'a> Line<'a> {
         E: ParseError<&'a [u8]>
             + FromExternalError<&'a [u8], std::num::ParseIntError>,
     {
+        const fn nibble(c: u8) -> u8 {
+            match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                _ => c - b'A' + 10,
+            }
+        }
+
         let (input, _) = tag("x")(input)?;
         let (input, hex) =
-            take_while_m_n(2, 2, |c: u8| (c as char).is_ascii_hexdigit())(
-                input,
-            )?;
-        let s = unsafe { std::str::from_utf8_unchecked(hex) };
-        let v = u8::from_str_radix(s, 16).map_err(|e| {
-            nom::Err::Failure(E::from_external_error(input, ErrorKind::Fail, e))
-        })?;
-        Ok((input, v))
+            take_while_m_n(2, 2, |c: u8| c.is_ascii_hexdigit())(input)?;
+        Ok((input, (nibble(hex[0]) << 4) | nibble(hex[1])))
     }
 
     fn parse_escaped_char<E>(input: &'a [u8]) -> IResult<&'a [u8], u8, E>
@@ -449,14 +415,12 @@ impl<'a> Line<'a> {
         Ok((input, (db, addr)))
     }
 
+    /// Command names are printable ASCII. Module commands commonly contain
+    /// punctuation such as `FT.SEARCH` or `JSON.SET`; quotes, backslashes
+    /// (escapes), and spaces never appear in a valid unescaped name.
     #[inline]
     const fn is_cmd_char(b: u8) -> bool {
-        matches!(b,
-            b'A'..=b'Z' |
-            b'a'..=b'z' |
-            b'0'..=b'9' |
-            b'_'
-        )
+        b.is_ascii_graphic() && b != b'"' && b != b'\\'
     }
 
     #[inline]
@@ -767,9 +731,7 @@ impl Serialize for ClientAddr<'_> {
     {
         match self {
             Self::Path(p) => serializer.serialize_str(p),
-            Self::Tcp(ip, port) => {
-                serializer.serialize_str(&format!("{ip}:{port}"))
-            }
+            Self::Tcp(..) => serializer.collect_str(self),
             Self::Lua => serializer.serialize_str("lua"),
             Self::Unknown => serializer.serialize_str("-"),
         }
@@ -785,11 +747,7 @@ where
 {
     match args {
         LineArgs::Parsed(v) => {
-            let strs: Vec<Cow<'_, str>> = v
-                .iter()
-                .map(|a| bytes_to_structured_string(a.as_ref()))
-                .collect();
-            strs.serialize(s)
+            s.collect_seq(v.iter().map(|a| bytes_to_structured_string(a)))
         }
         LineArgs::Raw(raw) => {
             let s1 = bytes_to_structured_string(raw);
@@ -932,5 +890,47 @@ mod tests {
         assert_eq!(args.len(), 5);
         assert_eq!(args[0].as_ref(), b"key");
         assert_eq!(args[1].as_ref(), payload);
+    }
+
+    #[test]
+    fn timestamps_are_parsed_with_correct_rounding() {
+        for text in ["1783484211.311904", "0.1", "1783484211.999999"] {
+            let line = format!(r#"{text} [0 127.0.0.1:1] "PING""#);
+            let (_, parsed) =
+                Line::from_line_bytes(line.as_bytes(), true).unwrap();
+            assert_eq!(
+                parsed.timestamp.to_bits(),
+                text.parse::<f64>().unwrap().to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_timestamp_is_rejected_without_panicking() {
+        let line = br#"99999999999999999999999.1 [0 127.0.0.1:1] "PING""#;
+        let _ = Line::from_line_bytes(line, true);
+    }
+
+    #[test]
+    fn module_command_names_are_accepted() {
+        for cmd in ["FT.SEARCH", "json.set", "_FT.DEBUG", "CF.ADD"] {
+            let line = format!(r#"1.0 [0 127.0.0.1:1] "{cmd}" "k""#);
+            let (_, parsed) =
+                Line::from_line_bytes(line.as_bytes(), true).unwrap();
+            assert_eq!(parsed.cmd, cmd);
+        }
+    }
+
+    #[test]
+    fn hex_escapes_decode_to_bytes() {
+        let line = br#"1.0 [0 127.0.0.1:1] "SET" "\x00\xfF\x7a" "\xZZ""#;
+        let (_, parsed) = Line::from_line_bytes(line, true).unwrap();
+
+        let LineArgs::Parsed(args) = parsed.args else {
+            panic!("expected parsed args");
+        };
+        assert_eq!(args[0].as_ref(), b"\x00\xff\x7a");
+        // An invalid escape is preserved literally.
+        assert_eq!(args[1].as_ref(), br"\xZZ");
     }
 }
