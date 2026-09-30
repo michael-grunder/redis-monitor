@@ -1,0 +1,31 @@
+1783484211.311904|0|stdin 127.0.0.1:52460|stdin|stdin|stdin|-|127.0.0.1:52460|127.0.0.1|52460|SET|"key" "value"|%|%x|%s|%c
+1783484211.311904|0|stdin 127.0.0.1:52460|stdin|stdin|stdin|-|127.0.0.1:52460|127.0.0.1|52460|GET|"key"|%|%x|%s|%c
+1783484211.3|12|stdin 10.0.0.1:6000|stdin|stdin|stdin|-|10.0.0.1:6000|10.0.0.1|6000|PING||%|%x|%s|%c
+1783484211|0|stdin 10.0.0.1:6000|stdin|stdin|stdin|-|10.0.0.1:6000|10.0.0.1|6000|PING||%|%x|%s|%c
+1783484211.3119|3|stdin 1.2.3.4:5|stdin|stdin|stdin|-|1.2.3.4:5|1.2.3.4|5|SET|"a" "b"|%|%x|%s|%c
+12345678901.123456|0|stdin 1.2.3.4:5|stdin|stdin|stdin|-|1.2.3.4:5|1.2.3.4|5|DEL|"k"|%|%x|%s|%c
+0.10000000000000001|0|stdin 1.2.3.4:5|stdin|stdin|stdin|-|1.2.3.4:5|1.2.3.4|5|DEL|"k"|%|%x|%s|%c
+1.5|0|stdin 127.0.0.1:1|stdin|stdin|stdin|-|127.0.0.1:1|127.0.0.1|1|FT.SEARCH|"idx" "*"|%|%x|%s|%c
+1783484211.311904|0|stdin [2001:db8::1]:49152|stdin|stdin|stdin|-|[2001:db8::1]:49152|2001:db8::1|49152|GET|"v6"|%|%x|%s|%c
+1783484211.311904|0|stdin [::1]:6379|stdin|stdin|stdin|-|[::1]:6379|::1|6379|GET|"v6short"|%|%x|%s|%c
+1783484211.311904|0|stdin 1.2.3.4:7|stdin|stdin|stdin|-|1.2.3.4:7|1.2.3.4|7|GET|"bracketed-v4"|%|%x|%s|%c
+1783484211.311904|0|stdin /run/redis/client.sock|stdin|stdin|stdin|-|/run/redis/client.sock|-|client.sock|GET|"unix"|%|%x|%s|%c
+1783484211.311904|0|stdin |stdin|stdin|stdin|-||-|-|GET|"unix-empty"|%|%x|%s|%c
+1783484211.311904|5|stdin lua|stdin|stdin|stdin|-|lua|-|lua|SET|"from" "lua"|%|%x|%s|%c
+1783484211.311904|0|stdin -|stdin|stdin|stdin|-|-|-|-|GET|"unknown"|%|%x|%s|%c
+1783484211.311904|0|stdin 127.0.0.1:1|stdin|stdin|stdin|-|127.0.0.1:1|127.0.0.1|1|SET|"key" "hello \"there\""|%|%x|%s|%c
+1783484211.311904|0|stdin 127.0.0.1:1|stdin|stdin|stdin|-|127.0.0.1:1|127.0.0.1|1|SET|"\x00\xfF\x7a" "\xZZ" "\n\r\t\a\b\\"|%|%x|%s|%c
+1783484211.311904|0|stdin 127.0.0.1:1|stdin|stdin|stdin|-|127.0.0.1:1|127.0.0.1|1|ZADD|"analytics" "1.5" "{"id":"99","wp":{"hits":1},"relay":null}"|%|%x|%s|%c
+1783484211.311904|0|stdin 127.0.0.1:1|stdin|stdin|stdin|-|127.0.0.1:1|127.0.0.1|1|SET|"terms:1" "a:2:{s:11:"description";s:0:"";s:5:"count";s:1:"1";}" "NX" "EX" "604800"|%|%x|%s|%c
+1783484211.311904|0|stdin 127.0.0.1:1|stdin|stdin|stdin|-|127.0.0.1:1|127.0.0.1|1|SET|"k" "Foo\Bar\Baz it\'s"|%|%x|%s|%c
+1783484211.311904|0|stdin 127.0.0.1:1|stdin|stdin|stdin|-|127.0.0.1:1|127.0.0.1|1|SET|"k" "a,b" "q\"uote"|%|%x|%s|%c
+1783484211.311904|0|stdin 127.0.0.1:1|stdin|stdin|stdin|-|127.0.0.1:1|127.0.0.1|1|SET|"k" ""|%|%x|%s|%c
+1783484211.311904|0|stdin 127.0.0.1:1|stdin|stdin|stdin|-|127.0.0.1:1|127.0.0.1|1|SET|"k"  "double spaced"|%|%x|%s|%c
+1783484211.311904|0|stdin 127.0.0.1:1|stdin|stdin|stdin|-|127.0.0.1:1|127.0.0.1|1|SET|"k"	"tabs"|%|%x|%s|%c
+1783484211.311904|0|stdin 127.0.0.1:1|stdin|stdin|stdin|-|127.0.0.1:1|127.0.0.1|1|SET|"k" "Ã© utf8 ÿ raw"|%|%x|%s|%c
+1783484211.311904|0|stdin 127.0.0.1:1|stdin|stdin|stdin|-|127.0.0.1:1|127.0.0.1|1|SET|"k"|%|%x|%s|%c
+1783484211.311904|0|stdin 127.0.0.1:1|stdin|stdin|stdin|-|127.0.0.1:1|127.0.0.1|1|SET|"unterminated|%|%x|%s|%c
+1783484211.311904|0|stdin 127.0.0.1:1|stdin|stdin|stdin|-|127.0.0.1:1|127.0.0.1|1|SET|"a""b"|%|%x|%s|%c
+1783484211.311904|0|stdin 127.0.0.1:1|stdin|stdin|stdin|-|127.0.0.1:1|127.0.0.1|1|SET|"trailing" garbage|%|%x|%s|%c
+1783484211.999999|0|stdin 127.0.0.1:1|stdin|stdin|stdin|-|127.0.0.1:1|127.0.0.1|1|get|"lower"|%|%x|%s|%c
+1783484211.311904|0|stdin 127.0.0.1:1|stdin|stdin|stdin|-|127.0.0.1:1|127.0.0.1|1|SET|"k" "v"|%|%x|%s|%c

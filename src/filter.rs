@@ -1,7 +1,8 @@
-use std::{collections::BTreeMap, fmt, str::FromStr};
+use std::{borrow::Cow, collections::BTreeMap, fmt, str::FromStr};
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use anyhow::{Context, Result};
+use redis_monitor::{commands, monitor};
 use regex::bytes::Regex;
 
 #[derive(Debug, Clone)]
@@ -339,6 +340,135 @@ impl fmt::Debug for Matchers {
                 &format_args!("{exc_lit} literal set(s), {exc_re} regex(es)"),
             )
             .finish()
+    }
+}
+
+/// Every per-record filter: database, command names and positional
+/// arguments, command flags/categories, and keys.
+#[derive(Clone)]
+pub struct LineFilter {
+    empty: bool,
+    db: Option<u64>,
+    names: Filter,
+    keys: Filter,
+    flags: commands::Filter,
+}
+
+impl fmt::Debug for LineFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LineFilter")
+            .field("empty", &self.empty)
+            .field("db", &self.db)
+            .field("names", &self.names)
+            .field("keys", &self.keys)
+            .field("flags", &self.flags)
+            .finish()
+    }
+}
+
+impl LineFilter {
+    pub const fn new(
+        db: Option<u64>,
+        names: Filter,
+        keys: Filter,
+        flags: commands::Filter,
+    ) -> Self {
+        let empty = db.is_none()
+            && names.is_empty()
+            && keys.is_empty()
+            && flags.is_empty();
+        Self {
+            empty,
+            db,
+            names,
+            keys,
+            flags,
+        }
+    }
+
+    /// Whether `COMMAND` metadata is needed to apply the filter.
+    #[inline]
+    pub const fn needs_cmds(&self) -> bool {
+        !self.flags.is_empty() || !self.keys.is_empty()
+    }
+
+    /// Whether key discovery is required, making metadata mandatory.
+    #[inline]
+    pub const fn needs_keys(&self) -> bool {
+        !self.keys.is_empty()
+    }
+
+    /// Decide whether a record is kept, using the cheapest checks first.
+    /// Arguments are decoded into `args` only for positional or key filters.
+    #[inline]
+    pub fn matches<'a>(
+        &self,
+        commands: Option<&commands::Lookup>,
+        line: &'a [u8],
+        args: &mut Vec<Cow<'a, [u8]>>,
+    ) -> bool {
+        if self.empty {
+            return true;
+        }
+
+        if let Some(db) = self.db
+            && monitor::database(line) != Some(db)
+        {
+            return false;
+        }
+
+        if self.names.is_empty()
+            && self.flags.is_empty()
+            && self.keys.is_empty()
+        {
+            return true;
+        }
+
+        let positional_args = self.names.needs_args();
+        let Some(cmd) = monitor::command_name(line) else {
+            // Without a command, only filters that inspect arguments or keys
+            // can reject the record; the output reports it as invalid.
+            return self.keys.is_empty() && !positional_args;
+        };
+
+        if !positional_args && !self.names.matches(cmd) {
+            return false;
+        }
+
+        if !self.flags.is_empty()
+            && commands
+                .is_some_and(|lu| !lu.matches_bytes_or(cmd, self.flags, true))
+        {
+            return false;
+        }
+        if self.keys.is_empty() && !positional_args {
+            return true;
+        }
+        if !self.keys.is_empty() && commands.is_none() {
+            return false;
+        }
+        let Ok(record) = monitor::Record::parse(line) else {
+            return false;
+        };
+        if record.decode_args(args).is_err() {
+            return false;
+        }
+        let cmd = record.cmd;
+        if positional_args
+            && !self.names.matches_values(
+                std::iter::once(cmd).chain(args.iter().map(AsRef::as_ref)),
+            )
+        {
+            return false;
+        }
+        if self.keys.is_empty() {
+            return true;
+        }
+        commands.is_some_and(|commands| {
+            commands
+                .keys(cmd, args)
+                .is_ok_and(|keys| self.keys.matches_values(keys))
+        })
     }
 }
 

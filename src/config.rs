@@ -2,17 +2,14 @@ use std::{
     collections::HashMap,
     convert::AsRef,
     env,
-    hash::{Hash, Hasher},
     iter::IntoIterator,
     option::Option,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use colored::Color;
 use config::{Config, File, FileFormat};
-use serde::{Deserialize, Deserializer, de};
+use serde::Deserialize;
 
 use crate::connection::{ServerAddr, TlsConfig};
 
@@ -22,20 +19,10 @@ const DEFAULT_CFGFILE_EXT: &[&str] = &["", "toml"];
 #[derive(Debug)]
 pub struct Map(HashMap<String, Entry>);
 
-#[derive(Debug)]
-pub struct DisplayColor(Color);
-
 #[derive(Debug, Clone, Default)]
 pub struct ServerAuth {
     pub user: Option<String>,
     pub pass: Option<String>,
-}
-
-impl Hash for ServerAuth {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.user.hash(state);
-        self.pass.hash(state);
-    }
 }
 
 impl<'a> IntoIterator for &'a Map {
@@ -65,29 +52,9 @@ pub struct Entry {
 
     #[serde(default)]
     pub cluster: bool,
-
+    // Accepted for compatibility; per-entry `format` and `color` settings do
+    // not affect output, and unknown keys such as `color` are ignored.
     pub format: Option<String>,
-
-    pub color: Option<DisplayColor>,
-}
-
-impl FromStr for DisplayColor {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Color::from_str(s)
-            .map_or_else(|()| Ok(Self(Color::Black)), |color| Ok(Self(color)))
-    }
-}
-
-impl<'de> Deserialize<'de> for DisplayColor {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        FromStr::from_str(&s).map_err(de::Error::custom)
-    }
 }
 
 impl ServerAuth {
@@ -180,10 +147,6 @@ impl Map {
 }
 
 impl Entry {
-    pub fn get_color(&self) -> Option<Color> {
-        self.color.as_ref().map(|c| c.0)
-    }
-
     fn host_port(&self) -> Option<(String, u16)> {
         match (&self.host, &self.port) {
             (Some(host), Some(port)) => Some((host.to_owned(), *port)),

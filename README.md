@@ -84,10 +84,12 @@ not supported as CLI instance arguments.
 
 For direct addresses, use `--user`/`-u` and `--pass`/`-p` (`-a` is also a
 password alias). Enable TLS explicitly with `--tls`; `--tls-ca` supplies a PEM
-CA bundle, and `--tls-cert` plus `--tls-key` supplies a client certificate and
-private key. Without `--tls-ca`, TLS uses the system trust store. `--insecure`
-disables certificate verification; the current MONITOR TLS path also omits
-client authentication in this mode.
+CA bundle, and `--tls-cert` plus `--tls-key` (which must be given together)
+supply a client certificate and private key. Without `--tls-ca`, TLS uses the
+system trust store. `--insecure` disables server certificate verification but
+still presents a configured client certificate. TLS files and the trust store
+are loaded and validated once at startup, and the same settings apply to
+MONITOR, cluster discovery, and `COMMAND` metadata connections.
 
 Named instances are TOML tables loaded from `--config-file PATH`, or the first
 file found in this order:
@@ -162,7 +164,9 @@ they require live `COMMAND` metadata.
 ### Output and formatting
 
 Records go to stdout. Connection messages, parse errors, debug information,
-statistics, and the final processed/filtered/backpressure summary go to stderr.
+statistics, and the final processed/filtered/backpressure/invalid summary go to
+stderr. Invalid records are skipped and reported with a bounded excerpt; at most
+10 are reported per second, followed by a count of suppressed messages.
 
 | `--output` | Record representation |
 | --- | --- |
@@ -186,18 +190,21 @@ does not include the monitored server address or configured instance name.
 | `%sh` | Server host |
 | `%sp` | Server port, or basename of its Unix path |
 | `%sn` | Configured instance name, or cluster node ID in CLI cluster mode, when set; otherwise `-` |
-| `%ca` | Full client address |
+| `%ca` | Full client address (`ip:port`, `[ipv6]:port`, Unix path, `lua`, or `-`) |
 | `%ch` | Client host |
 | `%cp` | Client port, or basename of its Unix path |
 | `%d` | Database number |
-| `%t` | MONITOR timestamp |
-| `%l` | Full quoted command and arguments |
+| `%t` | MONITOR timestamp, without leading zeros or trailing fractional zeros |
+| `%l` | Full quoted command and arguments, as MONITOR escaped them |
 | `%C` | Command name (argument 0) |
-| `%a` | Arguments 1..N |
+| `%a` | Arguments 1..N, as MONITOR escaped them |
+| `%%` | A literal `%` |
 
 The default is `%t [%d %ca] %l` for one source or stdin, and `%t [%S %d] %l`
-for multiple resolved server connections. Module commands such as `FT.SEARCH`
-and `JSON.SET` are supported.
+for multiple resolved server connections. Unknown specifiers are printed
+literally. Module commands such as `FT.SEARCH` and `JSON.SET` are supported.
+Plain output copies argument bytes from the input without validating them; only
+structured output decodes (and therefore validates) arguments.
 
 ### Database, flags, and statistics
 
@@ -214,22 +221,33 @@ stricter metadata requirements, described below.
 
 `--stats SECONDS` accepts a positive, finite interval (including fractional
 seconds). In plain mode it reports cumulative per-command counts and MONITOR
-line bytes after filtering, on stderr. The interval is checked after output
-drains, so an idle source does not trigger reports. With structured output,
+line bytes of written records, sorted by command name, on stderr. The interval
+is checked after output drains, so an idle source does not trigger reports.
+Sources merge their counts once per read, so a report can trail the output by
+at most one read per source. With structured output,
 `--stats` is ignored. The final processed/filtered/backpressure summary is
 independent of this option. `--debug` prints the compiled filter configuration
 to stderr.
 
-### Batching, ordering, and shutdown
+### Threads, batching, ordering, and shutdown
+
+Each source (server connection or stdin) is a task that frames, filters, and
+formats its own records. Tasks run on a pool of worker threads, so formatting
+many busy sources uses many cores; a single output thread only writes finished
+bytes to stdout. `--threads N` sets the worker count (default: available CPUs,
+at most 16). Stdin is read on a dedicated thread a few chunks ahead of
+formatting.
 
 By default, each source hands off complete accepted records already available
-from a read together, with a 256 KiB chunk target and no wait for more input.
-`--batch` additionally coalesces records across reads, with a 64-record limit,
-a 256 KiB target, and a 5 ms producer hold deadline. Slow output can delay either
-mode beyond that deadline. A single oversized record is kept intact.
+from a read together, with a 256 KiB input chunk target and no wait for more
+input. `--batch` additionally coalesces formatted records across reads, with a
+64-record limit, a 256 KiB target, and a 5 ms producer hold deadline. Slow
+output can delay either mode beyond that deadline. A single oversized record is
+kept intact. Output is flushed whenever the output queue runs empty, so
+buffering never delays a record with nothing queued behind it.
 
-Queued and producer-held batches share a 64 MiB byte budget. Queue length is
-also bounded: 16,384 messages by default or 1,024 with `--batch`. Slow output
+Formatted batches waiting for output share a 64 MiB byte budget. Queue length
+is also bounded: 16,384 messages by default or 1,024 with `--batch`. Slow output
 applies backpressure instead of silently dropping accepted records. A record
 larger than the byte budget temporarily consumes the full budget. This is not
 a process memory cap: input framing buffers, incomplete records, allocation
@@ -290,8 +308,8 @@ command-name filtering when no argument index beyond zero is requested. It runs
 only when key filtering or an argument index beyond zero requires it.
 Unescaped arguments borrow the input buffer;
 argument storage is reused within each scanned chunk and released afterwards.
-Escaped arguments need decoding allocations. Structured output currently
-parses accepted arguments again on the output thread.
+Escaped arguments need decoding allocations. Structured output decodes accepted
+arguments again when formatting them.
 
 ## Positional filters and literal syntax
 
@@ -346,6 +364,27 @@ Matching compiles patterns by position once and scans the borrowed iterator
 without collecting keys or allocating storage based on the requested index.
 Argument and key filters share a single decoding pass when both need it.
 
+## MONITOR record parsing (library)
+
+The `redis_monitor::monitor` module parses records without allocating.
+`Record::parse` validates the prefix and borrows every field from the line;
+arguments stay escaped until `Record::decode_args` decodes them into reusable
+scratch storage, borrowing arguments that contain no escapes.
+
+```rust,ignore
+use redis_monitor::monitor::Record;
+
+let record = Record::parse(br#"1.5 [0 127.0.0.1:6379] "SET" "k" "a\"b""#)?;
+let mut args = Vec::new();
+record.decode_args(&mut args)?;
+// record.cmd == b"SET"; args == [b"k", b"a\"b"]
+```
+
+Decoding runs in linear time. Redis escapes quotes inside arguments, but some
+producers do not, so a quote only closes an argument when it is followed by
+optional whitespace and then another argument or the end of the record.
+Unknown escape sequences are preserved literally.
+
 ## Command key discovery (library)
 
 The `redis_monitor::commands` module resolves decoded command arguments to a
@@ -396,6 +435,19 @@ require a running Redis server. Manual benchmarks and the live-server comparison
 are separate opt-in checks. See [AGENTS.md](AGENTS.md) for contribution and
 performance requirements, and [CHANGELOG.md](CHANGELOG.md) for unreleased changes.
 
+`tests/golden_output.rs` replays an adversarial corpus
+(`tests/fixtures/golden/input.log`) through every output kind and several plain
+formats, comparing stdout byte-for-byte. After an intentional output change,
+regenerate the expectations and review the fixture diff:
+
+```sh
+UPDATE_GOLDEN=1 cargo test --test golden_output
+```
+
+Run the record parser microbenchmark with
+`RUSTFLAGS='' cargo bench --bench parse`. It measures prefix parsing and
+argument decoding for short, escaped, and large records.
+
 Run the retained extraction benchmark with
 `RUSTFLAGS='' cargo bench --bench command_keys`.
 It compares lookup alone, borrowed key iteration, and collecting keys into a
@@ -418,12 +470,62 @@ separate grammar regression expectations.
 
 ## Recorded performance measurements
 
-These measurements were recorded when key discovery, key filtering, and
-positional filtering were introduced. They are historical comparisons, not
-fresh measurements of the current checkout. Use optimized builds and explicitly
-override the repository's native CPU flags for portable comparisons.
-The earlier [performance opportunities report](specs/PERFORMANCE_OPPORTUNITIES.md)
-includes a status review of its original recommendations.
+These are historical comparisons, not fresh measurements of the current
+checkout. Use optimized builds and explicitly override the repository's native
+CPU flags for portable comparisons. The earlier
+[performance opportunities report](specs/PERFORMANCE_OPPORTUNITIES.md) includes
+a status review of its original recommendations.
+
+### Parallel formatting and parser rewrite
+
+Measured on a 96-thread Intel Xeon Platinum 8160 host (Linux 6.1, rustc 1.98.1)
+with portable release builds (`RUSTFLAGS=''`), comparing revision `9a2ad69`
+("before") with this change ("after").
+
+Many sources: local fake MONITOR servers streamed a 2-million-record replay
+file (short `SET` records) as fast as possible for 6 seconds, with output to
+`/dev/null`. Before, one output thread parsed and formatted every record, so
+throughput fell as sources were added; after, formatting scales with sources.
+
+| Sources, mode | Before, million records/s | After, million records/s |
+| --- | ---: | ---: |
+| 1, plain | 6.60 | 6.35 |
+| 4, plain | 3.35 | 15.98 |
+| 8, plain | 3.32 | 30.70 |
+| 16, plain | 3.32 | 59.54 |
+| 8, JSON | 1.60 | 15.92 |
+| 8, plain, `--filter '[1]/^user:1/'` | 2.61 | 27.92 |
+
+Stdin replay (single source), mean of eight `hyperfine` runs after two warmups,
+milliseconds. `monitor.log` is a 45 MB capture with a 3.3 MB largest record;
+`short` is 2 million `SET` records (146 MB); `mixed` is 400,000 records with
+escaped, 400-byte, Lua, and Unix-socket records (65 MB).
+
+| Workload | Before | After |
+| --- | ---: | ---: |
+| `monitor.log`, plain default | 38.0 | 34.3 |
+| `monitor.log`, JSON | 396.3 | 186.6 |
+| `monitor.log`, RESP | 301.1 | 102.3 |
+| short, plain default | 311.8 | 301.6 |
+| short, plain `%t [%S %d] %l` | 554.3 | 467.0 |
+| short, `--filter '[1]/^user:1/'` | 819.7 | 501.1 |
+| short, JSON | 1352.6 | 906.6 |
+| short, CSV | 1462.8 | 1081.5 |
+| short, `--stats 1` | 429.8 | 382.2 |
+| mixed, plain default | 66.8 | 71.7 |
+| mixed, JSON | 485.5 | 244.4 |
+| mixed, PHP | 747.0 | 396.4 |
+
+Structured output gained the most from linear-time argument decoding: the
+previous decoder rescanned the remainder of the record for every literal run,
+which was quadratic for large JSON-like payloads. Mixed plain replay is about
+7% slower because stdin chunks are copied once more to overlap reading with
+formatting. With stdout rate-limited to 20 MB/s, four fast sources held
+resident memory between 93 and 106 MB and wrote exactly as many records as
+they processed. The parser microbenchmark measured 77 ns per short record
+prefix (104 ns before replacing the index-based scanner).
+
+### Key discovery and filtering
 
 On an Intel Xeon Platinum 8160 (Linux x86-64, rustc 1.98.1), the portable
 optimized bench profile measured medians of 41.68 ns/command for lookup alone,

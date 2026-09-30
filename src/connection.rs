@@ -14,17 +14,15 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::BytesMut;
-use colored::Color;
 use redis::{
-    Client, Connection, ConnectionAddr, ConnectionInfo, IntoConnectionInfo,
-    RedisConnectionInfo, Value,
+    Client, ClientTlsConfig, Connection, ConnectionAddr, IntoConnectionInfo,
+    RedisConnectionInfo, TlsCertificates, Value,
 };
 use rustls::client::danger::ServerCertVerifier;
 use rustls::{
     ClientConfig, RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer, ServerName},
 };
-use serde::Serialize;
 use serde::{Deserialize, Deserializer, de};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
@@ -41,12 +39,25 @@ pub enum Stream {
     Unix(UnixStream),
 }
 
-#[derive(Debug)]
+/// TLS settings, validated and compiled once at startup.
 pub struct TlsConfig {
-    pub insecure: bool,
-    pub ca: Option<Vec<CertificateDer<'static>>>,
-    pub cert: Option<CertificateDer<'static>>,
-    pub key: Option<PrivateKeyDer<'static>>,
+    insecure: bool,
+    /// PEM file contents, for auxiliary connections made by the `redis`
+    /// crate (cluster discovery and `COMMAND` metadata).
+    ca_pem: Option<Vec<u8>>,
+    client_pem: Option<ClientTlsConfig>,
+    /// Shared by every MONITOR connection.
+    connector: TlsConnector,
+}
+
+impl std::fmt::Debug for TlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsConfig")
+            .field("insecure", &self.insecure)
+            .field("custom_ca", &self.ca_pem.is_some())
+            .field("client_cert", &self.client_pem.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -55,12 +66,12 @@ pub struct Monitor {
     pub address: ServerAddr,
     pub tls: Option<Arc<TlsConfig>>,
     pub auth: ServerAuth,
-    pub color: Option<Color>,
 }
 
-#[derive(Debug, Eq, Clone, Serialize)]
+#[derive(Debug, Eq, Clone)]
 pub enum ServerAddr {
-    Tcp(String, u16, #[serde(skip)] Option<IpAddr>),
+    /// Host, port, and the host parsed as an IP address when it is one.
+    Tcp(String, u16, Option<IpAddr>),
     Unix(String),
 }
 
@@ -77,14 +88,6 @@ pub struct ClusterNode {
 
 #[derive(Debug)]
 pub struct Cluster(HashSet<ClusterNode>);
-
-impl PartialEq for Monitor {
-    fn eq(&self, other: &Self) -> bool {
-        self.address == other.address
-    }
-}
-
-impl Eq for Monitor {}
 
 impl AsyncRead for Stream {
     fn poll_read(
@@ -185,13 +188,6 @@ impl Hash for ServerAddr {
     }
 }
 
-impl Hash for Monitor {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.address.hash(state);
-        self.auth.hash(state);
-    }
-}
-
 impl Hash for ClusterNode {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.addr.hash(state);
@@ -235,8 +231,7 @@ impl ServerAddr {
         auth: &ServerAuth,
         tls: Option<&TlsConfig>,
     ) -> Result<Connection> {
-        let cli = Client::open(connection_info(self, auth, tls))
-            .with_context(|| format!("Failed to open connection to {self}"))?;
+        let cli = client(self, auth, tls)?;
         let con = cli.get_connection().map_err(|e| {
             anyhow!("Failed to get connection from client: {e}")
         })?;
@@ -245,13 +240,17 @@ impl ServerAddr {
     }
 }
 
-/// Build `redis` crate connection settings for an auxiliary (non-MONITOR)
-/// connection such as cluster discovery or `COMMAND` metadata.
-pub fn connection_info(
+/// Build a `redis` crate client for an auxiliary (non-MONITOR) connection
+/// such as cluster discovery or `COMMAND` metadata, using the same
+/// credentials and TLS settings as MONITOR connections.
+///
+/// # Errors
+/// Returns an error if the client cannot be configured.
+pub fn client(
     address: &ServerAddr,
     auth: &ServerAuth,
     tls: Option<&TlsConfig>,
-) -> ConnectionInfo {
+) -> Result<Client> {
     let addr = match address {
         ServerAddr::Tcp(host, port, _) => tls.map_or_else(
             || ConnectionAddr::Tcp(host.clone(), *port),
@@ -273,9 +272,24 @@ pub fn connection_info(
         redis = redis.set_password(pass);
     }
 
-    addr.into_connection_info()
-        .expect("ConnectionAddr::into_connection_info cannot fail")
-        .set_redis_settings(redis)
+    let info = addr
+        .into_connection_info()
+        .with_context(|| format!("Invalid connection settings for {address}"))?
+        .set_redis_settings(redis);
+    let client = match tls {
+        Some(tls) if tls.ca_pem.is_some() || tls.client_pem.is_some() => {
+            Client::build_with_tls(
+                info,
+                TlsCertificates {
+                    client_tls: tls.client_pem.clone(),
+                    root_cert: tls.ca_pem.clone(),
+                },
+            )
+        }
+        _ => Client::open(info),
+    };
+    client
+        .with_context(|| format!("Failed to configure a client for {address}"))
 }
 
 const DEFAULT_PORT: u16 = 6379;
@@ -528,7 +542,6 @@ impl Monitor {
                         primary.addr,
                         tls.clone(),
                         entry.get_auth(),
-                        entry.get_color(),
                     )
                 })
                 .collect())
@@ -536,13 +549,7 @@ impl Monitor {
             Ok(addresses
                 .into_iter()
                 .map(|addr| {
-                    Self::new(
-                        Some(name),
-                        addr,
-                        tls.clone(),
-                        entry.get_auth(),
-                        entry.get_color(),
-                    )
+                    Self::new(Some(name), addr, tls.clone(), entry.get_auth())
                 })
                 .collect())
         }
@@ -553,14 +560,12 @@ impl Monitor {
         address: ServerAddr,
         tls: Option<Arc<TlsConfig>>,
         auth: ServerAuth,
-        color: Option<Color>,
     ) -> Self {
         Self {
             name: name.map(ToString::to_string),
             address,
             tls,
             auth,
-            color,
         }
     }
 
@@ -659,44 +664,125 @@ impl Monitor {
 }
 
 impl TlsConfig {
-    fn load_ca(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-        let buf = fs::read(path)
-            .map_err(|e| anyhow!("Failed to read CA file: {e}"))?;
-
-        let mut c = Cursor::new(buf);
-        let parsed = rustls_pemfile::certs(&mut c)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| anyhow!("Failed to parse CA certs: {e}"))?;
-
-        Ok(parsed.into_iter().collect::<Vec<_>>())
-    }
-
-    fn load_cert(path: &Path) -> Result<CertificateDer<'static>> {
-        let buf = fs::read(path)
-            .map_err(|e| anyhow!("Failed to read cert file: {e}"))?;
-
-        let mut c = Cursor::new(buf);
-        let parsed = rustls_pemfile::certs(&mut c)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| anyhow!("Failed to parse certs: {e}"))?;
-
-        parsed.into_iter().next().ok_or_else(|| {
-            anyhow!("No certificate found in cert file: {}", path.display())
+    fn read(path: &Path, what: &str) -> Result<Vec<u8>> {
+        fs::read(path).with_context(|| {
+            format!("Failed to read {what} file {}", path.display())
         })
     }
 
-    fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-        let buf = fs::read(path).with_context(|| {
-            format!("Failed to read key file: {}", path.display())
-        })?;
-
-        let key = rustls_pemfile::private_key(&mut &buf[..])
-            .map_err(|e| anyhow!("Failed to parse private key: {e}"))?
-            .ok_or_else(|| {
-                anyhow!("No private key found in file: {}", path.display())
+    fn parse_certs(
+        pem: &[u8],
+        path: &Path,
+    ) -> Result<Vec<CertificateDer<'static>>> {
+        let certs = rustls_pemfile::certs(&mut Cursor::new(pem))
+            .collect::<Result<Vec<_>, _>>()
+            .with_context(|| {
+                format!("Failed to parse certificates in {}", path.display())
             })?;
+        if certs.is_empty() {
+            bail!("No certificate found in {}", path.display());
+        }
+        Ok(certs)
+    }
 
-        Ok(key)
+    fn parse_key(pem: &[u8], path: &Path) -> Result<PrivateKeyDer<'static>> {
+        rustls_pemfile::private_key(&mut Cursor::new(pem))
+            .with_context(|| {
+                format!("Failed to parse private key in {}", path.display())
+            })?
+            .ok_or_else(|| {
+                anyhow!("No private key found in {}", path.display())
+            })
+    }
+
+    fn roots(
+        ca: Option<Vec<CertificateDer<'static>>>,
+    ) -> Result<RootCertStore> {
+        let mut roots = RootCertStore::empty();
+        if let Some(ca) = ca {
+            for cert in ca {
+                roots.add(cert).context("Failed to add CA certificate")?;
+            }
+            return Ok(roots);
+        }
+
+        let native = rustls_native_certs::load_native_certs();
+        if !native.errors.is_empty() {
+            let errors: Vec<String> =
+                native.errors.iter().map(ToString::to_string).collect();
+            bail!(
+                "Failed to load some system certificates: {}",
+                errors.join("; ")
+            );
+        }
+        for cert in native.certs {
+            roots
+                .add(cert)
+                .context("Failed to add native certificate")?;
+        }
+        Ok(roots)
+    }
+
+    /// Load and validate TLS files, and build the connector shared by every
+    /// MONITOR connection.
+    ///
+    /// # Errors
+    /// Returns an error for unreadable or invalid files, a certificate
+    /// without a key (or vice versa), or unusable system roots.
+    pub fn new(
+        insecure: bool,
+        ca: Option<&Path>,
+        cert: Option<&Path>,
+        key: Option<&Path>,
+    ) -> Result<Self> {
+        let ca_pem = ca.map(|path| Self::read(path, "CA")).transpose()?;
+        let ca_certs = ca
+            .zip(ca_pem.as_deref())
+            .map(|(path, pem)| Self::parse_certs(pem, path))
+            .transpose()?;
+
+        let (client_pem, client_auth) = match (cert, key) {
+            (Some(cert_path), Some(key_path)) => {
+                let cert_pem = Self::read(cert_path, "certificate")?;
+                let key_pem = Self::read(key_path, "private key")?;
+                let certs = Self::parse_certs(&cert_pem, cert_path)?;
+                let key = Self::parse_key(&key_pem, key_path)?;
+                (
+                    Some(ClientTlsConfig {
+                        client_cert: cert_pem,
+                        client_key: key_pem,
+                    }),
+                    Some((certs, key)),
+                )
+            }
+            (None, None) => (None, None),
+            _ => bail!(
+                "A TLS client certificate and private key must be given \
+                 together"
+            ),
+        };
+
+        let builder = if insecure {
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        } else {
+            ClientConfig::builder()
+                .with_root_certificates(Self::roots(ca_certs)?)
+        };
+        let config = match client_auth {
+            Some((certs, key)) => builder
+                .with_client_auth_cert(certs, key)
+                .context("Failed to set TLS client authentication")?,
+            None => builder.with_no_client_auth(),
+        };
+
+        Ok(Self {
+            insecure,
+            ca_pem,
+            client_pem,
+            connector: TlsConnector::from(Arc::new(config)),
+        })
     }
 
     pub async fn initialize_tls(
@@ -704,83 +790,13 @@ impl TlsConfig {
         stream: TcpStream,
         host: &str,
     ) -> Result<ClientTlsStream<TcpStream>> {
-        let config = if self.insecure {
-            let verifier = Arc::new(NoVerifier);
-            ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(verifier)
-                .with_no_client_auth()
-        } else {
-            let mut root_cert_store = RootCertStore::empty();
+        let server_name = ServerName::try_from(host.to_owned())
+            .map_err(|e| anyhow!("Invalid TLS server name '{host}': {e}"))?;
 
-            if let Some(ca_certs) = &self.ca {
-                for cert in ca_certs {
-                    root_cert_store.add(cert.clone()).map_err(|e| {
-                        anyhow!("Failed to add CA certificate: {e}")
-                    })?;
-                }
-            } else if !self.insecure {
-                let native_certs = rustls_native_certs::load_native_certs();
-
-                if !native_certs.errors.is_empty() {
-                    let error_messages: Vec<String> = native_certs
-                        .errors
-                        .into_iter()
-                        .map(|e| e.to_string())
-                        .collect();
-                    let error_summary = error_messages.join("; ");
-                    return Err(anyhow!(
-                        "Failed to load some system certificates: {error_summary}",
-                    ));
-                }
-
-                for cert in native_certs.certs {
-                    root_cert_store.add(cert).map_err(|e| {
-                        anyhow!("Failed to add native certificate: {e}")
-                    })?;
-                }
-            }
-
-            let config =
-                ClientConfig::builder().with_root_certificates(root_cert_store);
-
-            if let (Some(cert), Some(key)) = (&self.cert, &self.key) {
-                config
-                    .with_client_auth_cert(vec![cert.clone()], key.clone_key())
-                    .map_err(|e| anyhow!("Failed to set client auth: {e}"))?
-            } else {
-                config.with_no_client_auth()
-            }
-        };
-
-        let connector = TlsConnector::from(Arc::new(config));
-        let server_name = ServerName::try_from(host)
-            .map_err(|e| anyhow!("Failed to create server name: {e}"))?;
-
-        let tls_stream = connector
-            .connect(server_name.to_owned(), stream)
+        self.connector
+            .connect(server_name, stream)
             .await
-            .map_err(|e| anyhow!("TLS handshake failed: {e}"))?;
-
-        Ok(tls_stream)
-    }
-
-    pub fn new(
-        insecure: bool,
-        ca: Option<&Path>,
-        cert: Option<&Path>,
-        key: Option<&Path>,
-    ) -> Result<Self> {
-        let ca = ca.as_ref().map(|p| Self::load_ca(p)).transpose()?;
-        let cert = cert.as_ref().map(|p| Self::load_cert(p)).transpose()?;
-        let key = key.as_ref().map(|p| Self::load_key(p)).transpose()?;
-
-        Ok(Self {
-            insecure,
-            ca,
-            cert,
-            key,
-        })
+            .context("TLS handshake failed")
     }
 }
 
@@ -834,13 +850,15 @@ mod tests {
     use super::ServerAddr;
 
     #[test]
-    fn server_address_serialization_omits_normalized_ip_cache() {
-        let address = ServerAddr::from_tcp_addr("127.0.0.1", 6379);
-
-        assert_eq!(
-            serde_json::to_string(&address).unwrap(),
-            r#"{"Tcp":["127.0.0.1",6379]}"#
-        );
+    fn tls_client_certificate_and_key_must_be_paired() {
+        let path = std::path::Path::new("unused.pem");
+        for (cert, key) in [(Some(path), None), (None, Some(path))] {
+            let error = super::TlsConfig::new(true, None, cert, key)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("together"), "{error}");
+        }
+        assert!(super::TlsConfig::new(true, None, None, None).is_ok());
     }
 
     #[test]
@@ -919,7 +937,6 @@ mod tests {
             ServerAddr::from_tcp_addr("127.0.0.1", port),
             None,
             crate::ServerAuth::default(),
-            None,
         );
         let (_stream, pending) = monitor.connect().await.unwrap();
 

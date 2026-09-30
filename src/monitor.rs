@@ -1,797 +1,769 @@
+//! Byte-oriented parsing of Redis `MONITOR` records:
+//!
+//! ```text
+//! <secs>.<fraction> [<db> <client>] "<command>" "<arg>" ...
+//! ```
+//!
+//! [`Record::parse`] validates and borrows the record prefix without
+//! allocating. Arguments stay escaped until a caller needs their bytes, when
+//! [`Record::decode_args`] decodes them into reusable scratch storage.
 use std::{
     borrow::Cow,
-    io::Write,
+    fmt,
+    io::{self, Write},
     net::{IpAddr, Ipv4Addr},
 };
 
-use anyhow::Result;
-use nom::{
-    Err, IResult, Parser,
-    branch::alt,
-    bytes::{
-        complete::{is_not, tag, take_until, take_while, take_while_m_n},
-        take_while1,
-    },
-    combinator::{map_res, peek, value, verify},
-    error::{ErrorKind, FromExternalError, ParseError},
-    sequence::preceded,
-};
-use serde::{Serialize, Serializer};
+use lexical_core::FormattedSize;
 
-#[derive(Debug)]
-pub enum LineArgs<'a> {
-    Raw(&'a [u8]),
-    Parsed(Vec<Cow<'a, [u8]>>),
+/// Where and why a record failed to parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseError {
+    pub offset: usize,
+    pub expected: &'static str,
 }
 
-#[derive(Debug, Serialize)]
-pub struct Line<'a> {
-    pub timestamp: f64,
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "expected {} at byte {}", self.expected, self.offset)
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+type Result<T> = std::result::Result<T, ParseError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Client<'a> {
+    Tcp { ip: IpAddr, port: u16 },
+    Unix(&'a str),
+    Lua,
+    Unknown,
+}
+
+/// A validated record whose fields borrow the input line.
+#[derive(Debug)]
+pub struct Record<'a> {
+    /// `<secs>.<fraction>`, where both parts are digits that fit a `u64`.
+    timestamp: &'a [u8],
+    /// Offset of the '.' in `timestamp`.
+    dot: usize,
     pub db: u64,
-    pub addr: ClientAddr<'a>,
-    pub cmd: &'a str,
-    #[serde(serialize_with = "serialize_args_as_strings")]
-    pub args: LineArgs<'a>,
-}
-
-#[derive(Debug, Copy, Clone, Default)]
-pub struct ParsePlan {
-    pub client_ip: bool,
-    pub timestamp: bool,
-}
-
-#[derive(Debug)]
-pub struct LineView<'a> {
-    pub timestamp: &'a [u8],
-    pub typed_timestamp: Option<f64>,
-    pub db: &'a [u8],
-    pub addr: ClientAddrView<'a>,
-    pub cmd: &'a str,
+    pub client: Client<'a>,
+    /// Printable ASCII, excluding quotes, backslashes, and spaces.
+    pub cmd: &'a [u8],
+    /// The still-escaped arguments following the command.
     pub args: &'a [u8],
+    /// `"<command>" <args>`, when the input spells it exactly as `%l`
+    /// renders it.
     pub full_line: Option<&'a [u8]>,
-    pub single_default_tail: Option<&'a [u8]>,
+    /// Everything after the timestamp, when the input spells it exactly as
+    /// the default single-instance format renders it.
+    pub default_tail: Option<&'a [u8]>,
 }
 
-#[derive(Debug)]
-pub enum ClientAddrView<'a> {
-    Path(&'a str),
-    Tcp {
-        host: &'a [u8],
-        port: &'a [u8],
-        ip: Option<IpAddr>,
-        bracketed: bool,
-    },
-    Lua,
-    Unknown,
+/// Extract the command name (between the first pair of quotes) without
+/// validating the rest of the record.
+#[inline]
+#[must_use]
+pub fn command_name(line: &[u8]) -> Option<&[u8]> {
+    let start = memchr::memchr(b'"', line)? + 1;
+    let len = memchr::memchr(b'"', &line[start..])?;
+    Some(&line[start..start + len])
 }
 
-#[derive(Debug)]
-pub enum ClientAddr<'a> {
-    Path(&'a str),
-    Tcp(IpAddr, u16),
-    Lua,
-    Unknown,
+/// Extract the database number without validating the rest of the record.
+#[inline]
+#[must_use]
+pub fn database(line: &[u8]) -> Option<u64> {
+    let start = memchr::memchr(b'[', line)? + 1;
+    let digits = &line[start..];
+    let len = digits
+        .iter()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(digits.len());
+    lexical_core::parse(&digits[..len]).ok()
 }
 
-impl std::fmt::Display for LineArgs<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LineArgs::Raw(raw) => {
-                // Lossy is OK for display; writers can handle bytes.
-                f.write_str(&String::from_utf8_lossy(raw))
-            }
-            LineArgs::Parsed(args) => {
-                let mut it = args.iter();
-                if let Some(first) = it.next() {
-                    write!(
-                        f,
-                        "\"{}\"",
-                        String::from_utf8_lossy(first.as_ref())
-                    )?;
-                }
-                for a in it {
-                    write!(f, " \"{}\"", String::from_utf8_lossy(a.as_ref()))?;
-                }
-                Ok(())
-            }
+/// A forward-only cursor over one record.
+struct Scanner<'a> {
+    line: &'a [u8],
+    /// The unconsumed suffix of `line`.
+    rest: &'a [u8],
+}
+
+impl<'a> Scanner<'a> {
+    const fn new(line: &'a [u8]) -> Self {
+        Self { line, rest: line }
+    }
+
+    /// Offset of the cursor within the line.
+    const fn pos(&self) -> usize {
+        self.line.len() - self.rest.len()
+    }
+
+    const fn err(&self, expected: &'static str) -> ParseError {
+        ParseError {
+            offset: self.pos(),
+            expected,
         }
     }
-}
 
-#[inline]
-fn space0b(i: &[u8]) -> IResult<&[u8], &[u8]> {
-    take_while(|b| matches!(b, b' ' | b'\t'))(i)
-}
+    const fn eat(&mut self, byte: u8) -> bool {
+        match self.rest {
+            [first, rest @ ..] if *first == byte => {
+                self.rest = rest;
+                true
+            }
+            _ => false,
+        }
+    }
 
-#[inline]
-fn digit1b(i: &[u8]) -> IResult<&[u8], &[u8]> {
-    take_while(|b| (b as char).is_ascii_digit())(i).and_then(|(r, s)| {
-        if s.is_empty() {
-            Err(nom::Err::Error(nom::error::Error::new(
-                i,
-                nom::error::ErrorKind::Digit,
-            )))
+    const fn expect(&mut self, byte: u8, expected: &'static str) -> Result<()> {
+        if self.eat(byte) {
+            Ok(())
         } else {
-            Ok((r, s))
+            Err(self.err(expected))
         }
-    })
-}
+    }
 
-#[inline]
-fn parse_u64(i: &[u8]) -> IResult<&[u8], u64> {
-    map_res(digit1b, lexical_core::parse::<u64>).parse(i)
-}
-
-#[inline]
-fn parse_u64_bytes(i: &[u8]) -> IResult<&[u8], &[u8]> {
-    map_res(digit1b, |digits| {
-        lexical_core::parse::<u64>(digits).map(|_| digits)
-    })
-    .parse(i)
-}
-
-#[inline]
-fn parse_f64(input: &[u8]) -> IResult<&[u8], f64> {
-    // Validate <digits> '.' <digits>, then parse the span with correct
-    // rounding so the value round-trips to the text MONITOR printed.
-    let (i, _) = digit1b(input)?;
-    let (i, _) = tag(".")(i)?;
-    let (i, _) = digit1b(i)?;
-    let text = &input[..input.len() - i.len()];
-
-    let val = lexical_core::parse::<f64>(text).map_err(|_| {
-        nom::Err::Failure(nom::error::Error::new(
-            input,
-            nom::error::ErrorKind::Float,
-        ))
-    })?;
-
-    Ok((i, val))
-}
-
-impl<'a> Line<'a> {
-    fn is_structural_quote(input: &[u8]) -> bool {
-        if !matches!(input.first(), Some(b'"')) {
-            return false;
-        }
-
-        let after_quote = &input[1..];
-        let next_non_space = after_quote
+    fn take_while(&mut self, pred: impl Fn(u8) -> bool) -> &'a [u8] {
+        let len = self
+            .rest
             .iter()
-            .position(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
+            .position(|&b| !pred(b))
+            .unwrap_or(self.rest.len());
+        let (taken, rest) = self.rest.split_at(len);
+        self.rest = rest;
+        taken
+    }
 
-        match next_non_space {
-            None => true,
-            Some(0) => false,
-            Some(idx) => after_quote[idx] == b'"',
+    /// Skip spaces and tabs, reporting whether exactly one space was skipped.
+    fn space(&mut self) -> Separator {
+        match self.take_while(|b| matches!(b, b' ' | b'\t')) {
+            b"" => Separator::None,
+            b" " => Separator::Single,
+            _ => Separator::Other,
         }
     }
 
-    fn parse_escaped_hex<E>(input: &'a [u8]) -> IResult<&'a [u8], u8, E>
-    where
-        E: ParseError<&'a [u8]>
-            + FromExternalError<&'a [u8], std::num::ParseIntError>,
-    {
-        const fn nibble(c: u8) -> u8 {
-            match c {
-                b'0'..=b'9' => c - b'0',
-                b'a'..=b'f' => c - b'a' + 10,
-                _ => c - b'A' + 10,
+    /// One or more digits whose value fits `T`. Returns the value and
+    /// whether its spelling is canonical (no leading zeros).
+    fn number<T: TryFrom<u64>>(
+        &mut self,
+        expected: &'static str,
+    ) -> Result<(T, bool)> {
+        let before = self.rest;
+        let digits = self.take_while(|b| b.is_ascii_digit());
+        // Up to 19 digits cannot overflow a `u64`; only longer spellings
+        // (such as leading zeros) need checked arithmetic.
+        let value = if digits.len() < 20 {
+            Some(
+                digits
+                    .iter()
+                    .fold(0u64, |v, &d| v * 10 + u64::from(d - b'0')),
+            )
+        } else {
+            digits.iter().try_fold(0u64, |v, &d| {
+                v.checked_mul(10)?.checked_add(u64::from(d - b'0'))
+            })
+        };
+        match value.and_then(|v| T::try_from(v).ok()) {
+            Some(value) if !digits.is_empty() => {
+                Ok((value, digits.len() == 1 || digits[0] != b'0'))
+            }
+            _ => {
+                self.rest = before;
+                Err(self.err(expected))
             }
         }
-
-        let (input, _) = tag("x")(input)?;
-        let (input, hex) =
-            take_while_m_n(2, 2, |c: u8| c.is_ascii_hexdigit())(input)?;
-        Ok((input, (nibble(hex[0]) << 4) | nibble(hex[1])))
     }
 
-    fn parse_escaped_char<E>(input: &'a [u8]) -> IResult<&'a [u8], u8, E>
-    where
-        E: ParseError<&'a [u8]>
-            + FromExternalError<&'a [u8], std::num::ParseIntError>,
-    {
-        preceded(
-            tag("\\"),
-            alt((
-                Self::parse_escaped_hex,
-                value(b'\n', tag("n")),
-                value(b'\r', tag("r")),
-                value(b'\t', tag("t")),
-                value(0x07, tag("a")),
-                value(0x08, tag("b")),
-                value(0x0C, tag("f")),
-                value(b'\\', tag("\\")),
-                value(b'/', tag("/")),
-                value(b'"', tag("\"")),
-                value(b' ', tag(" ")),
-            )),
-        )
-        .parse(input)
+    fn take_until(
+        &mut self,
+        byte: u8,
+        expected: &'static str,
+    ) -> Result<&'a [u8]> {
+        let len = memchr::memchr(byte, self.rest)
+            .ok_or_else(|| self.err(expected))?;
+        let (taken, rest) = self.rest.split_at(len);
+        self.rest = rest;
+        Ok(taken)
     }
 
-    /// Non-empty block of bytes that doesn't include `\` or `"`
-    fn parse_literal<E: ParseError<&'a [u8]>>(
-        input: &'a [u8],
-    ) -> IResult<&'a [u8], &'a [u8], E> {
-        let not_quote_slash = is_not("\\\"");
-        verify(not_quote_slash, |s: &[u8]| !s.is_empty()).parse(input)
+    /// Returns the timestamp text and the offset of its '.'.
+    fn timestamp(&mut self) -> Result<(&'a [u8], usize)> {
+        let start = self.rest;
+        self.number::<u64>("timestamp seconds")?;
+        let dot = start.len() - self.rest.len();
+        self.expect(b'.', "'.' in timestamp")?;
+        self.number::<u64>("timestamp fraction")?;
+        Ok((&start[..start.len() - self.rest.len()], dot))
     }
 
-    fn parse_escaped_string<E>(
-        input: &'a [u8],
-    ) -> IResult<&'a [u8], Cow<'a, [u8]>, E>
-    where
-        E: ParseError<&'a [u8]>
-            + FromExternalError<&'a [u8], std::num::ParseIntError>,
-    {
-        let (mut input, _) = tag("\"")(input)?;
-        let content_start = input;
-        let mut owned: Option<Vec<u8>> = None;
-
-        loop {
-            if input.is_empty() {
-                return Err(nom::Err::Error(E::from_error_kind(
-                    input,
-                    ErrorKind::Tag,
-                )));
-            }
-
-            if Self::is_structural_quote(input) {
-                let consumed = content_start.len().saturating_sub(input.len());
-                let (input_after_quote, _) = tag("\"")(input)?;
-
-                let cow = owned.map_or_else(
-                    || Cow::Borrowed(&content_start[..consumed]),
-                    Cow::Owned,
-                );
-                return Ok((input_after_quote, cow));
-            }
-
-            if matches!(input.first(), Some(b'"')) {
-                let consumed = content_start.len().saturating_sub(input.len());
-                let buf = owned.get_or_insert_with(|| {
-                    let mut v = Vec::with_capacity(consumed + 8);
-                    v.extend_from_slice(&content_start[..consumed]);
-                    v
-                });
-                buf.push(b'"');
-                input = &input[1..];
-                continue;
-            }
-
-            if matches!(input.first(), Some(b'\\')) {
-                let consumed = content_start.len().saturating_sub(input.len());
-                let buf = owned.get_or_insert_with(|| {
-                    let mut v = Vec::with_capacity(consumed + 8);
-                    v.extend_from_slice(&content_start[..consumed]);
-                    v
-                });
-                if let Ok((next, byte)) = Self::parse_escaped_char::<E>(input) {
-                    buf.push(byte);
-                    input = next;
-                } else {
-                    buf.push(b'\\');
-                    input = &input[1..];
+    /// `<client>` inside the source brackets. Returns whether its spelling is
+    /// exactly how it is rendered.
+    fn client(&mut self) -> Result<(Client<'a>, bool)> {
+        if let Some(rest) = self.rest.strip_prefix(b"unix:") {
+            self.rest = rest;
+            let path = self.take_until(b']', "']' after unix path")?;
+            let path = std::str::from_utf8(path)
+                .map_err(|_| self.err("UTF-8 unix path"))?;
+            return Ok((Client::Unix(path), false));
+        }
+        if let Some(rest) = self.rest.strip_prefix(b"lua") {
+            self.rest = rest;
+            return Ok((Client::Lua, true));
+        }
+        match self.rest.first() {
+            Some(b'0'..=b'9') => {
+                let mut octets = [0u8; 4];
+                let mut canonical = true;
+                for (i, octet) in octets.iter_mut().enumerate() {
+                    if i > 0 {
+                        self.expect(b'.', "'.' in IPv4 address")?;
+                    }
+                    let (value, plain) = self.number("IPv4 octet")?;
+                    *octet = value;
+                    canonical &= plain;
                 }
-                continue;
+                self.expect(b':', "':' after IPv4 address")?;
+                let (port, plain) = self.number("client port")?;
+                let ip = IpAddr::V4(Ipv4Addr::from(octets));
+                Ok((Client::Tcp { ip, port }, canonical && plain))
             }
-
-            let (next, literal) = Self::parse_literal::<E>(input)?;
-            if let Some(buf) = &mut owned {
-                buf.extend_from_slice(literal);
+            Some(b'[') => {
+                self.rest = &self.rest[1..];
+                let host = self.take_until(b']', "']' after IPv6 address")?;
+                let ip = std::str::from_utf8(host)
+                    .ok()
+                    .and_then(|host| host.parse().ok())
+                    .ok_or_else(|| self.err("IP address"))?;
+                self.rest = &self.rest[1..];
+                self.expect(b':', "':' after IPv6 address")?;
+                let (port, _) = self.number("client port")?;
+                Ok((Client::Tcp { ip, port }, false))
             }
-            input = next;
+            Some(b']') => Ok((Client::Unknown, false)),
+            _ => Err(self.err("client address")),
         }
     }
 
-    fn parse_escaped_args<E>(
-        input: &'a [u8],
-    ) -> IResult<&'a [u8], Vec<Cow<'a, [u8]>>, E>
-    where
-        E: ParseError<&'a [u8]>
-            + FromExternalError<&'a [u8], std::num::ParseIntError>,
-    {
-        let mut args = Vec::new();
-        let (input, ()) = Self::parse_args_into(input, &mut args)?;
-        Ok((input, args))
-    }
-
-    /// Decode arguments into reusable storage. Borrow unescaped arguments;
-    /// allocate only when an argument requires unescaping. On error the scratch
-    /// may contain a partial parse and must not be used for key discovery.
-    pub fn parse_args_into<E>(
-        mut input: &'a [u8],
-        args: &mut Vec<Cow<'a, [u8]>>,
-    ) -> IResult<&'a [u8], (), E>
-    where
-        E: ParseError<&'a [u8]>
-            + FromExternalError<&'a [u8], std::num::ParseIntError>,
-    {
-        args.clear();
-
-        while !input.is_empty() {
-            let (next, arg) = Self::parse_escaped_string(input)?;
-            args.push(arg);
-
-            let space_len = next
-                .iter()
-                .take_while(|b| matches!(b, b' ' | b'\t'))
-                .count();
-            let space = &next[..space_len];
-            let after_space = &next[space_len..];
-            if after_space.is_empty() {
-                input = after_space;
-                break;
-            }
-            if space.is_empty() {
-                return Err(nom::Err::Error(E::from_error_kind(
-                    after_space,
-                    ErrorKind::Space,
-                )));
-            }
-            input = after_space;
+    fn command(&mut self) -> Result<&'a [u8]> {
+        self.expect(b'"', "'\"' before command")?;
+        let name = self.take_while(is_command_byte);
+        if name.is_empty() {
+            return Err(self.err("command name"));
         }
-
-        Ok((input, ()))
+        self.expect(b'"', "'\"' after command")?;
+        Ok(name)
     }
+}
 
-    // aaa.bbb.ccc.ddd:port
-    fn parse_ipv4(input: &[u8]) -> IResult<&[u8], (IpAddr, u16)> {
-        let (input, a) =
-            map_res(digit1b, lexical_core::parse::<u8>).parse(input)?;
-        let (input, _) = tag(".")(input)?;
-        let (input, b) =
-            map_res(digit1b, lexical_core::parse::<u8>).parse(input)?;
-        let (input, _) = tag(".")(input)?;
-        let (input, c) =
-            map_res(digit1b, lexical_core::parse::<u8>).parse(input)?;
-        let (input, _) = tag(".")(input)?;
-        let (input, d) =
-            map_res(digit1b, lexical_core::parse::<u8>).parse(input)?;
-        let (input, _) = tag(":")(input)?;
-        let (input, port) =
-            map_res(digit1b, lexical_core::parse::<u16>).parse(input)?;
-        let ip = IpAddr::V4(Ipv4Addr::new(a, b, c, d));
-        Ok((input, (ip, port)))
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Separator {
+    None,
+    Single,
+    Other,
+}
 
-    // [::1]:53374
-    fn parse_ipv6(input: &[u8]) -> IResult<&[u8], (IpAddr, u16)> {
-        let (input, _) = tag("[")(input)?;
-        let (input, ipb) = take_until("]")(input)?;
-        let (input, _) = tag("]")(input)?;
-        let (input, _) = tag(":")(input)?;
-        let (input, port) =
-            map_res(digit1b, lexical_core::parse::<u16>).parse(input)?;
-        let addrs = std::str::from_utf8(ipb).map_err(|_| {
-            Err::Error(ParseError::from_error_kind(
-                input,
-                nom::error::ErrorKind::Tag,
-            ))
-        })?;
-        let ip = addrs.parse().map_err(|_| {
-            Err::Error(ParseError::from_error_kind(
-                input,
-                nom::error::ErrorKind::Tag,
-            ))
-        })?;
-        Ok((input, (ip, port)))
-    }
+/// Module commands commonly contain punctuation such as `FT.SEARCH`; quotes,
+/// backslashes, and spaces never appear in a valid unescaped name.
+const fn is_command_byte(b: u8) -> bool {
+    b.is_ascii_graphic() && b != b'"' && b != b'\\'
+}
 
-    fn parse_unix(input: &[u8]) -> IResult<&[u8], &str> {
-        let (input, _) = tag("unix:")(input)?;
-        let (input, pathb) = take_until("]")(input)?;
-        let paths = std::str::from_utf8(pathb).map_err(|_| {
-            nom::Err::Error(nom::error::Error::new(
-                input,
-                nom::error::ErrorKind::MapRes,
-            ))
-        })?;
-        Ok((input, paths))
-    }
+impl<'a> Record<'a> {
+    /// Validate a record prefix, borrowing every field from `line`.
+    ///
+    /// # Errors
+    /// Returns the first offset that does not match the record grammar.
+    /// Arguments are validated separately by [`Self::decode_args`].
+    pub fn parse(line: &'a [u8]) -> Result<Self> {
+        let mut s = Scanner::new(line);
+        let (timestamp, dot) = s.timestamp()?;
+        let source_space = s.space();
+        let source_start = s.pos();
+        s.expect(b'[', "'[' before source")?;
+        let (db, canonical_db) = s.number("database")?;
+        let db_space = s.space();
+        let (client, canonical_client) = s.client()?;
+        s.expect(b']', "']' after source")?;
+        let command_space = s.space();
+        let command_start = s.pos();
+        let cmd = s.command()?;
+        let args_space = s.space();
+        let args = s.rest;
 
-    #[inline]
-    fn parse_unknown(input: &[u8]) -> IResult<&[u8], &str> {
-        let (input, _) = peek(tag("]")).parse(input)?;
-        Ok((input, ""))
-    }
-
-    #[inline]
-    fn parse_lua(input: &[u8]) -> IResult<&[u8], ()> {
-        let (input, _) = tag("lua").parse(input)?;
-        Ok((input, ()))
-    }
-
-    fn parse_client(input: &[u8]) -> IResult<&[u8], ClientAddr<'_>> {
-        if let Ok((input, path)) = Self::parse_unix(input) {
-            Ok((input, ClientAddr::from_path(path)))
-        } else if let Ok((input, (addr, port))) = Self::parse_ipv4(input) {
-            Ok((input, ClientAddr::from_addr(addr, port)))
-        } else if let Ok((input, (addr, port))) = Self::parse_ipv6(input) {
-            Ok((input, ClientAddr::from_addr(addr, port)))
-        } else if let Ok((input, ())) = Self::parse_lua(input) {
-            Ok((input, ClientAddr::Lua))
-        } else if let Ok((input, _)) = Self::parse_unknown(input) {
-            Ok((input, ClientAddr::Unknown))
+        // `%l` renders `"<command>"` plus a single space and the arguments,
+        // when there are any.
+        let canonical_args = if args.is_empty() {
+            args_space == Separator::None
         } else {
-            Err(Err::Error(ParseError::from_error_kind(
-                input,
-                ErrorKind::Tag,
-            )))
-        }
-    }
-
-    fn parse_source(input: &[u8]) -> IResult<&[u8], (u64, ClientAddr<'_>)> {
-        let (input, _) = tag("[")(input)?;
-        let (input, db) = parse_u64(input)?;
-        let (input, _) = space0b(input)?;
-        let (input, addr) = Self::parse_client(input)?;
-        let (input, _) = tag("]")(input)?;
-        Ok((input, (db, addr)))
-    }
-
-    /// Command names are printable ASCII. Module commands commonly contain
-    /// punctuation such as `FT.SEARCH` or `JSON.SET`; quotes, backslashes
-    /// (escapes), and spaces never appear in a valid unescaped name.
-    #[inline]
-    const fn is_cmd_char(b: u8) -> bool {
-        b.is_ascii_graphic() && b != b'"' && b != b'\\'
-    }
-
-    #[inline]
-    fn parse_quoted_ascii_cmd(input: &[u8]) -> IResult<&[u8], &str> {
-        let (input, _) = tag("\"")(input)?;
-        let (input, cmd_bytes) = take_while1(Self::is_cmd_char).parse(input)?;
-        let (input, _) = tag("\"")(input)?;
-        // Safe: ASCII verified
-        let cmd = unsafe { std::str::from_utf8_unchecked(cmd_bytes) };
-        Ok((input, cmd))
-    }
-
-    pub fn from_line_bytes(
-        input: &'a [u8],
-        parse_args: bool,
-    ) -> IResult<&'a [u8], Self> {
-        let (input, timestamp) = parse_f64(input)?;
-        let (input, _) = space0b(input)?;
-        let (input, (db, addr)) = Self::parse_source(input)?;
-        let (input, _) = space0b(input)?;
-        let (input, cmd) = Self::parse_quoted_ascii_cmd(input)?;
-        let (input, _) = space0b(input)?;
-
-        let args = if parse_args {
-            let (input, args) = Self::parse_escaped_args(input)?;
-            if !input.is_empty() {
-                return Err(nom::Err::Error(nom::error::Error::new(
-                    input,
-                    ErrorKind::Tag,
-                )));
-            }
-            LineArgs::Parsed(args)
-        } else {
-            LineArgs::Raw(input)
+            args_space == Separator::Single
         };
+        let full_line = canonical_args.then(|| &line[command_start..]);
+        let default_tail = (canonical_args
+            && source_space == Separator::Single
+            && canonical_db
+            && db_space == Separator::Single
+            && canonical_client
+            && command_space == Separator::Single)
+            .then(|| &line[source_start..]);
 
-        Ok((input, Self::new(timestamp, db, addr, cmd, args)))
-    }
-
-    fn write_bulk_bytes(writer: &mut dyn Write, bytes: &[u8]) -> Result<()> {
-        write!(writer, "${}\r\n", bytes.len())?;
-        writer.write_all(bytes)?;
-        writer.write_all(b"\r\n")?;
-        Ok(())
-    }
-
-    pub fn write_resp(&self, writer: &mut dyn Write) -> Result<()> {
-        let args = match &self.args {
-            LineArgs::Parsed(v) => v,
-            LineArgs::Raw(_) => {
-                return Err(anyhow::anyhow!(
-                    "RESP output requires parsed MONITOR arguments"
-                ));
-            }
-        };
-
-        let total_count = 1 + args.len();
-        write!(writer, "*{total_count}\r\n")?;
-
-        Self::write_bulk_bytes(writer, self.cmd.as_bytes())?;
-        for arg in args {
-            Self::write_bulk_bytes(writer, arg.as_ref())?;
-        }
-        Ok(())
-    }
-
-    pub const fn new(
-        timestamp: f64,
-        db: u64,
-        addr: ClientAddr<'a>,
-        cmd: &'a str,
-        args: LineArgs<'a>,
-    ) -> Self {
-        Self {
+        Ok(Self {
             timestamp,
+            dot,
             db,
-            addr,
+            client,
             cmd,
             args,
-        }
-    }
-}
-
-impl<'a> LineView<'a> {
-    fn is_canonical_uint(bytes: &[u8]) -> bool {
-        bytes.len() == 1 || bytes.first() != Some(&b'0')
-    }
-
-    fn is_canonical_client(client: &ClientAddrView<'_>) -> bool {
-        match client {
-            ClientAddrView::Tcp {
-                host,
-                port,
-                bracketed: false,
-                ..
-            } => {
-                host.split(|byte| *byte == b'.')
-                    .all(Self::is_canonical_uint)
-                    && Self::is_canonical_uint(port)
-            }
-            ClientAddrView::Lua => true,
-            ClientAddrView::Path(_)
-            | ClientAddrView::Tcp {
-                bracketed: true, ..
-            }
-            | ClientAddrView::Unknown => false,
-        }
-    }
-
-    fn parse_timestamp(
-        input: &'a [u8],
-        plan: ParsePlan,
-    ) -> IResult<&'a [u8], (&'a [u8], Option<f64>)> {
-        let start = input;
-        let (input, integer) = parse_u64_bytes(input)?;
-        let (input, _) = tag(".")(input)?;
-        let (input, fraction) = parse_u64_bytes(input)?;
-        let consumed = start.len() - input.len();
-        let timestamp = &start[..consumed];
-        let typed =
-            if plan.timestamp && (integer.len() > 10 || fraction.len() != 6) {
-                Some(parse_f64(start)?.1)
-            } else {
-                None
-            };
-        Ok((input, (timestamp, typed)))
-    }
-
-    fn parse_port(input: &'a [u8]) -> IResult<&'a [u8], &'a [u8]> {
-        map_res(digit1b, |digits| {
-            lexical_core::parse::<u16>(digits).map(|_| digits)
+            full_line,
+            default_tail,
         })
-        .parse(input)
     }
 
-    fn parse_ipv4(
-        input: &'a [u8],
-        plan: ParsePlan,
-    ) -> IResult<&'a [u8], ClientAddrView<'a>> {
-        let host_start = input;
-        let (input, a) =
-            map_res(digit1b, lexical_core::parse::<u8>).parse(input)?;
-        let (input, _) = tag(".")(input)?;
-        let (input, b) =
-            map_res(digit1b, lexical_core::parse::<u8>).parse(input)?;
-        let (input, _) = tag(".")(input)?;
-        let (input, c) =
-            map_res(digit1b, lexical_core::parse::<u8>).parse(input)?;
-        let (input, _) = tag(".")(input)?;
-        let (input, d) =
-            map_res(digit1b, lexical_core::parse::<u8>).parse(input)?;
-        let host_len = host_start.len() - input.len();
-        let host = &host_start[..host_len];
-        let (input, _) = tag(":")(input)?;
-        let (input, port) = Self::parse_port(input)?;
-        let ip = plan
-            .client_ip
-            .then(|| IpAddr::V4(Ipv4Addr::new(a, b, c, d)));
-
-        Ok((
-            input,
-            ClientAddrView::Tcp {
-                host,
-                port,
-                ip,
-                bracketed: false,
-            },
-        ))
+    /// The command name as text. Command names are ASCII, so this never
+    /// needs to validate anything but is kept off the plain-output path.
+    #[must_use]
+    pub fn cmd_str(&self) -> &'a str {
+        std::str::from_utf8(self.cmd).unwrap_or_default()
     }
 
-    fn parse_ipv6(input: &'a [u8]) -> IResult<&'a [u8], ClientAddrView<'a>> {
-        let (input, _) = tag("[")(input)?;
-        let (input, host) = take_until("]")(input)?;
-        let (input, _) = tag("]")(input)?;
-        let (input, _) = tag(":")(input)?;
-        let (input, port) = Self::parse_port(input)?;
-        let host_str = std::str::from_utf8(host).map_err(|_| {
-            Err::Error(ParseError::from_error_kind(input, ErrorKind::Tag))
-        })?;
-        let ip = host_str.parse().map_err(|_| {
-            Err::Error(ParseError::from_error_kind(input, ErrorKind::Tag))
-        })?;
-
-        Ok((
-            input,
-            ClientAddrView::Tcp {
-                host,
-                port,
-                ip: Some(ip),
-                bracketed: true,
-            },
-        ))
+    /// The timestamp as a float, correctly rounded from its text. Values
+    /// with more than about 16 significant digits lose precision.
+    #[must_use]
+    pub fn timestamp(&self) -> f64 {
+        // Parsing validated `<digits>.<digits>`, which always parses.
+        lexical_core::parse(self.timestamp).unwrap_or(f64::NAN)
     }
 
-    fn parse_client(
-        input: &'a [u8],
-        plan: ParsePlan,
-    ) -> IResult<&'a [u8], ClientAddrView<'a>> {
-        if let Ok((input, path)) = Line::parse_unix(input) {
-            Ok((input, ClientAddrView::Path(path)))
-        } else if let Ok(result) = Self::parse_ipv4(input, plan) {
-            Ok(result)
-        } else if let Ok(result) = Self::parse_ipv6(input) {
-            Ok(result)
-        } else if let Ok((input, ())) = Line::parse_lua(input) {
-            Ok((input, ClientAddrView::Lua))
-        } else if let Ok((input, _)) = Line::parse_unknown(input) {
-            Ok((input, ClientAddrView::Unknown))
+    /// Decode arguments into `args`, replacing its contents. Unescaped
+    /// arguments are borrowed; only arguments containing escapes allocate.
+    ///
+    /// # Errors
+    /// Returns an error for unterminated or unseparated arguments. `args` may
+    /// then hold a partial decode and must not be used.
+    pub fn decode_args(&self, args: &mut Vec<Cow<'a, [u8]>>) -> Result<()> {
+        decode_args(self.args, args)
+    }
+
+    /// Write the timestamp as MONITOR text normalized like a decimal number:
+    /// no leading zeros in the seconds and no trailing zeros in the fraction.
+    ///
+    /// # Errors
+    /// Returns any error from `w`.
+    pub fn write_timestamp(&self, w: &mut impl Write) -> io::Result<()> {
+        let secs = &self.timestamp[..self.dot];
+        let fraction = &self.timestamp[self.dot + 1..];
+        // Both parts are non-empty digit strings.
+        let first_nonzero = secs
+            .iter()
+            .position(|&b| b != b'0')
+            .unwrap_or(secs.len() - 1);
+        w.write_all(&secs[first_nonzero..])?;
+        if let Some(last) = fraction.iter().rposition(|&b| b != b'0') {
+            w.write_all(b".")?;
+            w.write_all(&fraction[..=last])?;
+        }
+        Ok(())
+    }
+}
+
+/// Room for any rendered TCP client address, such as `[<ipv6>]:65535`.
+pub const MAX_TCP_ADDR_LEN: usize = 64;
+
+impl Client<'_> {
+    /// Write the address as `ip:port`, `[ipv6]:port`, a unix path, `lua`,
+    /// or `-`.
+    ///
+    /// # Errors
+    /// Returns any error from `w`.
+    pub fn write_addr(&self, w: &mut impl Write) -> io::Result<()> {
+        match self {
+            Client::Tcp { ip, port } => {
+                if ip.is_ipv6() {
+                    w.write_all(b"[")?;
+                    write_ip(w, *ip)?;
+                    w.write_all(b"]:")?;
+                } else {
+                    write_ip(w, *ip)?;
+                    w.write_all(b":")?;
+                }
+                write_uint(w, *port)
+            }
+            Client::Unix(path) => w.write_all(path.as_bytes()),
+            Client::Lua => w.write_all(b"lua"),
+            Client::Unknown => w.write_all(b"-"),
+        }
+    }
+
+    /// Write the host part: the IP address, or `-` for non-TCP clients.
+    ///
+    /// # Errors
+    /// Returns any error from `w`.
+    pub fn write_host(&self, w: &mut impl Write) -> io::Result<()> {
+        match self {
+            Client::Tcp { ip, .. } => write_ip(w, *ip),
+            Client::Unix(_) | Client::Lua | Client::Unknown => {
+                w.write_all(b"-")
+            }
+        }
+    }
+
+    /// Write the port, the unix socket's file name, `lua`, or `-`.
+    ///
+    /// # Errors
+    /// Returns any error from `w`.
+    pub fn write_port(&self, w: &mut impl Write) -> io::Result<()> {
+        match self {
+            Client::Tcp { port, .. } => write_uint(w, *port),
+            Client::Unix(path) => w.write_all(
+                path.rsplit('/')
+                    .next()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("-")
+                    .as_bytes(),
+            ),
+            Client::Lua => w.write_all(b"lua"),
+            Client::Unknown => w.write_all(b"-"),
+        }
+    }
+
+    /// Render the address into a stack buffer, returning it as text.
+    /// Returns `None` for unix paths, which callers should use directly.
+    pub fn render_tcp<'b>(
+        &self,
+        buf: &'b mut [u8; MAX_TCP_ADDR_LEN],
+    ) -> Option<&'b str> {
+        if !matches!(self, Client::Tcp { .. }) {
+            return None;
+        }
+        let mut cursor = &mut buf[..];
+        self.write_addr(&mut cursor).ok()?;
+        let len = MAX_TCP_ADDR_LEN - cursor.len();
+        std::str::from_utf8(&buf[..len]).ok()
+    }
+}
+
+fn write_ip(w: &mut impl Write, ip: IpAddr) -> io::Result<()> {
+    match ip {
+        IpAddr::V4(ip) => {
+            for (i, octet) in ip.octets().into_iter().enumerate() {
+                if i > 0 {
+                    w.write_all(b".")?;
+                }
+                write_uint(w, octet)?;
+            }
+            Ok(())
+        }
+        // Rare enough that the formatting machinery's cost is irrelevant.
+        IpAddr::V6(ip) => write!(w, "{ip}"),
+    }
+}
+
+/// Write an unsigned integer in decimal without the formatting machinery.
+///
+/// # Errors
+/// Returns any error from `w`.
+pub fn write_uint(w: &mut impl Write, n: impl Into<u64>) -> io::Result<()> {
+    let mut buf = [0u8; u64::FORMATTED_SIZE_DECIMAL];
+    w.write_all(lexical_core::write(n.into(), &mut buf))
+}
+
+/// Decode escaped, quoted MONITOR arguments into `args`.
+///
+/// Redis escapes quotes inside arguments, but some producers do not, so a
+/// quote only closes an argument when followed by optional whitespace and then
+/// either the end of the record or another opening quote. Unknown escape
+/// sequences are preserved literally.
+///
+/// # Errors
+/// Returns an error for unterminated or unseparated arguments. `args` may
+/// then hold a partial decode and must not be used.
+pub fn decode_args<'a>(
+    input: &'a [u8],
+    args: &mut Vec<Cow<'a, [u8]>>,
+) -> Result<()> {
+    args.clear();
+    let mut pos = 0;
+    while pos < input.len() {
+        if input[pos] != b'"' {
+            return Err(ParseError {
+                offset: pos,
+                expected: "'\"' before argument",
+            });
+        }
+        let (arg, end) = decode_arg(input, pos + 1)?;
+        args.push(arg);
+
+        let spaces = input[end..]
+            .iter()
+            .take_while(|b| matches!(b, b' ' | b'\t'))
+            .count();
+        if spaces == 0 && end < input.len() {
+            return Err(ParseError {
+                offset: end,
+                expected: "space between arguments",
+            });
+        }
+        pos = end + spaces;
+    }
+    Ok(())
+}
+
+/// Decode one argument whose content starts at `start`. Returns the argument
+/// and the offset just past its closing quote. Runs in linear time: each byte
+/// is scanned once, jumping between quotes and backslashes.
+fn decode_arg(input: &[u8], start: usize) -> Result<(Cow<'_, [u8]>, usize)> {
+    let mut owned: Option<Vec<u8>> = None;
+    let mut pos = start;
+    loop {
+        let special = memchr::memchr2(b'"', b'\\', &input[pos..])
+            .map(|len| pos + len)
+            .ok_or(ParseError {
+                offset: input.len(),
+                expected: "closing '\"'",
+            })?;
+        if let Some(buf) = &mut owned {
+            buf.extend_from_slice(&input[pos..special]);
+        }
+
+        if input[special] == b'"' && closes_argument(&input[special + 1..]) {
+            let arg = owned.map_or_else(
+                || Cow::Borrowed(&input[start..special]),
+                Cow::Owned,
+            );
+            return Ok((arg, special + 1));
+        }
+
+        // First escape or embedded quote: switch to an owned copy, which
+        // already includes everything scanned so far.
+        let buf = owned.get_or_insert_with(|| input[start..special].to_vec());
+        if input[special] == b'"' {
+            buf.push(b'"');
+            pos = special + 1;
+        } else if let Some((byte, len)) = unescape(&input[special + 1..]) {
+            buf.push(byte);
+            pos = special + 1 + len;
         } else {
-            Err(Err::Error(ParseError::from_error_kind(
-                input,
-                ErrorKind::Tag,
-            )))
-        }
-    }
-
-    fn parse_source(
-        input: &'a [u8],
-        plan: ParsePlan,
-    ) -> IResult<&'a [u8], (&'a [u8], ClientAddrView<'a>, bool)> {
-        let (input, _) = tag("[")(input)?;
-        let (input, db) = parse_u64_bytes(input)?;
-        let before_space = input;
-        let (input, _) = space0b(input)?;
-        let canonical_space = before_space.len() - input.len() == 1
-            && before_space.first() == Some(&b' ');
-        let (input, addr) = Self::parse_client(input, plan)?;
-        let (input, _) = tag("]")(input)?;
-        let canonical = canonical_space
-            && Self::is_canonical_uint(db)
-            && Self::is_canonical_client(&addr);
-        Ok((input, (db, addr, canonical)))
-    }
-
-    pub fn from_line_bytes(
-        input: &'a [u8],
-        plan: ParsePlan,
-    ) -> IResult<&'a [u8], Self> {
-        let (input, (timestamp, typed_timestamp)) =
-            Self::parse_timestamp(input, plan)?;
-        let before_source_space = input;
-        let (input, _) = space0b(input)?;
-        let canonical_source_space = before_source_space.len() - input.len()
-            == 1
-            && before_source_space.first() == Some(&b' ');
-        let source_start = input;
-        let (input, (db, addr, canonical_source)) =
-            Self::parse_source(input, plan)?;
-        let before_command_space = input;
-        let (input, _) = space0b(input)?;
-        let canonical_command_space = before_command_space.len() - input.len()
-            == 1
-            && before_command_space.first() == Some(&b' ');
-        let full_line_start = input;
-        let (input, cmd) = Line::parse_quoted_ascii_cmd(input)?;
-        let before_args_space = input;
-        let (args, _) = space0b(input)?;
-        let canonical_args_space = before_args_space.len() - args.len() == 1
-            && before_args_space.first() == Some(&b' ');
-        let full_line = canonical_args_space.then_some(full_line_start);
-        let single_default_tail = (canonical_source_space
-            && canonical_source
-            && canonical_command_space
-            && canonical_args_space)
-            .then_some(source_start);
-
-        Ok((
-            args,
-            Self {
-                timestamp,
-                typed_timestamp,
-                db,
-                addr,
-                cmd,
-                args,
-                full_line,
-                single_default_tail,
-            },
-        ))
-    }
-}
-
-impl<'a> ClientAddr<'a> {
-    pub const fn from_path(path: &'a str) -> Self {
-        Self::Path(path)
-    }
-
-    pub const fn from_addr(addr: IpAddr, port: u16) -> Self {
-        Self::Tcp(addr, port)
-    }
-}
-
-impl std::fmt::Display for ClientAddr<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ClientAddr::Path(path) => write!(f, "{path}"),
-            ClientAddr::Tcp(addr, port) => write!(f, "{addr}:{port}"),
-            ClientAddr::Lua => write!(f, "lua"),
-            ClientAddr::Unknown => write!(f, "-"),
+            buf.push(b'\\');
+            pos = special + 1;
         }
     }
 }
 
-impl Serialize for ClientAddr<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
+/// Whether a quote followed by `after` closes an argument.
+fn closes_argument(after: &[u8]) -> bool {
+    match after
+        .iter()
+        .position(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
     {
-        match self {
-            Self::Path(p) => serializer.serialize_str(p),
-            Self::Tcp(..) => serializer.collect_str(self),
-            Self::Lua => serializer.serialize_str("lua"),
-            Self::Unknown => serializer.serialize_str("-"),
-        }
+        None => true,
+        Some(0) => false,
+        Some(next) => after[next] == b'"',
     }
 }
 
-fn serialize_args_as_strings<S>(
-    args: &LineArgs<'_>,
-    s: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    match args {
-        LineArgs::Parsed(v) => {
-            s.collect_seq(v.iter().map(|a| bytes_to_structured_string(a)))
-        }
-        LineArgs::Raw(raw) => {
-            let s1 = bytes_to_structured_string(raw);
-            s.serialize_str(&s1)
+/// Decode the escape following a backslash, returning the byte and the
+/// number of input bytes consumed after the backslash.
+fn unescape(input: &[u8]) -> Option<(u8, usize)> {
+    const fn nibble(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
         }
     }
-}
 
-fn bytes_to_structured_string(bytes: &[u8]) -> Cow<'_, str> {
-    String::from_utf8_lossy(bytes)
+    let byte = match *input.first()? {
+        b'x' => {
+            let hi = nibble(*input.get(1)?)?;
+            let lo = nibble(*input.get(2)?)?;
+            return Some(((hi << 4) | lo, 3));
+        }
+        b'n' => b'\n',
+        b'r' => b'\r',
+        b't' => b'\t',
+        b'a' => 0x07,
+        b'b' => 0x08,
+        b'f' => 0x0C,
+        c @ (b'\\' | b'/' | b'"' | b' ') => c,
+        _ => return None,
+    };
+    Some((byte, 1))
 }
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Value;
+    use std::borrow::Cow;
 
-    use super::{ClientAddr, Line, LineArgs};
+    use super::{Client, Record, command_name, database, decode_args};
+
+    fn args(line: &[u8]) -> Vec<Vec<u8>> {
+        let record = Record::parse(line).unwrap();
+        let mut args = Vec::new();
+        record.decode_args(&mut args).unwrap();
+        args.into_iter().map(Cow::into_owned).collect()
+    }
+
+    /// Escape like Redis `sdscatrepr`, which MONITOR uses for arguments.
+    fn repr(bytes: &[u8]) -> Vec<u8> {
+        let mut out = b"\"".to_vec();
+        for &b in bytes {
+            match b {
+                b'\\' | b'"' => out.extend([b'\\', b]),
+                b'\n' => out.extend(b"\\n"),
+                b'\r' => out.extend(b"\\r"),
+                b'\t' => out.extend(b"\\t"),
+                0x07 => out.extend(b"\\a"),
+                0x08 => out.extend(b"\\b"),
+                _ if b.is_ascii_graphic() || b == b' ' => out.push(b),
+                _ => out.extend(format!("\\x{b:02x}").bytes()),
+            }
+        }
+        out.push(b'"');
+        out
+    }
 
     #[test]
-    fn resp_writer_rejects_unparsed_arguments_without_panicking() {
-        let line =
-            Line::new(1.0, 0, ClientAddr::Unknown, "PING", LineArgs::Raw(b""));
-        let error = line.write_resp(&mut Vec::new()).unwrap_err();
-
+    fn parses_every_field_of_a_record() {
+        let record = Record::parse(
+            br#"1783484211.311904 [3 127.0.0.1:52460] "SET" "k" "v""#,
+        )
+        .unwrap();
+        assert_eq!(record.db, 3);
         assert_eq!(
-            error.to_string(),
-            "RESP output requires parsed MONITOR arguments"
+            record.client,
+            Client::Tcp {
+                ip: "127.0.0.1".parse().unwrap(),
+                port: 52460
+            }
         );
+        assert_eq!(record.cmd, b"SET");
+        assert_eq!(record.args, br#""k" "v""#);
+        assert_eq!(record.full_line, Some(&br#""SET" "k" "v""#[..]));
+        assert_eq!(
+            record.default_tail,
+            Some(&br#"[3 127.0.0.1:52460] "SET" "k" "v""#[..])
+        );
+    }
+
+    #[test]
+    fn parses_every_client_form() {
+        for (client, expected) in [
+            ("127.0.0.1:1", "127.0.0.1:1"),
+            ("[::1]:6379", "[::1]:6379"),
+            ("[2001:0db8::1]:1", "[2001:db8::1]:1"),
+            ("unix:/tmp/redis.sock", "/tmp/redis.sock"),
+            ("lua", "lua"),
+            ("", "-"),
+        ] {
+            let line = format!(r#"1.0 [0 {client}] "PING""#);
+            let record = Record::parse(line.as_bytes()).unwrap();
+            let mut out = Vec::new();
+            record.client.write_addr(&mut out).unwrap();
+            assert_eq!(String::from_utf8(out).unwrap(), expected, "{line}");
+        }
+    }
+
+    #[test]
+    fn numeric_fields_are_range_checked() {
+        let ok = |line: &str| Record::parse(line.as_bytes()).is_ok();
+        assert!(ok(
+            r#"18446744073709551615.18446744073709551615 [0 lua] "X""#
+        ));
+        assert!(!ok(r#"18446744073709551616.0 [0 lua] "X""#));
+        assert!(!ok(r#"1.18446744073709551616 [0 lua] "X""#));
+        assert!(ok(r#"1.0 [18446744073709551615 lua] "X""#));
+        assert!(!ok(r#"1.0 [18446744073709551616 lua] "X""#));
+        // Leading zeros may exceed 19 digits without overflowing.
+        assert!(ok(r#"000000000000000000000001.0 [0 lua] "X""#));
+        assert!(ok(r#"1.0 [0 255.255.255.255:65535] "X""#));
+        assert!(!ok(r#"1.0 [0 256.0.0.1:1] "X""#));
+        assert!(!ok(r#"1.0 [0 1.2.3.4:65536] "X""#));
+        assert!(!ok(r#"1.0 [0 1.2.3:4] "X""#));
+        assert!(!ok(r#"1. [0 lua] "X""#));
+        assert!(!ok(r#".1 [0 lua] "X""#));
+    }
+
+    #[test]
+    fn errors_report_the_failing_offset() {
+        let error = Record::parse(br#"1.0 [0 lua] "BAD CMD""#).unwrap_err();
+        assert_eq!(error.offset, 16);
+        assert_eq!(error.expected, "'\"' after command");
+        assert_eq!(
+            Record::parse(b"").unwrap_err().to_string(),
+            "expected timestamp seconds at byte 0"
+        );
+    }
+
+    #[test]
+    fn timestamps_are_parsed_with_correct_rounding() {
+        for text in ["1783484211.311904", "0.1", "1783484211.999999"] {
+            let line = format!(r#"{text} [0 127.0.0.1:1] "PING""#);
+            let record = Record::parse(line.as_bytes()).unwrap();
+            assert_eq!(
+                record.timestamp().to_bits(),
+                text.parse::<f64>().unwrap().to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_text_is_normalized_without_rounding() {
+        for (text, expected) in [
+            ("1783484211.311904", "1783484211.311904"),
+            ("1783484211.300000", "1783484211.3"),
+            ("1783484211.000000", "1783484211"),
+            ("0001.5", "1.5"),
+            ("0.0", "0"),
+            ("12345678901.123456", "12345678901.123456"),
+        ] {
+            let line = format!(r#"{text} [0 lua] "PING""#);
+            let mut out = Vec::new();
+            Record::parse(line.as_bytes())
+                .unwrap()
+                .write_timestamp(&mut out)
+                .unwrap();
+            assert_eq!(String::from_utf8(out).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn module_command_names_are_accepted() {
+        for cmd in ["FT.SEARCH", "json.set", "_FT.DEBUG", "CF.ADD"] {
+            let line = format!(r#"1.0 [0 127.0.0.1:1] "{cmd}" "k""#);
+            let record = Record::parse(line.as_bytes()).unwrap();
+            assert_eq!(record.cmd_str(), cmd);
+        }
+    }
+
+    #[test]
+    fn escaped_arguments_round_trip_all_bytes() {
+        let values: Vec<Vec<u8>> = vec![
+            b"plain".to_vec(),
+            Vec::new(),
+            (0..=255).collect(),
+            b"\"quoted\" \\backslash\\ \r\n\t\x07\x08".to_vec(),
+            b"\" \"looks like a separator\" \"".to_vec(),
+        ];
+        let mut line = br#"1.0 [0 lua] "SET""#.to_vec();
+        for value in &values {
+            line.push(b' ');
+            line.extend(repr(value));
+        }
+        assert_eq!(args(&line), values);
+    }
+
+    #[test]
+    fn unescaped_arguments_are_borrowed() {
+        let record = Record::parse(br#"1.0 [0 lua] "SET" "k" "a\"b""#).unwrap();
+        let mut decoded = Vec::new();
+        record.decode_args(&mut decoded).unwrap();
+        assert!(matches!(decoded[0], Cow::Borrowed(b"k")));
+        assert!(matches!(&decoded[1], Cow::Owned(v) if v == b"a\"b"));
     }
 
     #[test]
@@ -801,152 +773,106 @@ mod tests {
         let line = format!(
             r#"1783484211.311904 [0 127.0.0.1:52460] "ZADD" "analytics:measurements" "1783484211.3117671" "{payload}""#
         );
-
-        let (_, parsed) = Line::from_line_bytes(line.as_bytes(), true).unwrap();
-
-        let LineArgs::Parsed(args) = &parsed.args else {
-            panic!("expected parsed args");
-        };
-        assert_eq!(args.len(), 3);
-        assert_eq!(args[2].as_ref(), payload.as_bytes());
-
-        let json = serde_json::to_string(&parsed).unwrap();
-        let value: Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value["args"][2], payload);
+        assert_eq!(args(line.as_bytes())[2], payload.as_bytes());
     }
 
     #[test]
-    fn parses_escaped_quotes_inside_argument() {
-        let line = br#"1783484211.311904 [0 127.0.0.1:52460] "SET" "key" "hello \"there\"""#;
-
-        let (_, parsed) = Line::from_line_bytes(line, true).unwrap();
-
-        let LineArgs::Parsed(args) = parsed.args else {
-            panic!("expected parsed args");
-        };
-        assert_eq!(args.len(), 2);
-        assert_eq!(args[1].as_ref(), b"hello \"there\"");
-    }
-
-    #[test]
-    fn parses_unescaped_html_attribute_quotes_inside_argument() {
-        let payload = br#"<iframe src="https://example.test/video" width="500" height="281"></iframe>"#;
-        let mut line =
-            b"1783484211.311904 [0 127.0.0.1:52460] \"SET\" \"key\" \""
-                .to_vec();
-        line.extend_from_slice(payload);
-        line.extend_from_slice(b"\" \"NX\" \"EX\" \"604800\"");
-
-        let (_, parsed) = Line::from_line_bytes(&line, true).unwrap();
-
-        let LineArgs::Parsed(args) = parsed.args else {
-            panic!("expected parsed args");
-        };
-        assert_eq!(args.len(), 5);
-        assert_eq!(args[0].as_ref(), b"key");
-        assert_eq!(args[1].as_ref(), payload);
-        assert_eq!(args[2].as_ref(), b"NX");
-    }
-
-    #[test]
-    fn parses_php_serialized_empty_string_quotes_inside_argument() {
-        let payload =
-            br#"a:2:{s:11:"description";s:0:"";s:5:"count";s:1:"1";}"#;
-        let mut line =
-            b"1783484211.311904 [0 127.0.0.1:52460] \"SET\" \"terms:1\" \""
-                .to_vec();
-        line.extend_from_slice(payload);
-        line.extend_from_slice(b"\" \"NX\" \"EX\" \"604800\"");
-
-        let (_, parsed) = Line::from_line_bytes(&line, true).unwrap();
-
-        let LineArgs::Parsed(args) = parsed.args else {
-            panic!("expected parsed args");
-        };
-        assert_eq!(args.len(), 5);
-        assert_eq!(args[0].as_ref(), b"terms:1");
-        assert_eq!(args[1].as_ref(), payload);
-        assert_eq!(args[2].as_ref(), b"NX");
-    }
-
-    #[test]
-    fn parses_php_serialized_object_argument() {
-        let payload = br#"O:8:"stdClass":9:{s:7:"term_id";s:4:"1504";s:4:"name";s:11:"VIP Recipes";s:11:"description";s:0:"";}"#;
-        let mut line =
-            b"1783484180.262905 [0 127.0.0.1:40960] \"SET\" \"terms:1504\" \""
-                .to_vec();
-        line.extend_from_slice(payload);
-        line.extend_from_slice(b"\" \"NX\" \"EX\" \"604800\"");
-
-        let (_, parsed) = Line::from_line_bytes(&line, true).unwrap();
-
-        let LineArgs::Parsed(args) = parsed.args else {
-            panic!("expected parsed args");
-        };
-        assert_eq!(args.len(), 5);
-        assert_eq!(args[0].as_ref(), b"terms:1504");
-        assert_eq!(args[1].as_ref(), payload);
-        assert_eq!(args[2].as_ref(), b"NX");
-    }
-
-    #[test]
-    fn preserves_unknown_backslash_sequences_inside_argument() {
-        let payload = br#"a:2:{s:5:"class";s:15:"Foo\Bar\Baz";s:5:"quote";s:8:"it\'s ok";}"#;
-        let mut line =
-            b"1783484211.311904 [0 127.0.0.1:52460] \"SET\" \"key\" \""
-                .to_vec();
-        line.extend_from_slice(payload);
-        line.extend_from_slice(b"\" \"NX\" \"EX\" \"604800\"");
-
-        let (_, parsed) = Line::from_line_bytes(&line, true).unwrap();
-
-        let LineArgs::Parsed(args) = parsed.args else {
-            panic!("expected parsed args");
-        };
-        assert_eq!(args.len(), 5);
-        assert_eq!(args[0].as_ref(), b"key");
-        assert_eq!(args[1].as_ref(), payload);
-    }
-
-    #[test]
-    fn timestamps_are_parsed_with_correct_rounding() {
-        for text in ["1783484211.311904", "0.1", "1783484211.999999"] {
-            let line = format!(r#"{text} [0 127.0.0.1:1] "PING""#);
-            let (_, parsed) =
-                Line::from_line_bytes(line.as_bytes(), true).unwrap();
+    fn parses_unescaped_html_and_serialized_php_quotes() {
+        for payload in [
+            &br#"<iframe src="https://example.test/video" width="500" height="281"></iframe>"#[..],
+            br#"a:2:{s:11:"description";s:0:"";s:5:"count";s:1:"1";}"#,
+            br#"O:8:"stdClass":9:{s:7:"term_id";s:4:"1504";s:11:"description";s:0:"";}"#,
+        ] {
+            let mut line = br#"1.0 [0 127.0.0.1:1] "SET" "key" ""#.to_vec();
+            line.extend_from_slice(payload);
+            line.extend_from_slice(br#"" "NX" "EX" "604800""#);
             assert_eq!(
-                parsed.timestamp.to_bits(),
-                text.parse::<f64>().unwrap().to_bits()
+                args(&line),
+                [&b"key"[..], payload, b"NX", b"EX", b"604800"]
             );
         }
     }
 
     #[test]
-    fn oversized_timestamp_is_rejected_without_panicking() {
-        let line = br#"99999999999999999999999.1 [0 127.0.0.1:1] "PING""#;
-        let _ = Line::from_line_bytes(line, true);
+    fn unknown_and_invalid_escapes_are_preserved_literally() {
+        let line =
+            br#"1.0 [0 lua] "SET" "\x00\xfF\x7a" "\xZZ" "Foo\Bar it\'s" "\x4""#;
+        assert_eq!(
+            args(line),
+            [&b"\x00\xff\x7a"[..], br"\xZZ", br"Foo\Bar it\'s", br"\x4"]
+        );
     }
 
     #[test]
-    fn module_command_names_are_accepted() {
-        for cmd in ["FT.SEARCH", "json.set", "_FT.DEBUG", "CF.ADD"] {
-            let line = format!(r#"1.0 [0 127.0.0.1:1] "{cmd}" "k""#);
-            let (_, parsed) =
-                Line::from_line_bytes(line.as_bytes(), true).unwrap();
-            assert_eq!(parsed.cmd, cmd);
+    fn malformed_arguments_are_rejected() {
+        for input in [
+            &br#""unterminated"#[..],
+            br#""a" garbage"#,
+            br"bare",
+            br#""trailing backslash\"#,
+        ] {
+            assert!(
+                decode_args(input, &mut Vec::new()).is_err(),
+                "{}",
+                String::from_utf8_lossy(input)
+            );
         }
+        // Trailing whitespace after the last argument is accepted.
+        assert!(decode_args(br#""a" "#, &mut Vec::new()).is_ok());
+        // A quote followed directly by more text cannot close an argument.
+        let mut decoded = Vec::new();
+        decode_args(br#""a""b""#, &mut decoded).unwrap();
+        assert_eq!(decoded, [&br#"a""b"#[..]]);
     }
 
     #[test]
-    fn hex_escapes_decode_to_bytes() {
-        let line = br#"1.0 [0 127.0.0.1:1] "SET" "\x00\xfF\x7a" "\xZZ""#;
-        let (_, parsed) = Line::from_line_bytes(line, true).unwrap();
+    fn prefix_helpers_extract_without_full_validation() {
+        let line = br#"1.0 [12 lua] "GET" "k""#;
+        assert_eq!(command_name(line), Some(&b"GET"[..]));
+        assert_eq!(database(line), Some(12));
+        assert_eq!(command_name(b"no quotes"), None);
+        assert_eq!(database(b"no brackets"), None);
+    }
 
-        let LineArgs::Parsed(args) = parsed.args else {
-            panic!("expected parsed args");
+    /// Every prefix of valid records, and pseudo-random bytes, must parse or
+    /// fail cleanly: never panic, and never report an offset past the input.
+    #[test]
+    fn truncated_and_arbitrary_input_never_panics() {
+        let valid: &[&[u8]] = &[
+            br#"1783484211.311904 [0 127.0.0.1:52460] "SET" "k" "a\"b\x00""#,
+            br#"1.0 [0 [::1]:1] "GET" "k""#,
+            br#"1.0 [0 unix:/tmp/s] "GET" "k""#,
+            br#"1.0 [0 lua] "EVAL" "return 1" "0""#,
+        ];
+        let check = |input: &[u8]| {
+            match Record::parse(input) {
+                Ok(record) => {
+                    let _ = record.decode_args(&mut Vec::new());
+                }
+                Err(error) => assert!(error.offset <= input.len()),
+            }
+            let _ = decode_args(input, &mut Vec::new());
         };
-        assert_eq!(args[0].as_ref(), b"\x00\xff\x7a");
-        // An invalid escape is preserved literally.
-        assert_eq!(args[1].as_ref(), br"\xZZ");
+        for line in valid {
+            for end in 0..=line.len() {
+                check(&line[..end]);
+            }
+        }
+        let alphabet = b" \t.:[]\"\\x0123456789abfuniLlua";
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        for _ in 0..20_000 {
+            let len = usize::try_from(state % 48).unwrap();
+            let input: Vec<u8> = (0..len)
+                .map(|_| {
+                    // xorshift64
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    alphabet[usize::try_from(state % alphabet.len() as u64)
+                        .unwrap()]
+                })
+                .collect();
+            check(&input);
+        }
     }
 }

@@ -11,18 +11,20 @@ current implementation. A source review at `6944473` found:
 
 | Finding | Current status |
 | --- | --- |
-| 1. Structured-output allocations | Partly implemented: JSON streams argument strings, CSV writes fields directly, addresses use serializer display formatting, and PHP borrows argument bytes. The parsed argument vector and escaped-argument allocations remain. |
-| 2. Many-instance CPU ceiling | Still applicable as an architectural concern: one current-thread Tokio runtime handles ingest and one output thread parses, formats, and writes. Producers now send directly to the writer; the central forwarding loop is gone. Batching and byte-budgeted backpressure are implemented. Re-profile before estimating a current scaling limit. |
-| 3. Stdin record cloning | Implemented: stdin and network readers share `BytesMut` framing, transfer chunks with record ranges, and strip `+` by slicing. There is no per-line `buf.clone()` or `remove(0)`. |
-| 4. Statistics overhead | Partly implemented: the output thread checks the interval once per drain. Command rescanning and per-command hash-map updates remain. |
-| 5. Flush policy | Still open: output flushes after each drain (now up to 16 queue messages, each potentially containing many records) and at shutdown. |
+| 1. Structured-output allocations | Implemented: arguments decode into a vector reused for every record in a read, borrowing unescaped arguments; addresses render into stack buffers; JSON, PHP, CSV, and RESP append to one output buffer per read. Only escaped arguments allocate. |
+| 2. Many-instance CPU ceiling | Implemented: sources parse, filter, and format on a multi-threaded runtime and send finished bytes; the output thread only writes. Eight fast sources scale from 3.3 to 30.7 million records/s (see the README). Per-source parallelism (ordered batch workers) was not needed: one source sustains over 6 million records/s, above what a single server's MONITOR produces. |
+| 3. Stdin record cloning | Implemented: stdin and network readers share `BytesMut` framing and strip `+` by slicing. Stdin is read on a dedicated thread a few chunks ahead of formatting. |
+| 4. Statistics overhead | Implemented: each source counts commands locally and merges into the shared totals once per read; the reporting interval is checked once per output drain. Command names are still found by rescanning each written record. |
+| 5. Flush policy | Implemented: output flushes whenever the queue runs empty, and at shutdown. |
 
-The shared 64 MiB budget accounts for queued and producer-held batch data; it is
-not an RSS limit. Input framing buffers and oversized records can exceed it.
+The shared 64 MiB budget accounts for queued and producer-held formatted batch
+data; it is not an RSS limit. Input framing buffers and oversized records can
+exceed it.
 Backpressure counters now count capacity-wait episodes, so they cannot be
 compared directly with the failed-send counts in the original profile.
 
-No new timings were collected for this documentation review. `monitor.log` is a
+This table was last updated after the parallel-formatting change; see the
+README for its measurements. `monitor.log` is a
 local, untracked input, so the original replay cannot be reproduced from a clean
 checkout alone. The current repository enables `target-cpu=native` by default;
 use `RUSTFLAGS='' cargo build --release` for a portable target baseline, and

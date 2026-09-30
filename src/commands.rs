@@ -1,11 +1,9 @@
 use std::{
     borrow::Borrow,
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fmt,
     hash::{Hash, Hasher},
-    ops::BitOr,
     str::FromStr,
-    sync::LazyLock,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -28,8 +26,10 @@ pub struct Metadata {
     pub key_specs: Vec<KeySpec>,
 }
 
+/// Bytes compared and hashed ASCII case-insensitively, so command names can
+/// be looked up directly from MONITOR bytes without allocating.
 #[repr(transparent)]
-struct CiStr(str);
+struct CiBytes([u8]);
 
 #[derive(Debug, Clone)]
 pub struct Lookup(HashSet<Metadata>);
@@ -82,49 +82,43 @@ pub struct Filter {
     pub categories: Option<Categories>,
 }
 
-impl CiStr {
+impl CiBytes {
     #[inline]
-    const fn from_str(s: &str) -> &Self {
-        // SAFETY: CiStr is #[repr(transparent)] over str
-        unsafe { &*(std::ptr::from_ref::<str>(s) as *const Self) }
-    }
-
-    fn ascii_eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
-        #[inline]
-        const fn lower(b: u8) -> u8 {
-            if b.is_ascii_uppercase() { b + 32 } else { b }
-        }
-
-        a.len() == b.len()
-            && a.iter()
-                .zip(b.iter())
-                .all(|(lhs, rhs)| lower(*lhs) == lower(*rhs))
+    const fn new(bytes: &[u8]) -> &Self {
+        // SAFETY: `CiBytes` is `#[repr(transparent)]` over `[u8]`, so the
+        // pointer cast preserves layout, metadata, and lifetime.
+        unsafe { &*(std::ptr::from_ref::<[u8]>(bytes) as *const Self) }
     }
 }
 
-impl PartialEq for CiStr {
+impl PartialEq for CiBytes {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        Self::ascii_eq_ignore_ascii_case(self.0.as_bytes(), other.0.as_bytes())
+        self.0.eq_ignore_ascii_case(&other.0)
     }
 }
 
-impl Eq for CiStr {}
+impl Eq for CiBytes {}
 
-impl Hash for CiStr {
+impl Hash for CiBytes {
+    /// Hash lowercased bytes in chunks rather than one byte per call.
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        for b in self.0.as_bytes() {
-            let lb = if b.is_ascii_uppercase() { b + 32 } else { *b };
-            lb.hash(state);
+        let mut buf = [0u8; 32];
+        for chunk in self.0.chunks(buf.len()) {
+            let lower = &mut buf[..chunk.len()];
+            lower.copy_from_slice(chunk);
+            lower.make_ascii_lowercase();
+            state.write(lower);
         }
+        state.write_usize(self.0.len());
     }
 }
 
-impl Borrow<CiStr> for Metadata {
+impl Borrow<CiBytes> for Metadata {
     #[inline]
-    fn borrow(&self) -> &CiStr {
-        CiStr::from_str(&self.name)
+    fn borrow(&self) -> &CiBytes {
+        CiBytes::new(self.name.as_bytes())
     }
 }
 
@@ -140,7 +134,7 @@ impl Eq for Metadata {}
 impl Hash for Metadata {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        CiStr::from_str(&self.name).hash(state);
+        CiBytes::new(self.name.as_bytes()).hash(state);
     }
 }
 
@@ -157,54 +151,6 @@ impl Hash for Command {
         self.name.hash(state);
     }
 }
-
-trait BitMask: Copy + BitOr<Output = Self> {
-    fn empty() -> Self;
-}
-
-static FLAG_MAP: LazyLock<HashMap<&'static str, Flags>> = LazyLock::new(|| {
-    HashMap::from([
-        ("admin", Flags::ADMIN),
-        ("allow_busy", Flags::ALLOW_BUSY),
-        ("asking", Flags::ASKING),
-        ("blocking", Flags::BLOCKING),
-        ("denyoom", Flags::DENYOOM),
-        ("fast", Flags::FAST),
-        ("loading", Flags::LOADING),
-        ("module", Flags::MODULE),
-        ("movablekeys", Flags::MOVABLEKEYS),
-        ("no_async_loading", Flags::NO_ASYNC_LOADING),
-        ("no_auth", Flags::NO_AUTH),
-        ("no_mandatory_keys", Flags::NO_MANDATORY_KEYS),
-        ("no_multi", Flags::NO_MULTI),
-        ("noscript", Flags::NOSCRIPT),
-        ("pubsub", Flags::PUBSUB),
-        ("readonly", Flags::READONLY),
-        ("ro", Flags::READONLY),
-        ("skip_monitor", Flags::SKIP_MONITOR),
-        ("skip_slowlog", Flags::SKIP_SLOWLOG),
-        ("stale", Flags::STALE),
-        ("write", Flags::WRITE),
-        ("wo", Flags::WRITE),
-    ])
-});
-
-static KEY_SPEC_FLAG_MAP: LazyLock<HashMap<&'static str, KeySpecFlags>> =
-    LazyLock::new(|| {
-        HashMap::from([
-            ("rw", KeySpecFlags::RW),
-            ("ro", KeySpecFlags::RO),
-            ("ow", KeySpecFlags::OW),
-            ("rm", KeySpecFlags::RM),
-            ("access", KeySpecFlags::ACCESS),
-            ("insert", KeySpecFlags::INSERT),
-            ("update", KeySpecFlags::UPDATE),
-            ("delete", KeySpecFlags::DELETE),
-            ("incomplete", KeySpecFlags::INCOMPLETE),
-            ("not_key", KeySpecFlags::NOT_KEY),
-            ("variable_flags", KeySpecFlags::VARIABLE_FLAGS),
-        ])
-    });
 
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -249,83 +195,6 @@ bitflags! {
     }
 }
 
-impl FromStr for Flags {
-    type Err = ();
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let k = s.trim().to_ascii_lowercase();
-        FLAG_MAP.get(k.as_str()).copied().ok_or(())
-    }
-}
-
-impl FromStr for KeySpecFlags {
-    type Err = ();
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let k = s.trim().to_ascii_lowercase();
-        KEY_SPEC_FLAG_MAP.get(k.as_str()).copied().ok_or(())
-    }
-}
-
-impl fmt::Display for Flags {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut first = true;
-        for name in self.names() {
-            if !first {
-                write!(f, ",")?;
-            }
-            write!(f, "{name}")?;
-            first = false;
-        }
-        Ok(())
-    }
-}
-
-impl Flags {
-    pub fn names(self) -> impl Iterator<Item = &'static str> {
-        FLAG_MAP.iter().filter_map(move |(k, v)| {
-            if self.contains(*v) { Some(*k) } else { None }
-        })
-    }
-}
-
-impl BitMask for Flags {
-    fn empty() -> Self {
-        Self::empty()
-    }
-}
-
-impl BitMask for KeySpecFlags {
-    fn empty() -> Self {
-        Self::empty()
-    }
-}
-
-static CATEGORY_MAP: LazyLock<HashMap<&'static str, Categories>> =
-    LazyLock::new(|| {
-        HashMap::from([
-            ("@admin", Categories::ADMIN),
-            ("@bitmap", Categories::BITMAP),
-            ("@blocking", Categories::BLOCKING),
-            ("@connection", Categories::CONNECTION),
-            ("@dangerous", Categories::DANGEROUS),
-            ("@fast", Categories::FAST),
-            ("@geo", Categories::GEO),
-            ("@hash", Categories::HASH),
-            ("@hyperloglog", Categories::HYPERLOGLOG),
-            ("@keyspace", Categories::KEYSPACE),
-            ("@list", Categories::LIST),
-            ("@pubsub", Categories::PUBSUB),
-            ("@read", Categories::READ),
-            ("@scripting", Categories::SCRIPTING),
-            ("@set", Categories::SET),
-            ("@slow", Categories::SLOW),
-            ("@sortedset", Categories::SORTEDSET),
-            ("@stream", Categories::STREAM),
-            ("@string", Categories::STRING),
-            ("@transaction", Categories::TRANSACTION),
-            ("@write", Categories::WRITE),
-        ])
-    });
-
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct Categories: u32 {
@@ -353,39 +222,147 @@ bitflags! {
     }
 }
 
+/// Server spellings, canonical name first; later entries are aliases.
+const FLAG_NAMES: &[(&str, Flags)] = &[
+    ("admin", Flags::ADMIN),
+    ("allow_busy", Flags::ALLOW_BUSY),
+    ("asking", Flags::ASKING),
+    ("blocking", Flags::BLOCKING),
+    ("denyoom", Flags::DENYOOM),
+    ("fast", Flags::FAST),
+    ("loading", Flags::LOADING),
+    ("module", Flags::MODULE),
+    ("movablekeys", Flags::MOVABLEKEYS),
+    ("no_async_loading", Flags::NO_ASYNC_LOADING),
+    ("no_auth", Flags::NO_AUTH),
+    ("no_mandatory_keys", Flags::NO_MANDATORY_KEYS),
+    ("no_multi", Flags::NO_MULTI),
+    ("noscript", Flags::NOSCRIPT),
+    ("pubsub", Flags::PUBSUB),
+    ("readonly", Flags::READONLY),
+    ("skip_monitor", Flags::SKIP_MONITOR),
+    ("skip_slowlog", Flags::SKIP_SLOWLOG),
+    ("stale", Flags::STALE),
+    ("write", Flags::WRITE),
+    ("ro", Flags::READONLY),
+    ("wo", Flags::WRITE),
+];
+
+const KEY_SPEC_FLAG_NAMES: &[(&str, KeySpecFlags)] = &[
+    ("rw", KeySpecFlags::RW),
+    ("ro", KeySpecFlags::RO),
+    ("ow", KeySpecFlags::OW),
+    ("rm", KeySpecFlags::RM),
+    ("access", KeySpecFlags::ACCESS),
+    ("insert", KeySpecFlags::INSERT),
+    ("update", KeySpecFlags::UPDATE),
+    ("delete", KeySpecFlags::DELETE),
+    ("incomplete", KeySpecFlags::INCOMPLETE),
+    ("not_key", KeySpecFlags::NOT_KEY),
+    ("variable_flags", KeySpecFlags::VARIABLE_FLAGS),
+];
+
+const CATEGORY_NAMES: &[(&str, Categories)] = &[
+    ("@admin", Categories::ADMIN),
+    ("@bitmap", Categories::BITMAP),
+    ("@blocking", Categories::BLOCKING),
+    ("@connection", Categories::CONNECTION),
+    ("@dangerous", Categories::DANGEROUS),
+    ("@fast", Categories::FAST),
+    ("@geo", Categories::GEO),
+    ("@hash", Categories::HASH),
+    ("@hyperloglog", Categories::HYPERLOGLOG),
+    ("@keyspace", Categories::KEYSPACE),
+    ("@list", Categories::LIST),
+    ("@pubsub", Categories::PUBSUB),
+    ("@read", Categories::READ),
+    ("@scripting", Categories::SCRIPTING),
+    ("@set", Categories::SET),
+    ("@slow", Categories::SLOW),
+    ("@sortedset", Categories::SORTEDSET),
+    ("@stream", Categories::STREAM),
+    ("@string", Categories::STRING),
+    ("@transaction", Categories::TRANSACTION),
+    ("@write", Categories::WRITE),
+];
+
+/// Case-insensitive name lookup in a name table.
+fn lookup_name<T: Copy>(table: &[(&str, T)], name: &str) -> Option<T> {
+    let name = name.trim();
+    table
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .map(|&(_, value)| value)
+}
+
+/// Canonical names of the bits set in `value`, in table order.
+fn names_of<T: bitflags::Flags + Copy>(
+    table: &'static [(&'static str, T)],
+    value: T,
+) -> impl Iterator<Item = &'static str> {
+    let mut seen = T::empty();
+    table.iter().filter_map(move |&(name, bit)| {
+        let fresh = value.contains(bit) && !seen.contains(bit);
+        seen.insert(bit);
+        fresh.then_some(name)
+    })
+}
+
+fn write_names(
+    f: &mut fmt::Formatter<'_>,
+    names: impl Iterator<Item = &'static str>,
+) -> fmt::Result {
+    for (i, name) in names.enumerate() {
+        if i > 0 {
+            f.write_str(",")?;
+        }
+        f.write_str(name)?;
+    }
+    Ok(())
+}
+
+impl FromStr for Flags {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        lookup_name(FLAG_NAMES, s).ok_or(())
+    }
+}
+
+impl FromStr for KeySpecFlags {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        lookup_name(KEY_SPEC_FLAG_NAMES, s).ok_or(())
+    }
+}
+
 impl FromStr for Categories {
     type Err = ();
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let k = s.trim().to_ascii_lowercase();
-        CATEGORY_MAP.get(k.as_str()).copied().ok_or(())
+        lookup_name(CATEGORY_NAMES, s).ok_or(())
     }
 }
 
-impl BitMask for Categories {
-    fn empty() -> Self {
-        Self::empty()
-    }
-}
-
-impl fmt::Display for Categories {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut first = true;
-        for name in self.names() {
-            if !first {
-                write!(f, ",")?;
-            }
-            write!(f, "{name}")?;
-            first = false;
-        }
-        Ok(())
+impl Flags {
+    pub fn names(self) -> impl Iterator<Item = &'static str> {
+        names_of(FLAG_NAMES, self)
     }
 }
 
 impl Categories {
     pub fn names(self) -> impl Iterator<Item = &'static str> {
-        CATEGORY_MAP.iter().filter_map(move |(k, v)| {
-            if self.contains(*v) { Some(*k) } else { None }
-        })
+        names_of(CATEGORY_NAMES, self)
+    }
+}
+
+impl fmt::Display for Flags {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_names(f, self.names())
+    }
+}
+
+impl fmt::Display for Categories {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_names(f, self.names())
     }
 }
 
@@ -415,14 +392,16 @@ impl Filter {
 }
 
 impl Command {
+    /// Union of the recognized names; unknown names are ignored so newer
+    /// servers remain usable.
     fn parse_mask<'a, I, T>(it: I) -> T
     where
         I: IntoIterator<Item = &'a str>,
-        T: BitMask + FromStr<Err = ()>,
+        T: bitflags::Flags + FromStr<Err = ()>,
     {
         it.into_iter()
             .filter_map(|s| s.parse::<T>().ok())
-            .fold(T::empty(), |a, x| a | x)
+            .fold(T::empty(), T::union)
     }
 
     fn iter_simplestring(arr: &[redis::Value]) -> impl Iterator<Item = &str> {
@@ -748,13 +727,14 @@ impl Lookup {
     #[inline]
     #[must_use]
     pub fn get(&self, cmd: &str) -> Option<&Metadata> {
-        self.0.get(CiStr::from_str(cmd))
+        self.get_bytes(cmd.as_bytes())
     }
 
+    /// Look up a command name, ignoring ASCII case.
     #[inline]
     #[must_use]
     pub fn get_bytes(&self, cmd: &[u8]) -> Option<&Metadata> {
-        std::str::from_utf8(cmd).ok().and_then(|s| self.get(s))
+        self.0.get(CiBytes::new(cmd))
     }
 
     #[inline]
@@ -783,5 +763,50 @@ impl fmt::Debug for Filter {
             .field("flags", &flags)
             .field("categories", &cats)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Categories, Flags, KeySpecFlags, Lookup};
+
+    #[test]
+    fn names_parse_case_insensitively_and_display_canonically() {
+        assert_eq!("RO".parse(), Ok(Flags::READONLY));
+        assert_eq!(" Write ".parse(), Ok(Flags::WRITE));
+        assert_eq!("@Hash".parse(), Ok(Categories::HASH));
+        assert_eq!("not_key".parse(), Ok(KeySpecFlags::NOT_KEY));
+        assert_eq!("wrtie".parse::<Flags>(), Err(()));
+        // Table order, without aliases, regardless of how flags were named.
+        assert_eq!(
+            (Flags::WRITE | Flags::READONLY | Flags::ADMIN).to_string(),
+            "admin,readonly,write"
+        );
+        assert_eq!(
+            (Categories::WRITE | Categories::HASH).to_string(),
+            "@hash,@write"
+        );
+    }
+
+    #[test]
+    fn lookup_ignores_ascii_case_for_bytes() {
+        let lookup: Lookup =
+            super::Command::from_reply(&redis::Value::Array(vec![
+                redis::Value::Array(vec![
+                    redis::Value::BulkString(b"get".to_vec()),
+                    redis::Value::Int(2),
+                    redis::Value::Array(vec![]),
+                    redis::Value::Int(1),
+                    redis::Value::Int(1),
+                    redis::Value::Int(1),
+                ]),
+            ]))
+            .unwrap()
+            .into();
+        for name in [b"get".as_slice(), b"GET", b"gEt"] {
+            assert_eq!(lookup.get_bytes(name).unwrap().name, "get");
+        }
+        assert!(lookup.get_bytes(b"ge").is_none());
+        assert!(lookup.get_bytes(b"get\xff").is_none());
     }
 }

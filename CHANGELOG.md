@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Add `--threads N` to set the number of worker threads that read, filter, and
+  format records (default: available CPUs, at most 16).
+- Expose allocation-free MONITOR record parsing as `redis_monitor::monitor`
+  (`Record::parse` and `Record::decode_args`).
+- Report the number of invalid records in the final summary, and document `%%`
+  (a literal percent sign) in the CLI help.
+
 - Add `[N]pattern` selectors to both filters: `--filter` indexes command
   arguments (command at 0), while `--key-filter` indexes only discovered keys
   (first key at 0). Add `=literal` to match syntax characters literally, with
@@ -26,6 +33,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   a library API used by key-scoped filtering.
 
 ### Changed
+
+- Format records in each source's task on a multi-threaded runtime instead of
+  on the single output thread, which now only writes finished bytes. Throughput
+  with many sources now scales with cores: 8 fast sources went from 3.3 to 30.7
+  million records/s (plain) and from 1.6 to 15.9 million records/s (JSON).
+  Per-source order is preserved; the byte budget and `--batch` limits now apply
+  to formatted output.
+- Replace the two nom-based MONITOR parsers with a single byte-oriented
+  scanner, cutting prefix parsing from 104 to 77 ns per short record, and decode
+  arguments in linear time. JSON and RESP replay of a 45 MB capture are about
+  2x and 3x faster.
+- Flush output whenever the output queue runs empty, rather than after every
+  drain of up to 16 messages.
+- Read stdin on a dedicated thread a few chunks ahead of formatting.
+- Report at most 10 invalid records per second, with a bounded excerpt of each
+  and a count of suppressed messages, and stop warning once per record when a
+  command filter sees a line without a command.
+- Print `--stats` entries sorted by command name, counting only records that
+  were written.
+- Load and validate TLS files and the system trust store once at startup
+  instead of on every connection attempt.
+- Look up commands for `--flags` and `--key-filter` directly from record bytes
+  without UTF-8 validation, and list flag and category names in a fixed order
+  without duplicate aliases in `--debug` output.
+- Write CSV directly with RFC 4180 quoting, and remove the unused `arcstr`,
+  `colored`, `csv`, `nom`, and `url` dependencies. `futures` is now a
+  development-only dependency.
+- Split the pipeline (framing, batching, backpressure, and the output thread)
+  out of `main.rs` into its own module.
 
 - Without `--batch`, hand off every complete record from each read together
   instead of one message per record. No record waits for more input, so latency
@@ -62,6 +98,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Tests/CI
 
+- Add byte-for-byte golden tests of every output kind and several plain formats
+  over an adversarial record corpus, including one-byte-at-a-time input.
+- Add parser tests for every client form, numeric bounds, error offsets,
+  Redis-escaped round trips of all byte values, unescaped quote payloads, and
+  truncated or arbitrary input; add a parser microbenchmark
+  (`cargo bench --bench parse`).
+- Cover framing across many small reads, bytes received with the MONITOR reply,
+  formatting in sources, statistics merging, idle flushing, CSV quoting, TLS
+  certificate/key pairing, and backoff limits.
+
 - Cover positional filters across command arguments, MSET/stream/subcommand keys,
   escaping, binary data, missing positions, combined exclusions, and stdin CLI
   output. Extend the release microbenchmark for selectors.
@@ -79,6 +125,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Documentation
 
+- Document the parallel pipeline, `--threads`, flushing, invalid-record
+  reporting, TLS behavior, format token details, the parsing library API, the
+  golden tests, and new performance measurements.
+
 - Remove README instructions for an untracked local benchmark helper while
   retaining historical measurements and the Rust microbenchmark command.
 - Refresh the README against the current CLI and implementation: document
@@ -95,6 +145,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   improvements.
 
 ### Fixed
+
+- Render `%%` as a single `%` in `--format`; previously it printed `%%`.
+- Stop appending a trailing space to `%l` for commands without arguments.
+- Print `%t` from the timestamp text instead of rounding through a float, which
+  changed timestamps with more than about 16 significant digits.
+- Bracket IPv6 client addresses (`[::1]:6379`) in `%ca`, `%S`, and structured
+  output, so the port separator is unambiguous.
+- Write `%a` argument bytes unchanged, like `%l`, instead of replacing invalid
+  UTF-8.
+- Reject timestamps whose parts exceed 64 bits in structured output, as plain
+  output already did.
+- Decode arguments in linear time; payloads with many quotes or backslashes were
+  rescanned for every literal run.
+- Search each partial record for a newline once rather than on every read; a
+  record spanning many reads was rescanned from its start each time.
+- Use `--tls-ca`, `--tls-cert`, and `--tls-key` for cluster discovery and
+  `COMMAND` metadata connections, which previously used only the system trust
+  store and no client certificate.
+- Reject `--tls-cert` without `--tls-key` (and vice versa) instead of silently
+  connecting without a client certificate, and present a configured client
+  certificate with `--insecure`.
+- Deduplicate cluster nodes by address alone; monitors previously hashed
+  their credentials but compared only addresses, violating `Hash`/`Eq`
+  consistency.
+- Saturate the reconnect attempt counter instead of overflowing it.
 
 - Preserve both regex and literal patterns with identical text when deduplicating
   filters; they have different matching behavior.
