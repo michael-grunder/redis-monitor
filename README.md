@@ -467,23 +467,11 @@ The release filter microbenchmark (SET, MSET, and XREAD records)
 measured about 360 ns/record with key filtering, versus 3 ns with filters disabled.
 The release executable grew from 8,977,040 to 8,998,224 bytes (about 0.24%).
 
-The replay commands below require `scripts/bench_key_filter.py`, which is
-present in this workspace but is not tracked in the repository. A clean checkout
-can run the retained Rust benchmarks, but needs that helper to reproduce these
-end-to-end replays. With the helper available:
+Run the retained filter microbenchmark with:
 
 ```sh
-RUSTFLAGS='' cargo build --release
 RUSTFLAGS='' cargo test --release --bin redis-monitor benchmark_key_filter -- --ignored --nocapture
-python3 scripts/bench_key_filter.py --records 500000
-python3 scripts/bench_key_filter.py --key-filter --records 500000 --accept-per-ten 1
-python3 scripts/bench_key_filter.py --key-filter --records 10000 --payload 4096 --output json --slow-ms 2
-python3 scripts/bench_key_filter.py --key-filter --records 1000 --metadata-failures 1 --samples 1
 ```
-
-The replay starts temporary local TCP servers and does not access Redis data.
-Use `--escaped-payload` to exercise decoding allocations, `--producers` to change
-source count, and `--binary` to compare another build.
 
 ### Positional-filter measurements
 
@@ -509,16 +497,7 @@ filters remained around 3–4 ns/record. The release executable grew from
 8,998,224 to 9,025,104 bytes (0.30%); an incremental release rebuild took about
 15 seconds.
 
-The replay also verifies second-key selection in MSET and XREAD, positional
+The replay also verified second-key selection in MSET and XREAD, positional
 argument filtering without metadata, and escaped 4 KiB values through JSON
-output with a slow reader. All replay checks require exact output and
-processed/filtered counts. Reproduce these cases with:
-
-```sh
-python3 scripts/bench_key_filter.py --key-filter --positioned --records 500000
-python3 scripts/bench_key_filter.py --key-filter --positioned --accept-per-ten 1 --records 500000 --samples 3
-python3 scripts/bench_key_filter.py --key-filter --positioned --command mset
-python3 scripts/bench_key_filter.py --key-filter --positioned --command xread
-python3 scripts/bench_key_filter.py --positioned --command xread
-python3 scripts/bench_key_filter.py --key-filter --positioned --records 10000 --payload 4096 --escaped-payload --output json --slow-ms 2
-```
+output with a slow reader. All replay checks required exact output and
+processed/filtered counts.

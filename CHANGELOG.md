@@ -64,12 +64,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - Cover positional filters across command arguments, MSET/stream/subcommand keys,
   escaping, binary data, missing positions, combined exclusions, and stdin CLI
-  output. Extend the release microbenchmark and concurrent replay for selectors.
+  output. Extend the release microbenchmark for selectors.
 
 - Cover key-filter combinations, decoded/binary keys, unsupported commands,
-  keyless commands, rejection counts, and stdin validation. Add a concurrent
-  MONITOR replay benchmark for plain/JSON output, slow consumers, and metadata
-  failure recovery, plus a release filter microbenchmark.
+  keyless commands, rejection counts, and stdin validation. Add a release filter
+  microbenchmark.
 
 - Add command metadata fixtures, adversarial key-spec tests, an optional live
   `COMMAND GETKEYS` comparison in RESP2/RESP3, and a release extraction benchmark.
@@ -80,10 +79,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Documentation
 
+- Remove README instructions for an untracked local benchmark helper while
+  retaining historical measurements and the Rust microbenchmark command.
 - Refresh the README against the current CLI and implementation: document
   config discovery and named instances, TLS, stdin, output schemas, metadata
   failure behavior, statistics, batching limits, and build CPU settings.
-  Clarify inactive formatting/color settings and the local-only replay helper;
+  Clarify inactive formatting/color settings;
   label historical measurements and update the performance report's status.
 - Correct the instance-name format token to `%sn` in the README and CLI help,
   and make the CLI's GEO regex example match uppercase command names.
