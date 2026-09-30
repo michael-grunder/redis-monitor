@@ -245,6 +245,10 @@ impl<'a> Scanner<'a> {
                 Ok((Client::Tcp { ip, port }, false))
             }
             Some(b']') => Ok((Client::Unknown, false)),
+            Some(b'-') => {
+                self.rest = &self.rest[1..];
+                Ok((Client::Unknown, true))
+            }
             _ => Err(self.err("client address")),
         }
     }
@@ -336,6 +340,20 @@ impl<'a> Record<'a> {
     pub fn timestamp(&self) -> f64 {
         // Parsing validated `<digits>.<digits>`, which always parses.
         lexical_core::parse(self.timestamp).unwrap_or(f64::NAN)
+    }
+
+    /// Exact timestamp components: whole seconds and decimal fractional digits.
+    /// The fractional slice preserves leading and trailing zeros from the input.
+    ///
+    /// # Panics
+    /// Only if the internally validated timestamp no longer parses as a `u64`;
+    /// records constructed through [`Self::parse`] establish this invariant.
+    #[must_use]
+    pub fn timestamp_parts(&self) -> (u64, &'a [u8]) {
+        // Record::parse already validated these digits as a u64.
+        let seconds = lexical_core::parse(&self.timestamp[..self.dot])
+            .expect("validated timestamp seconds");
+        (seconds, &self.timestamp[self.dot + 1..])
     }
 
     /// Decode arguments into `args`, replacing its contents. Unescaped
@@ -692,6 +710,7 @@ mod tests {
             ("unix:/tmp/redis.sock", "/tmp/redis.sock"),
             ("lua", "lua"),
             ("", "-"),
+            ("-", "-"),
         ] {
             let line = format!(r#"1.0 [0 {client}] "PING""#);
             let record = Record::parse(line.as_bytes()).unwrap();
@@ -719,6 +738,22 @@ mod tests {
         assert!(!ok(r#"1.0 [0 1.2.3:4] "X""#));
         assert!(!ok(r#"1. [0 lua] "X""#));
         assert!(!ok(r#".1 [0 lua] "X""#));
+    }
+
+    #[test]
+    fn timestamp_components_preserve_decimal_precision() {
+        for (text, seconds, digits) in [
+            ("0001.00000000000000000000100", 1, "00000000000000000000100"),
+            (
+                "18446744073709551615.18446744073709551615",
+                u64::MAX,
+                "18446744073709551615",
+            ),
+        ] {
+            let line = format!("{text} [0 lua] \"PING\"");
+            let record = Record::parse(line.as_bytes()).unwrap();
+            assert_eq!(record.timestamp_parts(), (seconds, digits.as_bytes()));
+        }
     }
 
     #[test]

@@ -8,6 +8,9 @@ use redis_monitor::{
 };
 use regex::bytes::Regex;
 
+mod prefix;
+pub use prefix::{ClientSelector, PrefixFilter, TimeCron, TimeRange};
+
 #[derive(Debug, Clone)]
 pub struct FilterPattern {
     exclude: bool,
@@ -344,11 +347,12 @@ impl fmt::Debug for Matchers {
 }
 
 /// Every per-record filter: database, command names and positional
-/// arguments, command flags/categories, and keys.
+/// arguments, command flags/categories, keys, clients, and recorded time.
 #[derive(Clone)]
 pub struct LineFilter {
     empty: bool,
     db: Option<u64>,
+    prefix: PrefixFilter,
     names: Filter,
     keys: Filter,
     flags: commands::Filter,
@@ -359,6 +363,7 @@ impl fmt::Debug for LineFilter {
         f.debug_struct("LineFilter")
             .field("empty", &self.empty)
             .field("db", &self.db)
+            .field("prefix", &self.prefix)
             .field("names", &self.names)
             .field("keys", &self.keys)
             .field("flags", &self.flags)
@@ -367,7 +372,7 @@ impl fmt::Debug for LineFilter {
 }
 
 impl LineFilter {
-    pub const fn new(
+    pub fn new(
         db: Option<u64>,
         names: Filter,
         keys: Filter,
@@ -380,10 +385,17 @@ impl LineFilter {
         Self {
             empty,
             db,
+            prefix: PrefixFilter::default(),
             names,
             keys,
             flags,
         }
+    }
+
+    pub fn with_prefix(mut self, prefix: PrefixFilter) -> Self {
+        self.empty &= prefix.is_empty();
+        self.prefix = prefix;
+        self
     }
 
     /// Whether `COMMAND` metadata is needed to apply the filter.
@@ -417,6 +429,20 @@ impl LineFilter {
             return false;
         }
 
+        // Prefix selectors reject before command metadata lookup or argument
+        // decoding. Reuse this parse if positional/key filters also need it.
+        let record = if self.prefix.is_empty() {
+            None
+        } else {
+            let Ok(record) = monitor::Record::parse(line) else {
+                return false;
+            };
+            if !self.prefix.matches(&record) {
+                return false;
+            }
+            Some(record)
+        };
+
         if self.names.is_empty()
             && self.flags.is_empty()
             && self.keys.is_empty()
@@ -447,8 +473,12 @@ impl LineFilter {
         if !self.keys.is_empty() && commands.is_none() {
             return false;
         }
-        let Ok(record) = monitor::Record::parse(line) else {
-            return false;
+        let record = match record {
+            Some(record) => record,
+            None => match monitor::Record::parse(line) {
+                Ok(record) => record,
+                Err(_) => return false,
+            },
         };
         let Ok(args) = args.decode(&record) else {
             return false;

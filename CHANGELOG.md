@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Add repeatable `--client` and `--client-host` selectors for exact connections,
+  IP hosts, Lua, Unix sockets, and unknown clients. Add `--time-range` with exact
+  inclusive-start/exclusive-end decimal Unix or RFC 3339 bounds, and five-field
+  `--time-cron` windows with `--time-zone` (UTC by default). All work on recorded
+  timestamps with stdin or live streams, reject before decoding arguments, and
+  combine with existing filters. Repeated values of one option use OR.
+- Expose exact borrowed timestamp components through `Record::timestamp_parts`
+  and accept a literal `-` as an unknown MONITOR client.
+
 - Add `--source` for every output format: a JSON/PHP source object, CSV source
   columns, a RESP capture envelope, or a plain prefix. Server strings are borrowed
   from connection setup; unknown identities are null/empty/`-` by format.

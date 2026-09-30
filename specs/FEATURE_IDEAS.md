@@ -136,6 +136,16 @@ writer. Retain a release stress workload measuring peak memory and throughput.
 
 ## 5. Client and time-window filters
 
+**Implemented on 2026-09-30.** `--client` and `--client-host` select exact
+connections and IP hosts, including explicit special-client selectors.
+`--time-range` supports half-open Unix timestamp and RFC 3339 intervals;
+`--time-cron` selects recurring whole-minute windows using five-field cron
+syntax, with `--time-zone` defaulting to UTC. All operate on recorded timestamps
+and work with stdin or live input. See the
+[usage and semantics](../README.md#filtering-by-client-and-recorded-time) and
+[release measurements](CLIENT_TIME_MEASUREMENTS.md). The proposal below is
+retained for context.
+
 **Current gap.** Filters select database, command/argument patterns, flags, and
 keys. The parser already exposes the client and timestamp, but the CLI cannot
 select a particular client or an incident's timestamp range directly.

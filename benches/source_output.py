@@ -21,14 +21,22 @@ async def run(args):
     tasks = set()
     failures = []
     value = b"x" * args.payload + b'\\"quoted\\"'
+    def prefix(rare):
+        if args.selector in ("client", "host"):
+            return b"1.5 [0 127.0.0.2:49153]" if rare else b"1.5 [0 127.0.0.1:49152]"
+        if args.selector in ("range", "cron"):
+            return b"1.5 [0 127.0.0.1:49152]" if rare else b"600.5 [0 127.0.0.1:49152]"
+        return b"1.5 [0 127.0.0.1:49152]"
+
     block = b"".join(
-        b'+1.5 [0 127.0.0.1:49152] "%s" "key" "%s"\r\n'
-        % (b"GET" if i % 16 == 0 else b"SET", value)
+        b'+%s "%s" "key" "%s"\r\n'
+        % (prefix(i % 16 == 0), b"GET" if i % 16 == 0 else b"SET", value)
         for i in range(1024)
     )
-    marker = b'+1.5 [0 lua] "PING"\r\n'
+    marker = b'+%s "PING"\r\n' % prefix(args.reject)
     input_records = args.sources * (args.blocks * 1024 + 1)
-    expected = args.sources * (args.blocks * (64 if args.reject else 1024) + 1)
+    accepted = 64 if args.reject else (960 if args.selector else 1024)
+    expected = args.sources * (args.blocks * accepted + 1)
 
     async def handle(reader, writer):
         nonlocal connected, started
@@ -72,7 +80,15 @@ async def run(args):
         command += ["--source"]
     if args.format is not None:
         command += ["--format", args.format]
-    if args.reject:
+    if args.selector == "client":
+        command += ["--client", "127.0.0.2:49153" if args.reject else "127.0.0.1:49152"]
+    elif args.selector == "host":
+        command += ["--client-host", "127.0.0.2" if args.reject else "127.0.0.1"]
+    elif args.selector == "range":
+        command += ["--time-range", "-300" if args.reject else "300-"]
+    elif args.selector == "cron":
+        command += ["--time-cron", "0-4 * * * *" if args.reject else "5-59 * * * *"]
+    elif args.reject:
         command += ["--filter", "!SET"]
     process = await asyncio.create_subprocess_exec(
         *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -102,7 +118,7 @@ async def run(args):
         input_bytes = args.sources * (len(block) * args.blocks + len(marker))
         print(json.dumps(dict(
             binary=args.binary, output=args.output, source=args.source, format=args.format, payload=args.payload,
-            sources=args.sources, blocks=args.blocks, reject=args.reject,
+            sources=args.sources, blocks=args.blocks, reject=args.reject, selector=args.selector,
             slow_ms=args.slow_ms, seconds=elapsed,
             input_records_per_second=input_records / elapsed,
             input_bytes_per_second=input_bytes / elapsed,
@@ -133,6 +149,7 @@ if __name__ == "__main__":
     parser.add_argument("--source", action="store_true")
     parser.add_argument("--format")
     parser.add_argument("--reject", action="store_true")
+    parser.add_argument("--selector", choices=["client", "host", "range", "cron"])
     parser.add_argument("--slow-ms", type=float, default=0)
     options = parser.parse_args()
     if options.sources < 1 or options.blocks < 1 or options.payload < 0 or options.slow_ms < 0:

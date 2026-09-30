@@ -4,6 +4,7 @@
 // earlier drop is impossible or would change behavior.
 #![allow(clippy::significant_drop_tightening)]
 use std::{
+    net::IpAddr,
     path::PathBuf,
     str::FromStr,
     sync::{Arc, Mutex},
@@ -19,7 +20,10 @@ use tokio::{sync::watch, task::JoinSet};
 use crate::{
     config::{ConnectionArgs, Map, ServerAuth},
     connection::{Cluster, Monitor, ServerAddr, TlsConfig},
-    filter::{Filter, FilterPattern, LineFilter},
+    filter::{
+        ClientSelector, Filter, FilterPattern, LineFilter, PrefixFilter,
+        TimeCron, TimeRange,
+    },
     output::{Formatter, OutputKind},
     pipeline::{BatchConfig, IoMessage, OUTPUT_BYTE_BUDGET, Pipeline},
     topology::ClusterGroup,
@@ -118,6 +122,44 @@ struct Options {
 
     #[arg(long, help = "Only show commands for a specific database")]
     db: Option<u64>,
+
+    #[arg(
+        long,
+        value_name = "CLIENT",
+        help = "Select exact client: IP:port, [IPv6]:port, unix:PATH, lua, or - (repeat for OR)"
+    )]
+    client: Vec<ClientSelector>,
+
+    #[arg(
+        long,
+        value_name = "IP",
+        help = "Select a client IP on any port (repeat for OR; no DNS)"
+    )]
+    client_host: Vec<IpAddr>,
+
+    #[arg(
+        long,
+        value_name = "RANGE",
+        allow_hyphen_values = true,
+        help = "Recorded time [start,end): LOW-HIGH, LOW-, -HIGH in Unix seconds, or RFC3339/RFC3339 (repeat for OR)"
+    )]
+    time_range: Vec<TimeRange>,
+
+    #[arg(
+        long,
+        value_name = "CRON",
+        help = "Select whole minutes using five cron fields: minute hour day month weekday (repeat for OR)"
+    )]
+    time_cron: Vec<TimeCron>,
+
+    #[arg(
+        long,
+        value_name = "ZONE",
+        default_value = "UTC",
+        requires = "time_cron",
+        help = "IANA timezone for --time-cron, e.g. America/Los_Angeles"
+    )]
+    time_zone: chrono_tz::Tz,
 
     #[command(flatten)]
     connection: ConnectionArgs,
@@ -251,7 +293,14 @@ impl Options {
         let names = Filter::for_command(self.filter.clone())?;
         let flags = Self::parse_flags(self.flags.iter().map(String::as_str))?;
         let keys = Filter::try_from(self.key_filter.clone())?;
-        Ok(LineFilter::new(self.db, names, keys, flags))
+        let prefix = PrefixFilter::new(
+            self.client.clone(),
+            self.client_host.clone(),
+            self.time_range.clone(),
+            self.time_cron.clone(),
+            self.time_zone,
+        );
+        Ok(LineFilter::new(self.db, names, keys, flags).with_prefix(prefix))
     }
 
     /// Per-command statistics apply to plain output only.
@@ -635,6 +684,117 @@ mod tests {
             Filter::new(Vec::new()).unwrap(),
             commands::Filter::default(),
         )
+    }
+
+    #[test]
+    fn prefix_filters_combine_with_metadata_and_reject_before_decoding() {
+        let lookup = key_fixture::lookup();
+        let filter = Options::try_parse_from([
+            "redis-monitor",
+            "--client",
+            "lua",
+            "--time-range",
+            "1-2",
+            "--time-cron",
+            "0 * * * *",
+            "--flags",
+            "write",
+            "--key-filter",
+            "/^user:/",
+        ])
+        .unwrap()
+        .line_filter()
+        .unwrap();
+        for (line, expected) in [
+            (br#"1.5 [0 lua] "SET" "user:1" "v""#.as_slice(), true),
+            (br#"1.5 [0 lua] "GET" "user:1""#, false),
+            (br#"1.5 [0 lua] "SET" "other" "v""#, false),
+            (br#"2.0 [0 lua] "SET" "user:1" "v""#, false),
+            (br#"1.5 [0 127.0.0.1:1] "SET" "user:1" "v""#, false),
+        ] {
+            assert_eq!(
+                filter.matches(Some(&lookup), line, &mut Args::default()),
+                expected
+            );
+        }
+        let filter = Options::try_parse_from([
+            "redis-monitor",
+            "--client",
+            "lua",
+            "--time-range",
+            "1-2",
+        ])
+        .unwrap()
+        .line_filter()
+        .unwrap();
+        // Prefix filtering leaves argument validation to the formatter.
+        assert!(filter.matches(
+            None,
+            br#"1.5 [0 lua] "SET" "truncated"#,
+            &mut Args::default()
+        ));
+    }
+
+    #[test]
+    #[ignore = "manual release client/time filter microbenchmark"]
+    fn benchmark_prefix_filter() {
+        use std::hint::black_box;
+        let cases: [(&str, &[&str]); 9] = [
+            ("disabled", &[]),
+            ("client accept", &["--client-host", "127.0.0.1"]),
+            ("client reject", &["--client-host", "127.0.0.2"]),
+            ("range accept", &["--time-range", "0-"]),
+            ("range reject", &["--time-range", "-1"]),
+            ("cron accept", &["--time-cron", "* * * * *"]),
+            ("cron reject", &["--time-cron", "5 * * * *"]),
+            (
+                "cron zoned",
+                &[
+                    "--time-cron",
+                    "* * * * *",
+                    "--time-zone",
+                    "America/Los_Angeles",
+                ],
+            ),
+            ("command", &["--filter", "GET"]),
+        ];
+        let large = format!(
+            r#"3601.5 [0 127.0.0.1:1] "SET" "k" "{}""#,
+            r#"escaped\"value"#.repeat(256)
+        );
+        let lines: [&[u8]; 3] = [
+            br#"1.5 [0 127.0.0.1:1] "GET" "k""#,
+            br#"61.5 [0 127.0.0.1:2] "MGET" "k" "k2""#,
+            large.as_bytes(),
+        ];
+        for (name, options) in cases {
+            let filter = Options::try_parse_from(
+                std::iter::once("redis-monitor").chain(options.iter().copied()),
+            )
+            .unwrap()
+            .line_filter()
+            .unwrap();
+            let mut args = Args::default();
+            let mut samples = Vec::new();
+            for _ in 0..7 {
+                let start = Instant::now();
+                for _ in 0..100_000 {
+                    for line in lines {
+                        black_box(filter.matches(
+                            None,
+                            black_box(line),
+                            &mut args,
+                        ));
+                    }
+                }
+                samples.push(start.elapsed().as_secs_f64() * 1e9 / 300_000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "{name}: median {:.2} ns/record, {samples:.2?}",
+                samples[3]
+            );
+        }
     }
 
     #[test]

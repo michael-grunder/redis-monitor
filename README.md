@@ -189,8 +189,8 @@ RESP simple-string `+` prefix. A final stdin record without a newline is also
 processed. Standalone `OK` replies are ignored. A truncated network record is
 discarded when its connection closes.
 
-`--stdin` bypasses server connections and config loading. Command/argument
-filters and `--db` work here; `--flags` and `--key-filter` are rejected because
+`--stdin` bypasses server connections and config loading. Command/argument,
+client, and recorded-time filters and `--db` work here; `--flags` and `--key-filter` are rejected because
 they require live `COMMAND` metadata.
 
 ### Output and formatting
@@ -364,6 +364,80 @@ entries, and invalid TLS files also report contextual errors.
 Ctrl-C requests shutdown and drains pending output; a second Ctrl-C exits
 immediately. If stdout closes (for example `redis-monitor | head`), all sources
 stop and the process exits successfully. Other output failures exit nonzero.
+
+## Filtering by client and recorded time
+
+These filters work with both live servers and `--stdin`, using the client and
+timestamp in each MONITOR record. They do not require command metadata.
+
+```bash
+# One connection, or every connection from an IP (no DNS lookup)
+redis-monitor --client 192.0.2.10:49152
+redis-monitor --client-host 192.0.2.10
+redis-monitor --client '[2001:db8::10]:49152'
+redis-monitor --client-host 2001:db8::10
+
+# Special clients: exact, case-sensitive Unix path; Lua; unknown client
+redis-monitor --stdin --client unix:/tmp/redis.sock < monitor.log
+redis-monitor --stdin --client lua --client - < monitor.log
+
+# Unix seconds: inclusive lower bound, exclusive upper bound
+redis-monitor --stdin --time-range '1790812800-1790813100' < monitor.log
+redis-monitor --stdin --time-range '1790812800.123456-' < monitor.log
+redis-monitor --stdin --time-range '-1790813100' < monitor.log
+
+# RFC 3339 dates use '/' to separate bounds; either bound may be empty
+redis-monitor --stdin \
+  --time-range '2026-09-30T10:00:00-07:00/2026-09-30T10:05:00-07:00' < monitor.log
+
+# The first five minutes of EVERY hour, including fractional seconds
+redis-monitor --time-cron '0-4 * * * *'
+
+# Weekdays from 09:00 through 09:04:59..., in the cron job's timezone
+redis-monitor --time-cron '0-4 9 * * MON-FRI' --time-zone America/Los_Angeles
+```
+
+`--client` compares parsed IP/port pairs, so equivalent IPv6 spellings match.
+`--client-host` matches only TCP clients, on any port. `--client -` matches an
+empty client field or a literal `-`; `lua` and `unix:PATH` select those special
+forms. These selectors do not search command arguments or server addresses.
+
+`--time-range` compares exact nonnegative decimal Unix timestamps without
+floating-point rounding, including fractional digits finer than nanoseconds.
+Dated bounds must have an explicit `Z` or numeric UTC offset; dates before the
+Unix epoch and leap-second bounds are rejected. Empty, equal, reversed, and
+overflowing ranges are errors. Use `/END` or `START/` for open dated bounds.
+
+`--time-cron` uses five cron fields: **minute hour day-of-month month
+day-of-week**. The [Croner parser](https://github.com/Hexagon/croner-rust)
+supports wildcards, lists, ranges, steps, and month/weekday names. For example,
+`*/15 * * * *` selects the entire minutes 0, 15, 30, and 45 each hour. When both
+day-of-month and day-of-week are restricted, either may match (cron's usual OR
+rule). Five fields are required; there is no command, seconds field, or
+`@hourly` shorthand. Calendar years beyond 5000 cannot match a cron window.
+
+Cron windows default to **UTC**, independently of the machine's local timezone.
+Use `--time-zone IANA/Name` with `--time-cron` to choose another timezone. The
+bundled timezone database determines daylight-saving transitions: both
+occurrences of a repeated local minute match, while a skipped minute has no
+matching instant. Range bounds always use their own explicit offsets and are
+unaffected by `--time-zone`.
+
+Repeat an option to OR its selectors. Different options combine with AND,
+including `--client`, `--client-host`, `--time-range`, `--time-cron`, `--db`,
+`--filter`, `--flags`, and `--key-filter`. A range plus cron window can therefore
+select the first five minutes of each hour during a particular incident.
+Nonmatching records and malformed prefixes rejected by these selectors count
+as filtered, consistent with existing early filters. Accepted records still
+undergo normal output validation.
+
+Filters never stop capture at the upper bound: later records can have earlier
+timestamps, especially across servers. They do not schedule connections, wait
+until a wall-clock time, or impose a capture duration; live monitoring remains
+connected and consumes the stream outside matching windows.
+
+See [client/time filter measurements](specs/CLIENT_TIME_MEASUREMENTS.md) for
+portable release throughput and dependency costs.
 
 ## Filtering by keys
 
