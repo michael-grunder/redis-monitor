@@ -8,10 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- Add opt-in `--output json-source` with borrowed server address and instance
-  name in a `source` object, keeping `addr` as the client address. Unnamed
-  servers use a null name; stdin uses null for both source fields. Existing
-  output schemas are unchanged.
+- Add `--source` for every output format: a JSON/PHP source object, CSV source
+  columns, a RESP capture envelope, or a plain prefix. Server strings are borrowed
+  from connection setup; unknown identities are null/empty/`-` by format.
+- Support native structured field selection with `--format`, e.g. `%t %C %a`,
+  including typed JSON/PHP fields, CSV headers, and RESP arrays. Compile selections
+  once; omitted formats use dedicated serializers without interpolation.
 - Refresh cluster membership every 30 seconds, configurable with
   `--cluster-refresh SECONDS`, for CLI and named clusters. Preserve unchanged
   connections, reconcile node/role/address changes, and retain the last topology
@@ -43,10 +45,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- Replace `--output json-source` with `--output json --source`. Default plain
+  output now omits server identity regardless of connection count; use `--source`
+  or an explicit server-token template to include it. Explicit structured
+  `--format` values are now honored and validated instead of ignored.
+
 - Use cancellable asynchronous cluster discovery with a 10-second timeout per
   candidate, trying known members before original seeds during refresh. Apply
-  `--replicas` to named clusters too, and use the multi-source plain format for
-  clusters even when initially monitoring one node.
+  `--replicas` to named clusters too.
 - Format records in each source's task on a multi-threaded runtime instead of
   on the single output thread, which now only writes finished bytes. Throughput
   with many sources now scales with cores: 8 fast sources went from 3.3 to 30.7
@@ -111,9 +117,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Tests/CI
 
-- Cover source-aware JSON with golden output, address/name escaping, unknown
-  stdin identity, and multi-source merging under backpressure. Retain a release
-  formatter measurement and a finite multi-server output replay benchmark.
+- Cover source metadata and selected fields in all formats, binary values,
+  malformed formats/records, default-serializer equivalence, and multi-source
+  merging under backpressure. Retain release formatter and multi-server replay
+  measurements.
 
 - Cover cluster refresh failures, promotion, address changes, repeated remaps,
   seed fallback/deduplication, named cluster settings, malformed topology, and

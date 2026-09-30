@@ -5,14 +5,10 @@ use std::{
 
 fn run(filters: &[&str], format: &str, input: &[u8]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_redis-monitor"));
-    command.args([
-        "--stdin",
-        "--no-color",
-        "--output",
-        format,
-        "--format",
-        "%l",
-    ]);
+    command.args(["--stdin", "--no-color", "--output", format]);
+    if format == "plain" {
+        command.args(["--format", "%l"]);
+    }
     for pattern in filters {
         command.args(["--filter", pattern]);
     }

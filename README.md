@@ -168,7 +168,7 @@ still no global timestamp ordering or exactly-once guarantee across topology
 changes. Discovery follows nodes reported by `CLUSTER SLOTS`; primaries without
 assigned slots are not included.
 
-Use CLI `--format` to control plain output. Per-entry `format` and `color`
+Use CLI `--format` to control plain output or select structured fields. Per-entry `format` and `color`
 settings are currently accepted but do not affect output; `--no-color` also has
 no effect because the current writers emit no color.
 
@@ -200,8 +200,7 @@ stderr. Invalid records are skipped and reported with a bounded excerpt; at most
 | --- | --- |
 | `plain` (default) | MONITOR-style text, customizable with `--format`/`-f` |
 | `json` | One JSON object per line with `timestamp`, `db`, `addr`, `cmd`, and an `args` array |
-| `json-source` | The JSON fields above plus `source: {"address": ..., "name": ...}` identifying the monitored server |
-| `php` | One PHP-serialized record per line with the legacy `json` fields |
+| `php` | One PHP-serialized record per line with the same default fields as JSON |
 | `csv` | Header `timestamp,db,addr,cmd,args`, then four metadata columns and one column per argument; row widths vary |
 | `resp` | A RESP array of bulk strings containing the command and arguments, without timestamp, database, or address metadata |
 
@@ -209,12 +208,13 @@ Structured outputs decode MONITOR argument escapes and preserve quoted content,
 including JSON-like values, serialized PHP values, and literal backslash
 sequences. JSON replaces invalid UTF-8 argument bytes with the Unicode replacement
 character; PHP, CSV, and RESP preserve decoded argument bytes.
-`--format` applies only to plain output.
+Omitting `--format` uses a dedicated serializer for the selected output kind;
+no default interpolation or field-selection plan runs per record.
 
-Use `--output json-source` to retain server identity when combining streams:
+Use `--source` to retain server identity when combining streams:
 
 ```sh
-redis-monitor --output json-source production staging
+redis-monitor --output json --source production staging
 ```
 
 ```json
@@ -230,34 +230,72 @@ MONITOR line does not identify the original server. An empty configured name
 remains an empty string. Records retain per-source order; merged streams have
 no global timestamp ordering guarantee.
 
-The explicit `json-source` format opts into these additional fields. Existing
-`json`, PHP, CSV, and RESP output retain their original schema and omit server
-identity; RESP remains a command array. See the reproducible
-[source-output measurements](specs/SOURCE_OUTPUT_MEASUREMENTS.md) for the
-throughput and output-size cost.
+`--source` works with every output kind, including custom `--format` selections:
 
-| Format token | Value |
+| Output | Source representation |
 | --- | --- |
-| `%S` | Short form of server and client address |
-| `%sa` | Full server address (`host:port` or Unix path) |
-| `%sh` | Server host |
-| `%sp` | Server port, or basename of its Unix path |
-| `%sn` | Configured instance name, or cluster node ID in CLI cluster mode, when set; otherwise `-` |
-| `%ca` | Full client address (`ip:port`, `[ipv6]:port`, Unix path, `lua`, or `-`) |
-| `%ch` | Client host |
-| `%cp` | Client port, or basename of its Unix path |
-| `%d` | Database number |
-| `%t` | MONITOR timestamp, without leading zeros or trailing fractional zeros |
-| `%l` | Full quoted command and arguments, as MONITOR escaped them |
-| `%C` | Command name (argument 0) |
-| `%a` | Arguments 1..N, as MONITOR escaped them |
-| `%%` | A literal `%` |
+| Plain | Prefix `[address name] `; unknown values are `-` |
+| JSON / PHP | Additional `source` object/associative array with `address` and `name`; unknown values are null |
+| CSV | Leading `source_address,source_name` columns; unknown values are empty fields |
+| RESP | Envelope `[[address, name], record]`; unknown values are null bulk strings |
 
-The default is `%t [%d %ca] %l` for one source or stdin, and `%t [%S %d] %l`
-for multiple resolved server connections. Unknown specifiers are printed
-literally. Module commands such as `FT.SEARCH` and `JSON.SET` are supported.
-Plain output copies argument bytes from the input without validating them; only
-structured output decodes (and therefore validates) arguments.
+Without `--source` or `--format`, RESP remains its original command array.
+With `--source`, its `record` is that command array, or the selected-field array
+when `--format` is also set. These opt-in envelopes and selected-field arrays
+are capture records, not commands for replay with `redis-cli --pipe`.
+CSV cannot distinguish an unknown name from an explicitly empty name.
+The former `json-source` output name is replaced by `--output json --source`.
+See [release measurements](specs/OUTPUT_FORMAT_MEASUREMENTS.md).
+
+For plain output, `--format` is a text template. For JSON, PHP, CSV, and RESP,
+it is an ordered selection of native fields, separated by spaces or commas:
+
+```sh
+redis-monitor --output json --source --format '%t %C %a' production
+redis-monitor --output csv --format '%sa,%d,%C,%a' production staging
+redis-monitor --format '%t [%sn %sa %d] %l' production
+```
+
+JSON/PHP use the field names below. Timestamps and databases are numeric;
+arguments are arrays. Other values are strings (or null for unknown server
+fields). Field order follows `--format`, with `source` appended when requested.
+CSV uses those names as its header and expands `%a` to zero or more argument
+columns, just as its default schema does. Putting `%a` last makes variable row
+widths easier to interpret. RESP emits selected values in an array, using bulk
+strings for scalar values and a nested array for `%a`.
+
+| Format token | Structured field | Value |
+| --- | --- | --- |
+| `%S` | `addresses` | Short text form of server and client address |
+| `%sa` | `server_address` | Full server address (`host:port` or Unix path) |
+| `%sh` | `server_host` | Server host |
+| `%sp` | `server_port` | Server port, or basename of its Unix path (a string) |
+| `%sn` | `server_name` | Configured instance name, or cluster node ID in CLI cluster mode |
+| `%ca` | `addr` | Full client address (`ip:port`, `[ipv6]:port`, Unix path, `lua`, or `-`) |
+| `%ch` | `client_host` | Client host |
+| `%cp` | `client_port` | Client port, or basename of its Unix path (a string) |
+| `%d` | `db` | Database number |
+| `%t` | `timestamp` | MONITOR timestamp; plain text removes leading/trailing zeros, JSON/PHP/CSV use the existing floating-point representation |
+| `%l` | `line` | Full quoted command and arguments, as MONITOR escaped them |
+| `%C` | `cmd` | Command name (argument 0) |
+| `%a` | `args` | Raw escaped arguments in plain output; decoded argument array/columns in structured output |
+| `%%` | Not supported | A literal `%` in plain output |
+
+Structured selections must contain at least one field. Duplicate fields,
+unknown/incomplete tokens, and literal template text are startup errors.
+Selecting server fields directly does not require `--source`. With stdin,
+`server_address`, `server_host`, `server_port`, and `server_name` are null
+(empty CSV fields or null RESP bulk strings); `%S` retains its plain text form.
+Plain server tokens retain their existing `stdin` label and `-` placeholders.
+
+Default plain output is `%t [%d %ca] %l` for any number of connections.
+Use `--source` to add identity, or an explicit template such as `%t [%S %d] %l`
+to retain the old multi-server layout. Explicit plain templates keep unknown
+specifiers literally; `--source` prefixes them too, even if they already include
+server tokens. Module commands such as `FT.SEARCH` and `JSON.SET` are supported.
+Plain output copies argument bytes without validating them. Structured output
+always decodes and validates arguments, even when `%a` is not selected. JSON
+replaces invalid UTF-8 in selected text fields; PHP, CSV, and RESP preserve bytes.
 
 ### Database, flags, and statistics
 

@@ -14,6 +14,9 @@ use std::{
 use anyhow::{Error, Result, anyhow};
 use lexical_core::FormattedSize;
 use serde::{Serialize, Serializer};
+
+mod fields;
+use fields::Fields;
 use serde_bytes::Bytes as SerBytes;
 use serde_php as php;
 
@@ -118,7 +121,6 @@ impl Source {
 pub enum OutputKind {
     Plain,
     Json,
-    JsonSource,
     Csv,
     Resp,
     Php,
@@ -132,111 +134,238 @@ impl FromStr for OutputKind {
             "plain" => Ok(Self::Plain),
             "resp" => Ok(Self::Resp),
             "json" => Ok(Self::Json),
-            "json-source" => Ok(Self::JsonSource),
             "csv" => Ok(Self::Csv),
             "php" => Ok(Self::Php),
             _ => Err(anyhow!(
                 "Invalid output format '{s}'. Supported: \
-                 plain, resp, json, json-source, csv, php"
+                 plain, resp, json, csv, php"
             )),
         }
     }
 }
 
-/// Formats records for one output kind.
+/// Scratch storage lives for one input-buffer scan, so large field values are
+/// reused within a scan but never retained indefinitely. Defaults allocate none.
+#[derive(Default)]
+pub struct Scratch<'a> {
+    pub args: Vec<Cow<'a, [u8]>>,
+    value: Vec<u8>,
+}
+
+/// Default serializers never construct or walk an interpolation plan.
 #[derive(Debug)]
 pub enum Formatter {
-    Plain(PlainFormat),
-    Json,
-    JsonSource,
-    Csv,
-    Resp,
-    Php,
-    /// Copies each line unchanged, so pipeline tests can use any bytes.
+    PlainDefault {
+        source: bool,
+    },
+    Plain {
+        format: PlainFormat,
+        source: bool,
+    },
+    Json {
+        source: bool,
+    },
+    Csv {
+        source: bool,
+    },
+    Resp {
+        source: bool,
+    },
+    Php {
+        source: bool,
+    },
+    Selected(Fields),
     #[cfg(test)]
     Raw,
 }
 
 impl Formatter {
-    /// `format` applies to plain output only.
-    pub fn new(kind: OutputKind, format: &str) -> Self {
-        match kind {
-            OutputKind::Plain => Self::Plain(PlainFormat::new(format)),
-            OutputKind::Json => Self::Json,
-            OutputKind::JsonSource => Self::JsonSource,
-            OutputKind::Csv => Self::Csv,
-            OutputKind::Resp => Self::Resp,
-            OutputKind::Php => Self::Php,
+    pub fn new(
+        kind: OutputKind,
+        format: Option<&str>,
+        source: bool,
+    ) -> Result<Self> {
+        if let Some(format) = format {
+            return Ok(if kind == OutputKind::Plain {
+                Self::Plain {
+                    format: PlainFormat::new(format),
+                    source,
+                }
+            } else {
+                Self::Selected(Fields::new(kind, format, source)?)
+            });
         }
+        Ok(match kind {
+            OutputKind::Plain => Self::PlainDefault { source },
+            OutputKind::Json => Self::Json { source },
+            OutputKind::Csv => Self::Csv { source },
+            OutputKind::Resp => Self::Resp { source },
+            OutputKind::Php => Self::Php { source },
+        })
     }
 
-    /// Bytes written once before the first record.
-    pub const fn header(&self) -> Option<&'static [u8]> {
+    pub fn header(&self) -> Option<&[u8]> {
         match self {
-            Self::Csv => Some(b"timestamp,db,addr,cmd,args\n"),
+            Self::Csv { source: false } => {
+                Some(b"timestamp,db,addr,cmd,args\n")
+            }
+            Self::Csv { source: true } => {
+                Some(b"source_address,source_name,timestamp,db,addr,cmd,args\n")
+            }
+            Self::Selected(fields) if fields.kind == OutputKind::Csv => {
+                Some(&fields.header)
+            }
             _ => None,
         }
     }
 
-    /// Append one formatted record to `out`. Invalid records fail before
-    /// anything is appended. `args` is scratch space that callers reuse across
-    /// records borrowing the same buffer.
-    ///
-    /// # Errors
-    /// Returns an error, and leaves `out` unchanged, for invalid records.
+    /// Append a complete record, leaving `out` unchanged on invalid input.
     pub fn format<'a>(
         &self,
         out: &mut Vec<u8>,
         source: &Source,
         line: &'a [u8],
-        args: &mut Vec<Cow<'a, [u8]>>,
+        scratch: &mut Scratch<'a>,
     ) -> Result<(), FormatError> {
         let start = out.len();
         let result = match self {
-            Self::Plain(plain) => {
+            Self::PlainDefault { source: include } => {
                 let record = Record::parse(line)
                     .map_err(|e| FormatError::new(line, e))?;
-                plain.write(out, source, &record)
+                if *include {
+                    write_plain_source(out, source)
+                } else {
+                    Ok(())
+                }
+                .and_then(|()| write_default_plain(out, &record))
             }
-            Self::Json | Self::JsonSource => {
-                let record = parse_structured(line, args)?;
-                let mut structured = Structured::new(&record, TextArgs(args));
-                if matches!(self, Self::JsonSource) {
+            Self::Plain {
+                format,
+                source: include,
+            } => {
+                let record = Record::parse(line)
+                    .map_err(|e| FormatError::new(line, e))?;
+                if *include {
+                    write_plain_source(out, source)
+                } else {
+                    Ok(())
+                }
+                .and_then(|()| format.write(out, source, &record))
+            }
+            Self::Json { source: include } => {
+                let record = parse_structured(line, &mut scratch.args)?;
+                let mut structured =
+                    Structured::new(&record, TextArgs(&scratch.args));
+                if *include {
                     structured.source = Some(source.structured());
                 }
                 serde_json::to_writer(&mut *out, &structured)
                     .map_err(io::Error::from)
             }
-            Self::Php => {
-                let record = parse_structured(line, args)?;
-                php::to_writer(
-                    &mut *out,
-                    &Structured::new(&record, ByteArgs(args)),
-                )
-                .map_err(io::Error::other)
+            Self::Php { source: include } => {
+                let record = parse_structured(line, &mut scratch.args)?;
+                let mut structured =
+                    Structured::new(&record, ByteArgs(&scratch.args));
+                if *include {
+                    structured.source = Some(source.structured());
+                }
+                php::to_writer(&mut *out, &structured).map_err(io::Error::other)
             }
-            Self::Csv => {
-                let record = parse_structured(line, args)?;
-                write_csv(out, &record, args)
+            Self::Csv { source: include } => {
+                let record = parse_structured(line, &mut scratch.args)?;
+                if *include {
+                    write_csv_source(out, source);
+                }
+                write_csv(out, &record, &scratch.args)
             }
-            Self::Resp => {
-                let record = parse_structured(line, args)?;
-                write_resp(out, &record, args)
+            Self::Resp { source: include } => {
+                let record = parse_structured(line, &mut scratch.args)?;
+                if *include {
+                    write_resp_source(out, source)
+                } else {
+                    Ok(())
+                }
+                .and_then(|()| write_resp(out, &record, &scratch.args))
+            }
+            Self::Selected(fields) => {
+                let record = parse_structured(line, &mut scratch.args)?;
+                fields.write(out, source, &record, scratch)
             }
             #[cfg(test)]
             Self::Raw => out.write_all(line),
         };
-        // Serializing into a `Vec` cannot fail in practice, but never leave a
-        // partial record behind if it does.
         if let Err(error) = result {
             out.truncate(start);
             return Err(FormatError::new(line, error));
         }
-        // RESP arrays are self-delimiting; other formats are line-based.
-        if !matches!(self, Self::Resp) {
+        let resp = matches!(self, Self::Resp { .. })
+            || matches!(self, Self::Selected(fields) if fields.kind == OutputKind::Resp);
+        if !resp {
             out.push(b'\n');
         }
         Ok(())
+    }
+}
+
+fn write_plain_source(out: &mut Vec<u8>, source: &Source) -> io::Result<()> {
+    let source = source.structured();
+    write!(
+        out,
+        "[{} {}] ",
+        source.address.unwrap_or("-"),
+        source.name.unwrap_or("-")
+    )
+}
+
+fn write_default_plain(
+    out: &mut Vec<u8>,
+    record: &Record<'_>,
+) -> io::Result<()> {
+    record.write_timestamp(out)?;
+    out.push(b' ');
+    if let Some(tail) = record.default_tail {
+        return out.write_all(tail);
+    }
+    out.push(b'[');
+    write_uint(out, record.db)?;
+    out.push(b' ');
+    record.client.write_addr(out)?;
+    out.extend_from_slice(b"] ");
+    write_full_line(out, record)
+}
+
+fn write_full_line(out: &mut Vec<u8>, record: &Record<'_>) -> io::Result<()> {
+    out.push(b'"');
+    out.extend_from_slice(record.cmd);
+    out.push(b'"');
+    if !record.args.is_empty() {
+        out.push(b' ');
+        out.write_all(record.args)?;
+    }
+    Ok(())
+}
+
+fn write_csv_source(out: &mut Vec<u8>, source: &Source) {
+    let source = source.structured();
+    csv_field(out, source.address.unwrap_or("").as_bytes());
+    out.push(b',');
+    csv_field(out, source.name.unwrap_or("").as_bytes());
+    out.push(b',');
+}
+
+/// Opt-in RESP envelope: [[address, name], command-or-selected-fields].
+fn write_resp_source(out: &mut Vec<u8>, source: &Source) -> io::Result<()> {
+    out.extend_from_slice(b"*2\r\n*2\r\n");
+    let source = source.structured();
+    resp_optional(out, source.address)?;
+    resp_optional(out, source.name)
+}
+
+fn resp_optional(out: &mut Vec<u8>, value: Option<&str>) -> io::Result<()> {
+    if let Some(value) = value {
+        resp_bulk(out, value.as_bytes())
+    } else {
+        out.write_all(b"$-1\r\n")
     }
 }
 
@@ -331,49 +460,53 @@ impl PlainFormat {
         }
 
         for token in &self.tokens {
-            match token {
-                FormatToken::Literal(bytes) => w.write_all(bytes)?,
-                FormatToken::ClientServerShort => match record.client {
-                    Client::Tcp { ip, port } if source.ip == Some(ip) => {
-                        w.write_all(source.port.as_bytes())?;
-                        w.write_all(b" ")?;
-                        write_uint(w, port)?;
-                    }
-                    client => {
-                        w.write_all(source.addr.as_bytes())?;
-                        w.write_all(b" ")?;
-                        client.write_addr(w)?;
-                    }
-                },
-                FormatToken::ServerAddress => {
-                    w.write_all(source.addr.as_bytes())?;
-                }
-                FormatToken::ServerName => w.write_all(
-                    source.name.as_deref().unwrap_or("-").as_bytes(),
-                )?,
-                FormatToken::ServerHost => {
-                    w.write_all(source.host.as_bytes())?;
-                }
-                FormatToken::ServerPort => {
+            token.write(w, source, record)?;
+        }
+        Ok(())
+    }
+}
+
+impl FormatToken {
+    fn write(
+        &self,
+        w: &mut Vec<u8>,
+        source: &Source,
+        record: &Record<'_>,
+    ) -> io::Result<()> {
+        match self {
+            Self::Literal(bytes) => w.write_all(bytes)?,
+            Self::ClientServerShort => match record.client {
+                Client::Tcp { ip, port } if source.ip == Some(ip) => {
                     w.write_all(source.port.as_bytes())?;
+                    w.write_all(b" ")?;
+                    write_uint(w, port)?;
                 }
-                FormatToken::ClientAddress => record.client.write_addr(w)?,
-                FormatToken::ClientHost => record.client.write_host(w)?,
-                FormatToken::ClientPort => record.client.write_port(w)?,
-                FormatToken::Timestamp => record.write_timestamp(w)?,
-                FormatToken::Database => write_uint(w, record.db)?,
-                FormatToken::Command => w.write_all(record.cmd)?,
-                FormatToken::Arguments => w.write_all(record.args)?,
-                FormatToken::FullLine => {
-                    w.write_all(b"\"")?;
-                    w.write_all(record.cmd)?;
-                    w.write_all(b"\"")?;
-                    if !record.args.is_empty() {
-                        w.write_all(b" ")?;
-                        w.write_all(record.args)?;
-                    }
+                client => {
+                    w.write_all(source.addr.as_bytes())?;
+                    w.write_all(b" ")?;
+                    client.write_addr(w)?;
                 }
+            },
+            Self::ServerAddress => {
+                w.write_all(source.addr.as_bytes())?;
             }
+            Self::ServerName => {
+                w.write_all(source.name.as_deref().unwrap_or("-").as_bytes())?;
+            }
+            Self::ServerHost => {
+                w.write_all(source.host.as_bytes())?;
+            }
+            Self::ServerPort => {
+                w.write_all(source.port.as_bytes())?;
+            }
+            Self::ClientAddress => record.client.write_addr(w)?,
+            Self::ClientHost => record.client.write_host(w)?,
+            Self::ClientPort => record.client.write_port(w)?,
+            Self::Timestamp => record.write_timestamp(w)?,
+            Self::Database => write_uint(w, record.db)?,
+            Self::Command => w.write_all(record.cmd)?,
+            Self::Arguments => w.write_all(record.args)?,
+            Self::FullLine => write_full_line(w, record)?,
         }
         Ok(())
     }
@@ -514,25 +647,25 @@ impl Serialize for ByteArgs<'_> {
     }
 }
 
+fn resp_bulk(out: &mut Vec<u8>, bytes: &[u8]) -> io::Result<()> {
+    out.write_all(b"$")?;
+    write_uint(out, bytes.len() as u64)?;
+    out.write_all(b"\r\n")?;
+    out.write_all(bytes)?;
+    out.write_all(b"\r\n")
+}
+
 /// A RESP array of bulk strings: the command, then its arguments.
 fn write_resp(
     out: &mut Vec<u8>,
     record: &Record<'_>,
     args: &[Cow<'_, [u8]>],
 ) -> io::Result<()> {
-    fn bulk(out: &mut Vec<u8>, bytes: &[u8]) -> io::Result<()> {
-        out.write_all(b"$")?;
-        write_uint(out, bytes.len() as u64)?;
-        out.write_all(b"\r\n")?;
-        out.write_all(bytes)?;
-        out.write_all(b"\r\n")
-    }
-
     out.write_all(b"*")?;
     write_uint(out, 1 + args.len() as u64)?;
     out.write_all(b"\r\n")?;
-    bulk(out, record.cmd)?;
-    args.iter().try_for_each(|arg| bulk(out, arg))
+    resp_bulk(out, record.cmd)?;
+    args.iter().try_for_each(|arg| resp_bulk(out, arg))
 }
 
 /// `timestamp,db,addr,cmd` followed by one column per argument.
@@ -580,10 +713,10 @@ fn csv_field(out: &mut Vec<u8>, field: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
 
     use super::{
-        FormatToken, Formatter, OutputKind, Source, compile_format, csv_field,
+        FormatToken, Formatter, OutputKind, Scratch, Source, compile_format,
+        csv_field,
     };
     use crate::connection::ServerAddr;
 
@@ -606,10 +739,16 @@ mod tests {
             ("short", &br#"1.5 [0 127.0.0.1:49152] "GET" "key""#[..]),
             ("large", large.as_bytes()),
         ] {
-            for kind in [OutputKind::Json, OutputKind::JsonSource] {
-                let formatter = Formatter::new(kind, "");
+            for (include, format) in [
+                (false, None),
+                (true, None),
+                (false, Some("%t %d %ca %C %a")),
+                (false, Some("%C %a")),
+            ] {
+                let kind = OutputKind::Json;
+                let formatter = Formatter::new(kind, format, include).unwrap();
                 let mut out = Vec::new();
-                let mut args = Vec::new();
+                let mut args = Scratch::default();
                 let mut samples = Vec::new();
                 for _ in 0..7 {
                     let start = Instant::now();
@@ -630,7 +769,7 @@ mod tests {
                 }
                 samples.sort_by(f64::total_cmp);
                 println!(
-                    "{label} {kind:?}: {:.2} ns/record; {} bytes/record; samples {samples:.2?}",
+                    "{label} {kind:?} source={include} format={format:?}: {:.2} ns/record; {} bytes/record; samples {samples:.2?}",
                     samples[3],
                     out.len()
                 );
@@ -645,11 +784,17 @@ mod tests {
         input: &[u8],
     ) -> Result<Vec<u8>, super::FormatError> {
         let mut output = Vec::new();
-        Formatter::new(kind, format).format(
+        Formatter::new(
+            kind,
+            (kind == OutputKind::Plain).then_some(format),
+            false,
+        )
+        .unwrap()
+        .format(
             &mut output,
             &Source::new(server, None),
             input,
-            &mut Vec::new(),
+            &mut Scratch::default(),
         )?;
         Ok(output)
     }
@@ -710,12 +855,13 @@ mod tests {
         let server = ServerAddr::from_tcp_addr("127.0.0.1", 6379);
         let input = br#"1.0 [0 127.0.0.1:49152] "PING""#;
         let mut output = Vec::new();
-        Formatter::new(OutputKind::Plain, "%sa|%sh|%sp|%sn")
+        Formatter::new(OutputKind::Plain, Some("%sa|%sh|%sp|%sn"), false)
+            .unwrap()
             .format(
                 &mut output,
                 &Source::new(&server, Some("primary".into())),
                 input,
-                &mut Vec::new(),
+                &mut Scratch::default(),
             )
             .unwrap();
         assert_eq!(output, b"127.0.0.1:6379|127.0.0.1|6379|primary\n");
@@ -761,8 +907,9 @@ mod tests {
         let input = br#"1.5 [2 127.0.0.1:49152] "SET" "key" "\xff\"\n""#;
         for (source, expected) in cases {
             let mut out = Vec::new();
-            let mut args = Vec::new();
-            Formatter::new(OutputKind::JsonSource, "")
+            let mut args = Scratch::default();
+            Formatter::new(OutputKind::Json, None, true)
+                .unwrap()
                 .format(&mut out, &source, input, &mut args)
                 .unwrap();
             assert_eq!(memchr::memchr_iter(b'\n', &out).count(), 1);
@@ -774,13 +921,90 @@ mod tests {
             );
             assert_eq!(value["addr"], "127.0.0.1:49152");
             out.clear();
-            Formatter::new(OutputKind::Json, "")
+            Formatter::new(OutputKind::Json, None, false)
+                .unwrap()
                 .format(&mut out, &source, input, &mut args)
                 .unwrap();
             assert_eq!(
                 value,
                 serde_json::from_slice::<serde_json::Value>(&out).unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn selected_fields_render_addresses_and_raw_command_text() {
+        let source = Source::new(
+            &ServerAddr::from_tcp_addr("::1", 6379),
+            Some("primary".into()),
+        );
+        let formatter = Formatter::new(
+            OutputKind::Json,
+            Some("%sa %sn %sh %sp %ca %ch %cp %S %l"),
+            false,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        // Noncanonical whitespace exercises the full-command fallback.
+        formatter
+            .format(
+                &mut out,
+                &source,
+                b"1.5 [2 [::1]:49152] \"GET\"  \"a\"",
+                &mut Scratch::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&out).unwrap(),
+            serde_json::json!({
+                "server_address": "[::1]:6379", "server_name": "primary", "server_host": "::1", "server_port": "6379",
+                "addr": "[::1]:49152", "client_host": "::1", "client_port": "49152", "addresses": "6379 49152", "line": "\"GET\" \"a\""
+            })
+        );
+        out.clear();
+        formatter
+            .format(
+                &mut out,
+                &Source::from_reader("stdin"),
+                b"1.5 [0 lua] \"PING\"",
+                &mut Scratch::default(),
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        for key in [
+            "server_address",
+            "server_name",
+            "server_host",
+            "server_port",
+        ] {
+            assert!(value[key].is_null(), "{key}");
+        }
+    }
+
+    #[test]
+    fn source_metadata_is_escaped_in_php_csv_and_resp() {
+        let source = Source::new(
+            &ServerAddr::from_path("/tmp/a,b"),
+            Some("a\"b".into()),
+        );
+        let input = br#"1.0 [0 lua] "PING""#;
+        for format in [None, Some("%C")] {
+            for kind in [OutputKind::Csv, OutputKind::Php, OutputKind::Resp] {
+                let mut out = Vec::new();
+                Formatter::new(kind, format, true)
+                    .unwrap()
+                    .format(&mut out, &source, input, &mut Scratch::default())
+                    .unwrap();
+                match kind {
+                    OutputKind::Csv => assert!(out.starts_with(b"\"/tmp/a,b\",\"a\"\"b\",")),
+                    OutputKind::Php => assert!(out.ends_with(b"s:6:\"source\";a:2:{s:7:\"address\";s:8:\"/tmp/a,b\";s:4:\"name\";s:3:\"a\"b\";}}\n")),
+                    OutputKind::Resp => {
+                        let redis::Value::Array(envelope) = redis::parse_redis_value(&out).unwrap() else { panic!("not an envelope"); };
+                        assert_eq!(envelope[0], redis::Value::Array(vec![redis::Value::BulkString(b"/tmp/a,b".to_vec()), redis::Value::BulkString(b"a\"b".to_vec())]));
+                    }
+                    _ => unreachable!(),
+                }
+            }
         }
     }
 
@@ -848,24 +1072,28 @@ mod tests {
         for kind in [
             OutputKind::Plain,
             OutputKind::Json,
-            OutputKind::JsonSource,
             OutputKind::Csv,
             OutputKind::Resp,
             OutputKind::Php,
         ] {
-            for input in malformed {
-                let mut output = b"previous".to_vec();
-                assert!(
-                    Formatter::new(kind, "%l")
-                        .format(
-                            &mut output,
-                            &Source::new(&server, None),
-                            input,
-                            &mut Vec::new(),
-                        )
-                        .is_err()
-                );
-                assert_eq!(output, b"previous", "{kind:?}");
+            for (format, include) in
+                [(None, false), (None, true), (Some("%C %a"), true)]
+            {
+                for input in malformed {
+                    let mut output = b"previous".to_vec();
+                    assert!(
+                        Formatter::new(kind, format, include)
+                            .unwrap()
+                            .format(
+                                &mut output,
+                                &Source::new(&server, None),
+                                input,
+                                &mut Scratch::default(),
+                            )
+                            .is_err()
+                    );
+                    assert_eq!(output, b"previous", "{kind:?}");
+                }
             }
         }
     }
@@ -909,9 +1137,9 @@ mod tests {
             br#"1.0 [0 127.0.0.1:1] "SET" "a" "b" "c""#,
             br#"1.0 [0 127.0.0.1:1] "GET" "k""#,
         ];
-        let formatter = Formatter::new(OutputKind::Resp, "");
+        let formatter = Formatter::new(OutputKind::Resp, None, false).unwrap();
         let mut output = Vec::new();
-        let mut args: Vec<Cow<'_, [u8]>> = Vec::new();
+        let mut args = Scratch::default();
         for input in inputs {
             formatter
                 .format(&mut output, &source, input, &mut args)

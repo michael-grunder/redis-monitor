@@ -33,7 +33,7 @@ use tokio::{
 use crate::{
     connection::{self, Monitor},
     filter::LineFilter,
-    output::{FormatError, Formatter, Source},
+    output::{FormatError, Formatter, Scratch, Source},
     stats::CommandStats,
 };
 
@@ -533,7 +533,7 @@ impl Producer {
         // Reused across records borrowing this read buffer. Dropped after the
         // scan so neither decoded values nor pathological argument counts are
         // retained.
-        let mut args = Vec::new();
+        let mut scratch = Scratch::default();
         let mut next_nl = Some(first_nl);
 
         while records < max_records {
@@ -551,12 +551,20 @@ impl Producer {
             line = line.strip_prefix(b"+").unwrap_or(line);
 
             self.stats.tick();
-            if !self.filter.matches(self.commands.as_ref(), line, &mut args) {
+            if !self.filter.matches(
+                self.commands.as_ref(),
+                line,
+                &mut scratch.args,
+            ) {
                 self.stats.filtered();
             } else if line != b"OK" {
                 // A standalone OK is the reply to MONITOR itself.
-                match self.formatter.format(out, &self.source, line, &mut args)
-                {
+                match self.formatter.format(
+                    out,
+                    &self.source,
+                    line,
+                    &mut scratch,
+                ) {
                     Ok(()) => {
                         accepted += 1;
                         if let Some(stats) = &mut self.command_stats {
@@ -1003,7 +1011,7 @@ fn is_broken_pipe(error: &anyhow::Error) -> bool {
 /// # Errors
 /// Returns an error if the thread cannot be spawned.
 pub fn start_output(
-    header: Option<&'static [u8]>,
+    header: Option<Vec<u8>>,
     capacity: usize,
     byte_budget: usize,
     stats: Option<(Duration, SharedStats)>,
@@ -1022,7 +1030,7 @@ pub fn start_output(
             let stdout = std::io::stdout();
             let mut out =
                 std::io::BufWriter::with_capacity(1 << 20, stdout.lock());
-            let result = write_output(&rx, &mut out, header, stats);
+            let result = write_output(&rx, &mut out, header.as_deref(), stats);
 
             // If output stopped early, make sure no source keeps waiting on
             // it: dropping the receiver releases queued byte-budget permits
@@ -1328,7 +1336,9 @@ pub mod tests {
     fn malformed_record_does_not_discard_the_rest_of_its_read() {
         let (io, _rx) = test_io(4, 1024);
         let mut producer = producer(io, BatchConfig::new(false));
-        producer.formatter = Arc::new(Formatter::new(OutputKind::Plain, "%l"));
+        producer.formatter = Arc::new(
+            Formatter::new(OutputKind::Plain, Some("%l"), false).unwrap(),
+        );
         let input = b"PONG\n1.000000 [0 127.0.0.1:1] \"PING\"\n";
         let mut out = Vec::new();
 
@@ -1342,7 +1352,8 @@ pub mod tests {
     async fn sources_format_records_before_sending() {
         let (io, rx) = test_io(4, 1024);
         let mut pipeline = pipeline(io, BatchConfig::new(false));
-        pipeline.formatter = Arc::new(Formatter::new(OutputKind::Json, ""));
+        pipeline.formatter =
+            Arc::new(Formatter::new(OutputKind::Json, None, false).unwrap());
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         run_from_reader(
@@ -1361,64 +1372,78 @@ pub mod tests {
 
     #[tokio::test]
     async fn json_source_identity_survives_merging_and_backpressure() {
-        let (io, rx) = test_io(1, 128);
-        let mut pipeline = pipeline(io, BatchConfig::new(false));
-        pipeline.formatter =
-            Arc::new(Formatter::new(OutputKind::JsonSource, ""));
-        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        let mut second_shutdown = shutdown_rx.clone();
-        let mut first = Producer::new(
-            Source::new(
-                &ServerAddr::from_tcp_addr("127.0.0.1", 6379),
-                Some("primary".into()),
-            ),
-            pipeline.clone(),
-        );
-        let mut second = Producer::new(
-            Source::new(&ServerAddr::from_tcp_addr("::1", 6380), None),
-            pipeline,
-        );
-        let input = &b"1.5 [2 lua] \"GET\" \"first\"\ninvalid\n1.5 [2 lua] \"GET\" \"last\""[..];
-        let drain = async move {
-            let mut records = Vec::new();
-            while let Ok(message) = rx.recv_async().await {
-                if let IoMessage::Batch(batch) = message {
-                    for line in batch.data.split_inclusive(|&b| b == b'\n') {
-                        records.push(
-                            serde_json::from_slice::<serde_json::Value>(line)
+        for format in [None, Some("%ca %C %a")] {
+            let (io, rx) = test_io(1, 128);
+            let mut pipeline = pipeline(io, BatchConfig::new(false));
+            pipeline.formatter = Arc::new(
+                Formatter::new(OutputKind::Json, format, true).unwrap(),
+            );
+            let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+            let mut second_shutdown = shutdown_rx.clone();
+            let mut first = Producer::new(
+                Source::new(
+                    &ServerAddr::from_tcp_addr("127.0.0.1", 6379),
+                    Some("primary".into()),
+                ),
+                pipeline.clone(),
+            );
+            let mut second = Producer::new(
+                Source::new(&ServerAddr::from_tcp_addr("::1", 6380), None),
+                pipeline,
+            );
+            let input = &b"1.5 [2 lua] \"GET\" \"first\"\ninvalid\n1.5 [2 lua] \"GET\" \"last\""[..];
+            let drain = async move {
+                let mut records = Vec::new();
+                while let Ok(message) = rx.recv_async().await {
+                    if let IoMessage::Batch(batch) = message {
+                        for line in batch.data.split_inclusive(|&b| b == b'\n')
+                        {
+                            records.push(
+                                serde_json::from_slice::<serde_json::Value>(
+                                    line,
+                                )
                                 .unwrap(),
-                        );
+                            );
+                        }
                     }
                 }
-            }
-            records
-        };
-        let ((), (), records) = tokio::join!(
-            async move {
-                first
-                    .consume(BytesMut::new(), input, &mut shutdown_rx, true)
-                    .await;
-            },
-            async move {
-                second
-                    .consume(BytesMut::new(), input, &mut second_shutdown, true)
-                    .await;
-            },
-            drain,
-        );
-        assert_eq!(records.len(), 4);
-        for (address, name) in
-            [("127.0.0.1:6379", Some("primary")), ("[::1]:6380", None)]
-        {
-            let from_source: Vec<_> = records
-                .iter()
-                .filter(|record| record["source"]["address"] == address)
-                .collect();
-            assert_eq!(from_source.len(), 2);
-            for (record, arg) in from_source.iter().zip(["first", "last"]) {
-                assert_eq!(record["source"]["name"], serde_json::json!(name));
-                assert_eq!(record["addr"], "lua");
-                assert_eq!(record["args"], serde_json::json!([arg]));
+                records
+            };
+            let ((), (), records) = tokio::join!(
+                async move {
+                    first
+                        .consume(BytesMut::new(), input, &mut shutdown_rx, true)
+                        .await;
+                },
+                async move {
+                    second
+                        .consume(
+                            BytesMut::new(),
+                            input,
+                            &mut second_shutdown,
+                            true,
+                        )
+                        .await;
+                },
+                drain,
+            );
+            assert_eq!(records.len(), 4);
+            for (address, name) in
+                [("127.0.0.1:6379", Some("primary")), ("[::1]:6380", None)]
+            {
+                let from_source: Vec<_> = records
+                    .iter()
+                    .filter(|record| record["source"]["address"] == address)
+                    .collect();
+                assert_eq!(from_source.len(), 2);
+                for (record, arg) in from_source.iter().zip(["first", "last"]) {
+                    assert_eq!(
+                        record["source"]["name"],
+                        serde_json::json!(name)
+                    );
+                    assert_eq!(record["addr"], "lua");
+                    assert_eq!(record["args"], serde_json::json!([arg]));
+                }
             }
         }
     }
@@ -1433,8 +1458,9 @@ pub mod tests {
             b"1.0 [0 lua] \"GET\" \"key\"\nnot a record\n",
         ] {
             let mut pipeline = pipeline(io.clone(), BatchConfig::new(false));
-            pipeline.formatter =
-                Arc::new(Formatter::new(OutputKind::Plain, "%l"));
+            pipeline.formatter = Arc::new(
+                Formatter::new(OutputKind::Plain, Some("%l"), false).unwrap(),
+            );
             pipeline.stats = Some(Arc::clone(&shared));
             run_from_reader("stdin", input, pipeline, shutdown_rx.clone())
                 .await;

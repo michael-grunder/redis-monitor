@@ -1,0 +1,29 @@
+{"args":["key","value"],"cmd":"SET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["key"],"cmd":"GET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":[],"cmd":"PING","timestamp":1783484211.3,"source":{"address":null,"name":null}}
+{"args":[],"cmd":"PING","timestamp":1783484211.0,"source":{"address":null,"name":null}}
+{"args":["a","b"],"cmd":"SET","timestamp":1783484211.3119,"source":{"address":null,"name":null}}
+{"args":["k"],"cmd":"DEL","timestamp":12345678901.123455,"source":{"address":null,"name":null}}
+{"args":["k"],"cmd":"DEL","timestamp":0.1,"source":{"address":null,"name":null}}
+{"args":["idx","*"],"cmd":"FT.SEARCH","timestamp":1.5,"source":{"address":null,"name":null}}
+{"args":["v6"],"cmd":"GET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["v6short"],"cmd":"GET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["bracketed-v4"],"cmd":"GET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["unix"],"cmd":"GET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["unix-empty"],"cmd":"GET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["from","lua"],"cmd":"SET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["unknown"],"cmd":"GET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["key","hello \"there\""],"cmd":"SET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["\u0000�z","\\xZZ","\n\r\t\u0007\b\\"],"cmd":"SET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["analytics","1.5","{\"id\":\"99\",\"wp\":{\"hits\":1},\"relay\":null}"],"cmd":"ZADD","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["terms:1","a:2:{s:11:\"description\";s:0:\"\";s:5:\"count\";s:1:\"1\";}","NX","EX","604800"],"cmd":"SET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["k","Foo\\Bar\\Baz it\\'s"],"cmd":"SET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["k","a,b","q\"uote"],"cmd":"SET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["k",""],"cmd":"SET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["k","double spaced"],"cmd":"SET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["k","tabs"],"cmd":"SET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["k","é utf8 � raw"],"cmd":"SET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["k"],"cmd":"SET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["a\"\"b"],"cmd":"SET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}
+{"args":["lower"],"cmd":"get","timestamp":1783484211.999999,"source":{"address":null,"name":null}}
+{"args":["k","v"],"cmd":"SET","timestamp":1783484211.311904,"source":{"address":null,"name":null}}

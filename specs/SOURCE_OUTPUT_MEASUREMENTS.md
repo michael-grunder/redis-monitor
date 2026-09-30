@@ -1,5 +1,9 @@
 # Source identity output measurements
 
+Historical measurements of the initial implementation. `--output json-source`
+has since been replaced by `--output json --source`; see the current
+[field-selection and source measurements](OUTPUT_FORMAT_MEASUREMENTS.md).
+
 Measured 2026-09-30 against baseline `a3d861d`, on Linux x86-64 with two
 Intel Xeon Platinum 8160 CPUs (96 logical CPUs), Rust 1.98.1. Both binaries
 used the portable release profile (`RUSTFLAGS=''`, overriding the repository's

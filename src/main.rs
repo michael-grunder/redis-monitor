@@ -53,9 +53,10 @@ mod topology;
   %a   Arguments 1..N
   %%   A literal percent sign
 
-  The default formats are:
-    Single instance:    "%t [%d %ca] %l";
-    Multiple Instances: "%t [%S %d] %l";
+  Plain default: "%t [%d %ca] %l". --source prefixes "[address name] ".
+  Structured --format selects native fields, e.g. "%t %C %a".
+  Separate fields with spaces or commas; literals and duplicates are errors.
+  Without --format, each output uses its direct default serializer.
 
 Examples:
   # Monitor localhost:6379 by default
@@ -102,6 +103,9 @@ struct Options {
     #[arg(short, long, help = "How to format each MONITOR line")]
     format: Option<String>,
 
+    #[arg(long, help = "Include server address and instance name in output")]
+    source: bool,
+
     #[arg(short, long, help = "Also connect and MONITOR cluster replicas")]
     replicas: bool,
 
@@ -140,7 +144,7 @@ struct Options {
         short,
         long,
         default_value = "plain",
-        help = "How to serialize the output. Values: plain, json, json-source, php, csv, resp"
+        help = "How to serialize the output. Values: plain, json, php, csv, resp"
     )]
     output: OutputKind,
 
@@ -210,8 +214,6 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_HASH: &str = env!("GIT_HASH");
 const GIT_DIRTY: &str = env!("GIT_DIRTY");
 
-const DEFAULT_SINGLE_FORMAT: &str = "%t [%d %ca] %l";
-const DEFAULT_MULTI_FORMAT: &str = "%t [%S %d] %l";
 /// Idle workers are cheap, but beyond this more rarely helps: the output
 /// thread becomes the limit first.
 const DEFAULT_MAX_THREADS: usize = 16;
@@ -456,18 +458,18 @@ fn format_preamble(monitors: &[Monitor]) -> String {
 /// Start the output thread and build the settings shared by every source.
 fn start_pipeline(
     opt: &Options,
-    format: &str,
+    formatter: Formatter,
     shutdown: &watch::Sender<bool>,
 ) -> Result<(Pipeline, std::thread::JoinHandle<Result<()>>)> {
     let filter = opt.line_filter()?;
-    let formatter = Arc::new(Formatter::new(opt.output, format));
+    let formatter = Arc::new(formatter);
     let batch = BatchConfig::new(opt.batch);
     let stats = opt
         .stats_interval()
         .map(|interval| (interval, Arc::new(Mutex::default())));
 
     let (io, output) = pipeline::start_output(
-        formatter.header(),
+        formatter.header().map(<[u8]>::to_vec),
         batch.queue_capacity(),
         OUTPUT_BYTE_BUDGET,
         stats.clone(),
@@ -498,8 +500,9 @@ async fn run_stdin(opt: Options, shutdown: watch::Sender<bool>) -> Result<()> {
         );
     }
 
-    let format = opt.format.as_deref().unwrap_or(DEFAULT_SINGLE_FORMAT);
-    let (pipeline, output) = start_pipeline(&opt, format, &shutdown)?;
+    let formatter =
+        Formatter::new(opt.output, opt.format.as_deref(), opt.source)?;
+    let (pipeline, output) = start_pipeline(&opt, formatter, &shutdown)?;
     let io = pipeline.io.clone();
 
     io.send(IoMessage::Preamble("MONITOR: stdin".into()))
@@ -519,8 +522,10 @@ async fn run_stdin(opt: Options, shutdown: watch::Sender<bool>) -> Result<()> {
 }
 
 async fn run_wire(opt: Options, shutdown: watch::Sender<bool>) -> Result<()> {
-    // Validate filters before connecting to anything.
+    // Validate filters and compile the output configuration before connecting.
     opt.line_filter()?;
+    let formatter =
+        Formatter::new(opt.output, opt.format.as_deref(), opt.source)?;
     let cfg = Map::load(opt.config_file.as_deref())?;
     let instances: Vec<String> = if opt.instances.is_empty() {
         vec!["localhost:6379".to_string()]
@@ -546,14 +551,7 @@ async fn run_wire(opt: Options, shutdown: watch::Sender<bool>) -> Result<()> {
     };
     let monitors = sources.monitors();
 
-    let format = opt.format.as_deref().unwrap_or(
-        if monitors.len() > 1 || !sources.clusters.is_empty() {
-            DEFAULT_MULTI_FORMAT
-        } else {
-            DEFAULT_SINGLE_FORMAT
-        },
-    );
-    let (pipeline, output) = start_pipeline(&opt, format, &shutdown)?;
+    let (pipeline, output) = start_pipeline(&opt, formatter, &shutdown)?;
     let io = pipeline.io.clone();
 
     io.send(IoMessage::Preamble(format_preamble(&monitors)))
