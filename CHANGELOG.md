@@ -125,6 +125,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Documentation
 
+- Add `FEATURE_IDEAS.md` with six code-grounded feature proposals, scoped first
+  versions, implementation pointers, and validation considerations.
 - Document the parallel pipeline, `--threads`, flushing, invalid-record
   reporting, TLS behavior, format token details, the parsing library API, the
   golden tests, and new performance measurements.
