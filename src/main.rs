@@ -84,6 +84,10 @@ Examples:
   # Match keys, excluding any command touching a private key
   redis-monitor --key-filter '/^user:/' --key-filter '!private'
 
+  # Index command arguments or discovered keys (both zero-based)
+  redis-monitor --filter '[2]/^bar$/'
+  redis-monitor --key-filter '[1]=[0]literal-key'
+
   # Filtering by command flags and categories
   redis-monitor --flags write,@hash"#
 )]
@@ -117,11 +121,11 @@ struct Options {
     pass: Option<String>,
 
     #[clap(long, action = clap::ArgAction::Append,
-           help = "One or more literal or regex patterns to filter command names")]
+           help = "Filter command names, or [N] arguments (command is 0); /regex/, =literal, !exclude")]
     filter: Vec<FilterPattern>,
 
     #[arg(long, action = ArgAction::Append, value_name = "PATTERN",
-        help = "Filter command keys using literal substrings or /regex/; prefix ! to exclude")]
+        help = "Filter keys, or [N]th key (first key is 0); /regex/, =literal, !exclude")]
     key_filter: Vec<FilterPattern>,
 
     #[arg(
@@ -733,7 +737,7 @@ impl fmt::Debug for LineFilter {
 
 impl LineFilter {
     fn from_options(opt: &Options) -> Result<Self> {
-        let names = Filter::try_from(opt.filter.clone())?;
+        let names = Filter::for_command(opt.filter.clone())?;
         let flags = Options::parse_flags(opt.flags.iter().map(String::as_str))?;
         let keys = Filter::try_from(opt.key_filter.clone())?;
         Ok(Self::new(opt.db, names, keys, flags))
@@ -811,7 +815,7 @@ impl LineFilter {
 
         // We need to extract the command to do anything useful
         let Some(cmd) = Self::cmd(line) else {
-            if !self.keys.is_empty() {
+            if !self.keys.is_empty() || self.names.needs_args() {
                 return false;
             }
             eprintln!(
@@ -821,7 +825,8 @@ impl LineFilter {
             return true;
         };
 
-        if !self.names.matches(cmd) {
+        let positional_args = self.names.needs_args();
+        if !positional_args && !self.names.matches(cmd) {
             return false;
         }
 
@@ -831,12 +836,12 @@ impl LineFilter {
         {
             return false;
         }
-        if self.keys.is_empty() {
+        if self.keys.is_empty() && !positional_args {
             return true;
         }
-        let Some(commands) = commands else {
+        if !self.keys.is_empty() && commands.is_none() {
             return false;
-        };
+        }
         let Ok((_, view)) = monitor::LineView::from_line_bytes(
             line,
             monitor::ParsePlan::default(),
@@ -850,6 +855,20 @@ impl LineFilter {
         {
             return false;
         }
+        if positional_args
+            && !self.names.matches_values(
+                std::iter::once(view.cmd.as_bytes())
+                    .chain(args.iter().map(AsRef::as_ref)),
+            )
+        {
+            return false;
+        }
+        if self.keys.is_empty() {
+            return true;
+        }
+        let Some(commands) = commands else {
+            return false;
+        };
         commands
             .keys(view.cmd.as_bytes(), args)
             .is_ok_and(|keys| self.keys.matches_values(keys))
@@ -2451,6 +2470,26 @@ mod tests {
             ("disabled", empty_filter()),
             ("accept", key_filter(&["user:"])),
             ("reject", key_filter(&["missing"])),
+            ("regex", key_filter(&["/^user:/"])),
+            ("indexed key", key_filter(&["[0]user:", "[1]user:"])),
+            (
+                "indexed key regex",
+                key_filter(&["[0]/^user:/", "[1]/^user:/"]),
+            ),
+            (
+                "indexed arg",
+                LineFilter::from_options(
+                    &Options::try_parse_from([
+                        "redis-monitor",
+                        "--filter",
+                        "[1]user:",
+                        "--filter",
+                        "[3]user:",
+                    ])
+                    .unwrap(),
+                )
+                .unwrap(),
+            ),
         ] {
             let mut args = Vec::new();
             let mut samples = Vec::new();
@@ -2473,5 +2512,129 @@ mod tests {
                 samples[3]
             );
         }
+    }
+
+    #[test]
+    fn positional_key_filter_counts_keys_instead_of_arguments() {
+        let lookup = key_fixture::lookup();
+        for (pattern, line, expected) in [
+            ("[3]three", br#"1.0 [0 127.0.0.1:1] "MSET" "zero" "z" "one" "o" "two" "t" "three" "t""#.as_slice(), true),
+            ("[2]three", br#"1.0 [0 127.0.0.1:1] "MSET" "zero" "z" "one" "o" "two" "t" "three" "t""#, false),
+            ("[1]/^one$/", br#"1.0 [0 127.0.0.1:1] "XREAD" "STREAMS" "zero" "one" "0" "$""#, true),
+            ("[1]/^one$/", br#"1.0 [0 127.0.0.1:1] "XREAD" "COUNT" "10" "STREAMS" "zero" "one" "0" "$""#, true),
+            ("[1]/^one$/", br#"1.0 [0 127.0.0.1:1] "XREADGROUP" "GROUP" "g" "c" "STREAMS" "zero" "one" ">" ">""#, true),
+            ("[0]/^one$/", br#"1.0 [0 127.0.0.1:1] "OBJECT" "ENCODING" "one""#, true),
+            ("[0]=[3]three", br#"1.0 [0 127.0.0.1:1] "GET" "[3]three""#, true),
+            (r"[0]/(?-u:^user:\xff$)/", br#"1.0 [0 127.0.0.1:1] "GET" "user:\xff""#, true),
+            ("[1]zero", br#"1.0 [0 127.0.0.1:1] "MGET" "zero" "zero""#, true),
+            ("[0]", br#"1.0 [0 127.0.0.1:1] "PING""#, false),
+            ("![0]", br#"1.0 [0 127.0.0.1:1] "PING""#, true),
+        ] {
+            assert_eq!(key_filter(&[pattern]).matches(Some(&lookup), line, &mut Vec::new()), expected, "{pattern}: {line:?}");
+        }
+        let filter = key_filter(&["[0]zero", "![1]one"]);
+        assert!(!filter.matches(
+            Some(&lookup),
+            br#"1.0 [0 127.0.0.1:1] "MGET" "zero" "one""#,
+            &mut Vec::new()
+        ));
+    }
+
+    #[test]
+    fn positional_command_filters_work_without_metadata_and_keep_default_scope()
+    {
+        let compile = |patterns: &[&str]| {
+            let mut options = vec!["redis-monitor", "--stdin"];
+            for pattern in patterns {
+                options.extend(["--filter", pattern]);
+            }
+            LineFilter::from_options(&Options::try_parse_from(options).unwrap())
+                .unwrap()
+        };
+        for (pattern, line, expected) in [
+            (
+                "[0]/^GET$/",
+                br#"1.0 [0 127.0.0.1:1] "GET" "foo""#.as_slice(),
+                true,
+            ),
+            (
+                "[2]/^bar$/",
+                br#"1.0 [0 127.0.0.1:1] "SET" "FOO" "bar""#,
+                true,
+            ),
+            ("bar", br#"1.0 [0 127.0.0.1:1] "SET" "FOO" "bar""#, false),
+            ("[1]bar", br#"1.0 [0 127.0.0.1:1] "SET" "FOO" "bar""#, false),
+            ("[2]bar", br#"1.0 [0 127.0.0.1:1] "GET" "FOO""#, false),
+            ("![2]bar", br#"1.0 [0 127.0.0.1:1] "GET" "FOO""#, true),
+            ("[1]=!foo", br#"1.0 [0 127.0.0.1:1] "GET" "!foo""#, true),
+            ("[1]=/foo/", br#"1.0 [0 127.0.0.1:1] "GET" "/foo/""#, true),
+            ("[1]=[0]foo", br#"1.0 [0 127.0.0.1:1] "GET" "[0]foo""#, true),
+            (
+                r"[1]/(?-u:^\xff$)/",
+                br#"1.0 [0 127.0.0.1:1] "GET" "\xff""#,
+                true,
+            ),
+            (
+                "![2]bar",
+                br#"1.0 [0 127.0.0.1:1] "SET" "FOO" "unterminated"#,
+                false,
+            ),
+            ("[1]foo", br#"bad "GET" "foo""#, false),
+        ] {
+            let filter = compile(&[pattern]);
+            assert!(!filter.needs_cmds());
+            assert_eq!(
+                filter.matches(None, line, &mut Vec::new()),
+                expected,
+                "{pattern}: {line:?}"
+            );
+        }
+        let set = br#"1.0 [0 127.0.0.1:1] "SET" "FOO" "bar""#;
+        assert!(compile(&["GET", "[2]bar"]).matches(
+            None,
+            set,
+            &mut Vec::new()
+        ));
+        assert!(!compile(&["SET", "![2]bar"]).matches(
+            None,
+            set,
+            &mut Vec::new()
+        ));
+        assert!(!compile(&["!SET", "[2]bar"]).matches(
+            None,
+            set,
+            &mut Vec::new()
+        ));
+    }
+
+    #[test]
+    fn argument_and_key_positions_combine_and_decode_once() {
+        let lookup = key_fixture::lookup();
+        let opt = Options::try_parse_from([
+            "redis-monitor",
+            "--filter",
+            "[4]=o",
+            "--key-filter",
+            "[1]=one",
+        ])
+        .unwrap();
+        let filter = LineFilter::from_options(&opt).unwrap();
+        let mut args = Vec::new();
+        assert!(filter.matches(
+            Some(&lookup),
+            br#"1.0 [0 127.0.0.1:1] "MSET" "zero" "z" "one" "o""#,
+            &mut args
+        ));
+        assert_eq!(args.len(), 4);
+        assert!(!filter.matches(
+            Some(&lookup),
+            br#"1.0 [0 127.0.0.1:1] "MSET" "zero" "z" "two" "o""#,
+            &mut args
+        ));
+        assert!(!filter.matches(
+            Some(&lookup),
+            br#"1.0 [0 127.0.0.1:1] "MSET" "zero" "z" "one" "x""#,
+            &mut args
+        ));
     }
 }

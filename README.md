@@ -53,9 +53,9 @@ Options:
   -p, --pass <PASS>
           Redis password
       --filter <FILTER>
-          One or more literal or regex patterns to filter command names
+          Filter command names, or [N] arguments (command is 0); /regex/, =literal, !exclude
       --key-filter <PATTERN>
-          Filter command keys using literal substrings or /regex/; prefix ! to exclude
+          Filter keys, or [N]th key (first key is 0); /regex/, =literal, !exclude
       --flags <FLAG|@CATEGORY>
           Require flags (e.g. write) and/or categories (e.g. @hash)
   -o, --output <OUTPUT>
@@ -181,8 +181,9 @@ case-sensitive match. Prefix either form with `!` to exclude. Quote patterns
 so the shell does not interpret them.
 
 Repeated inclusions are ORed: at least one key must match one inclusion.
-An exclusion matching **any** key rejects the entire command, even if another
-key matched an inclusion. Patterns are evaluated against each decoded key
+An unindexed exclusion matching **any** key rejects the entire command, even
+if another key matched an inclusion. Indexed patterns only examine the selected
+key; any matching exclusion still rejects the whole command. Patterns are evaluated against each decoded key
 separately, never against values, non-key arguments, or concatenated keys.
 With exclusions alone, commands with no keys pass. With inclusions, they do not.
 `--db`, `--filter`, `--flags`, and `--key-filter` must all pass when combined.
@@ -196,11 +197,65 @@ Malformed records and commands whose keys cannot be completely identified
 counted in the final filtered total, including with exclusion-only filters.
 Key discovery itself makes no per-command server requests.
 
-Argument decoding runs after the cheaper database/name/flag filters, and only
-when key filtering is enabled. Unescaped arguments borrow the input buffer;
+Argument decoding runs after the cheaper database/command-only/flag filters,
+and only when key filtering or an argument index beyond zero requires it.
+Unescaped arguments borrow the input buffer;
 argument storage is reused within each scanned chunk and released afterwards.
 Escaped arguments need decoding allocations. Structured output currently
 parses accepted arguments again on the output thread.
+
+## Positional filters and literal syntax
+
+Both filter options accept `[N]pattern` with a **zero-based** index, but index
+different sequences:
+
+- `--filter`: all command arguments, with the command name at index 0.
+  For `SET FOO bar`, indices 0, 1, and 2 select `SET`, `FOO`, and `bar`.
+- `--key-filter`: only discovered keys, with the first key at index 0.
+  For `MSET zero z one o two t three t`, `[3]` selects `three`.
+  For `XREAD COUNT 10 STREAMS zero one 0 $`, `[1]` selects `one`, irrespective
+  of the options before `STREAMS`. Duplicate key arguments retain their positions;
+  ordering is the discovery iterator's spec order, then argument order per spec.
+
+Unindexed `--filter` patterns still match only the command name; unindexed
+`--key-filter` patterns still match any key. Indexed and unindexed inclusions
+within one option are ORed. Any matching exclusion within that option vetoes
+the command. A missing position matches nothing: it cannot satisfy an inclusion
+or trigger an exclusion. Positional `--filter` works with `--stdin` and does not
+need command metadata; `--key-filter` always does.
+
+The syntax is an optional `!`, followed by an optional `[N]`, followed by the
+pattern. A pattern beginning with `=` treats **everything after that equals
+sign as literal text**; `/regex/` selects a regex; other text is a literal
+substring. Literal matching remains case-insensitive, not an equality test.
+
+```sh
+redis-monitor --filter '[0]/^GET$/'
+redis-monitor --filter '[2]/^bar$/'
+redis-monitor --key-filter '[3]three'
+redis-monitor --key-filter '[1]/^user:/' --key-filter '![0]/^private:/'
+```
+
+| Pattern | Meaning |
+| --- | --- |
+| `=[0]foo` | Literal `[0]foo` in the option's default scope |
+| `[1]=[0]foo` | Literal `[0]foo` at index 1 |
+| `[1]=/foo/` | Literal `/foo/` at index 1 |
+| `[1]=!important` | Literal `!important` at index 1 |
+| `!=!private` | Exclude literal `!private` in the default scope |
+| `==value` | Literal `=value` in the default scope |
+
+Only one leading selector is interpreted; regex contents are not parsed as
+selectors. Bare leading `[` is reserved for selectors, and malformed, negative,
+range, or overflowing indices are errors. Prefix a literal leading bracket,
+equals sign, exclamation mark, or regex-looking string with `=` as above.
+Shell quotes preserve the pattern passed to the program; they do not disable
+pattern syntax. Empty patterns match any existing value, including an empty key,
+but cannot match a missing position.
+
+Matching compiles patterns by position once and scans the borrowed iterator
+without collecting keys or allocating storage based on the requested index.
+Argument and key filters share a single decoding pass when both need it.
 
 ## Command key discovery (library)
 
@@ -234,7 +289,7 @@ metadata without usable specs return `KeyError`, rather than an incomplete key
 set. Invalid arity, counts, and positions also return errors; this is not a full
 command syntax validator. Extraction makes no server requests.
 
-The CLI uses this API when `--key-filter` is enabled. Existing `--filter`
+The CLI uses this API when `--key-filter` is enabled. Unindexed `--filter`
 command-name matching is unchanged.
 
 Run the retained extraction benchmark with `cargo bench --bench command_keys`.
@@ -312,3 +367,41 @@ python3 scripts/bench_key_filter.py --key-filter --records 1000 --metadata-failu
 The replay starts temporary local TCP servers and does not access Redis data.
 Use `--escaped-payload` to exercise decoding allocations, `--producers` to change
 source count, and `--binary` to compare another build.
+
+### Positional-filter measurements
+
+On the same host and portable release profile, the positional implementation
+replayed four sources with 500,000 SET records each. The following are medians
+of five samples (three for the 10%-accepted case):
+
+| Workload | Before selectors, seconds | After selectors, seconds | After, million records/s |
+| --- | ---: | ---: | ---: |
+| Plain, filters disabled | 0.348 | 0.357 | 5.60 |
+| Unindexed key regex, accepts 90% | 0.735 | 0.766 | 2.61 |
+| Indexed key regex, accepts 90% | — | 0.777 | 2.58 |
+| Indexed key regex, accepts 10% | — | 0.769 | 2.60 |
+
+The final comparison shows about 4% lower unindexed key-filter throughput;
+earlier comparisons varied from 7–10% lower. Indexing adds about 1% relative
+to the new unindexed path. This is a small but measurable cost, despite avoiding
+per-record key collections. Profiling still attributes most CPU time to parsing.
+The SET/MSET/XREAD microbenchmark measured 367 ns/record for literal key filters
+(357 ns before), 380 ns for indexed literals, 363/372 ns for unindexed/indexed
+regexes, and 299 ns for indexed arguments without key discovery. Disabled
+filters remained around 3–4 ns/record. The release executable grew from
+8,998,224 to 9,025,104 bytes (0.30%); an incremental release rebuild took about
+15 seconds.
+
+The replay also verifies second-key selection in MSET and XREAD, positional
+argument filtering without metadata, and escaped 4 KiB values through JSON
+output with a slow reader. All replay checks require exact output and
+processed/filtered counts. Reproduce these cases with:
+
+```sh
+python3 scripts/bench_key_filter.py --key-filter --positioned --records 500000
+python3 scripts/bench_key_filter.py --key-filter --positioned --accept-per-ten 1 --records 500000 --samples 3
+python3 scripts/bench_key_filter.py --key-filter --positioned --command mset
+python3 scripts/bench_key_filter.py --key-filter --positioned --command xread
+python3 scripts/bench_key_filter.py --positioned --command xread
+python3 scripts/bench_key_filter.py --key-filter --positioned --records 10000 --payload 4096 --escaped-payload --output json --slow-ms 2
+```

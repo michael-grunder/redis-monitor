@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Add `[N]pattern` selectors to both filters: `--filter` indexes command
+  arguments (command at 0), while `--key-filter` indexes only discovered keys
+  (first key at 0). Add `=literal` to match syntax characters literally, with
+  optional leading `!` exclusions. Missing positions match nothing, and malformed
+  selectors are rejected. Positional argument filters also work with stdin.
+
 - Add repeatable `--key-filter` literal/regex patterns with `!` exclusions,
   matching decoded key arguments only. Exclusions veto the whole command;
   unavailable key discovery rejects records. Require live `COMMAND` metadata,
@@ -56,6 +62,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Tests/CI
 
+- Cover positional filters across command arguments, MSET/stream/subcommand keys,
+  escaping, binary data, missing positions, combined exclusions, and stdin CLI
+  output. Extend the release microbenchmark and concurrent replay for selectors.
+
 - Cover key-filter combinations, decoded/binary keys, unsupported commands,
   keyless commands, rejection counts, and stdin validation. Add a concurrent
   MONITOR replay benchmark for plain/JSON output, slow consumers, and metadata
@@ -76,6 +86,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   improvements.
 
 ### Fixed
+
+- Preserve both regex and literal patterns with identical text when deduplicating
+  filters; they have different matching behavior.
 
 - Parse RESP3 command key-spec maps and metadata sets, retain nested subcommand metadata, and
   preserve unrecognized specs instead of silently discarding them.
