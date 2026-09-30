@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+### Added
+
+- Add repeatable `--key-filter` literal/regex patterns with `!` exclusions,
+  matching decoded key arguments only. Exclusions veto the whole command;
+  unavailable key discovery rejects records. Require live `COMMAND` metadata,
+  retry metadata failures with backoff, and refresh metadata on reconnect.
+
+- Add allocation-free, binary-safe command key discovery from Redis/Valkey
+  `COMMAND` metadata, with subcommand resolution, legacy fixed-key support,
+  range/count/keyword key specs, and local SORT/MIGRATE/GEORADIUS handling.
+  Unsupported or malformed key discovery returns explicit errors. This exposes
+  a library API used by key-scoped filtering.
+
 ### Changed
 
 - Without `--batch`, hand off every complete record from each read together
@@ -43,6 +56,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Tests/CI
 
+- Cover key-filter combinations, decoded/binary keys, unsupported commands,
+  keyless commands, rejection counts, and stdin validation. Add a concurrent
+  MONITOR replay benchmark for plain/JSON output, slow consumers, and metadata
+  failure recovery, plus a release filter microbenchmark.
+
+- Add command metadata fixtures, adversarial key-spec tests, an optional live
+  `COMMAND GETKEYS` comparison in RESP2/RESP3, and a release extraction benchmark.
+
 - Add regression tests for the MONITOR handshake, CSV/PHP/JSON output, module
   command names, `--db`, `--flags`, `--stats` validation, address parsing,
   output failure, and cancelling a stalled connection.
@@ -55,6 +76,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   improvements.
 
 ### Fixed
+
+- Parse RESP3 command key-spec maps and metadata sets, retain nested subcommand metadata, and
+  preserve unrecognized specs instead of silently discarding them.
 
 - Keep MONITOR records that the server sends in the same read as the `+OK`
   reply; these were previously discarded with the handshake buffer.

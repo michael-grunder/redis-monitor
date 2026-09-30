@@ -6,8 +6,8 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::{
-    collections::HashSet, convert::From, fmt, ops::Range, path::PathBuf,
-    str::FromStr, time::Instant,
+    borrow::Cow, collections::HashSet, convert::From, fmt, ops::Range,
+    path::PathBuf, str::FromStr, time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -35,7 +35,7 @@ use crate::{
     output::{InvalidLine, OutputHandler},
 };
 
-mod commands;
+use redis_monitor::commands;
 mod config;
 mod connection;
 mod filter;
@@ -81,6 +81,9 @@ Examples:
   redis-monitor --filter '!get' --filter '!set'
   redis-monitor --filter '/^geo/'
 
+  # Match keys, excluding any command touching a private key
+  redis-monitor --key-filter '/^user:/' --key-filter '!private'
+
   # Filtering by command flags and categories
   redis-monitor --flags write,@hash"#
 )]
@@ -116,6 +119,10 @@ struct Options {
     #[clap(long, action = clap::ArgAction::Append,
            help = "One or more literal or regex patterns to filter command names")]
     filter: Vec<FilterPattern>,
+
+    #[arg(long, action = ArgAction::Append, value_name = "PATTERN",
+        help = "Filter command keys using literal substrings or /regex/; prefix ! to exclude")]
+    key_filter: Vec<FilterPattern>,
 
     #[arg(
         long,
@@ -381,6 +388,7 @@ struct LineFilter {
     empty: bool,
     db: Option<u64>,
     names: Filter,
+    keys: Filter,
     flags: commands::Filter,
 }
 
@@ -717,6 +725,7 @@ impl fmt::Debug for LineFilter {
             .field("empty", &self.empty)
             .field("db", &self.db)
             .field("names", &self.names)
+            .field("keys", &self.keys)
             .field("flags", &self.flags)
             .finish()
     }
@@ -726,19 +735,25 @@ impl LineFilter {
     fn from_options(opt: &Options) -> Result<Self> {
         let names = Filter::try_from(opt.filter.clone())?;
         let flags = Options::parse_flags(opt.flags.iter().map(String::as_str))?;
-        Ok(Self::new(opt.db, names, flags))
+        let keys = Filter::try_from(opt.key_filter.clone())?;
+        Ok(Self::new(opt.db, names, keys, flags))
     }
 
     const fn new(
         db: Option<u64>,
         names: Filter,
+        keys: Filter,
         flags: commands::Filter,
     ) -> Self {
-        let empty = db.is_none() && names.is_empty() && flags.is_empty();
+        let empty = db.is_none()
+            && names.is_empty()
+            && keys.is_empty()
+            && flags.is_empty();
         Self {
             empty,
             db,
             names,
+            keys,
             flags,
         }
     }
@@ -767,14 +782,15 @@ impl LineFilter {
 
     #[inline]
     const fn needs_cmds(&self) -> bool {
-        !self.flags.is_empty()
+        !self.flags.is_empty() || !self.keys.is_empty()
     }
 
     #[inline]
-    fn matches(
+    fn matches<'a>(
         &self,
         commands: Option<&commands::Lookup>,
-        line: &[u8],
+        line: &'a [u8],
+        args: &mut Vec<Cow<'a, [u8]>>,
     ) -> bool {
         if self.empty {
             return true;
@@ -786,12 +802,18 @@ impl LineFilter {
             return false;
         }
 
-        if self.names.is_empty() && self.flags.is_empty() {
+        if self.names.is_empty()
+            && self.flags.is_empty()
+            && self.keys.is_empty()
+        {
             return true;
         }
 
         // We need to extract the command to do anything useful
         let Some(cmd) = Self::cmd(line) else {
+            if !self.keys.is_empty() {
+                return false;
+            }
             eprintln!(
                 "Unable to extract command from line: {}",
                 String::from_utf8_lossy(line)
@@ -803,11 +825,34 @@ impl LineFilter {
             return false;
         }
 
-        if self.flags.is_empty() {
+        if !self.flags.is_empty()
+            && commands
+                .is_some_and(|lu| !lu.matches_bytes_or(cmd, self.flags, true))
+        {
+            return false;
+        }
+        if self.keys.is_empty() {
             return true;
         }
-
-        commands.is_none_or(|lu| lu.matches_bytes_or(cmd, self.flags, true))
+        let Some(commands) = commands else {
+            return false;
+        };
+        let Ok((_, view)) = monitor::LineView::from_line_bytes(
+            line,
+            monitor::ParsePlan::default(),
+        ) else {
+            return false;
+        };
+        if monitor::Line::parse_args_into::<nom::error::Error<&[u8]>>(
+            view.args, args,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        commands
+            .keys(view.cmd.as_bytes(), args)
+            .is_ok_and(|keys| self.keys.matches_values(keys))
     }
 }
 
@@ -889,6 +934,9 @@ fn scan_frames(
     let mut start = 0;
     let mut records = 0;
     let mut lines = Vec::new();
+    // Reused across records borrowing this read buffer. Dropped after the scan
+    // so neither decoded values nor pathological argument counts are retained.
+    let mut args = Vec::new();
 
     while records < max_records {
         let Some(nl) = memchr::memchr(b'\n', &buf[start..])
@@ -912,7 +960,7 @@ fn scan_frames(
         }
 
         stats.tick();
-        if filter.matches(commands, &buf[line_start..line_end]) {
+        if filter.matches(commands, &buf[line_start..line_end], &mut args) {
             lines.push(line_start..line_end);
         } else {
             stats.filtered();
@@ -1124,17 +1172,29 @@ async fn run_monitor(
 
         match connected {
             Ok((stream, pending)) => {
-                backoff.reset();
-
-                // Load metadata lazily so a server that is down at startup
-                // still gets flag filtering once it becomes reachable.
+                // Load metadata lazily so unavailable servers can recover.
+                // Each new MONITOR connection gets a fresh command table.
                 if cmds.is_none() && filter.needs_cmds() {
                     cmds = tokio::select! {
                         biased;
                         () = shutdown_requested(&mut shutdown) => break,
-                        cmds = load_cmds(&mon) => cmds,
+                        cmds = load_cmds(&mon, !filter.keys.is_empty()) => cmds,
                     };
                 }
+
+                if !filter.keys.is_empty() && cmds.is_none() {
+                    // Never emit unfiltered records when metadata is required.
+                    // Back off before reconnecting so metadata failures cannot spin.
+                    drop(stream);
+                    drop(pending);
+                    tokio::select! {
+                        biased;
+                        () = shutdown_requested(&mut shutdown) => break,
+                        () = sleep(backoff.delay()) => {}
+                    }
+                    continue;
+                }
+                backoff.reset();
 
                 // Replay anything that arrived along with the MONITOR reply.
                 let reader = std::io::Cursor::new(pending).chain(stream);
@@ -1151,6 +1211,7 @@ async fn run_monitor(
                 {
                     StreamExit::Shutdown | StreamExit::OutputClosed => break,
                     StreamExit::End => {
+                        cmds = None;
                         eprintln!("{} connection closed", sender.source.server);
                     }
                 }
@@ -1180,7 +1241,15 @@ enum Control {
     Continue,
 }
 
-async fn load_cmds(mon: &Monitor) -> Option<commands::Lookup> {
+async fn load_cmds(
+    mon: &Monitor,
+    key_filter: bool,
+) -> Option<commands::Lookup> {
+    let effect = if key_filter {
+        "key filtering cannot run; reconnecting"
+    } else {
+        "--flags will not filter this source"
+    };
     let addr = &mon.address;
     let load = async {
         let client = Client::open(connection::connection_info(
@@ -1200,16 +1269,12 @@ async fn load_cmds(mon: &Monitor) -> Option<commands::Lookup> {
         Ok(Ok(commands)) => Some(commands.into()),
         Ok(Err(err)) => {
             eprintln!(
-                "{addr} failed to load COMMAND metadata; --flags will not \
-                 filter this source: {err:#}"
+                "{addr} failed to load COMMAND metadata ({effect}): {err:#}"
             );
             None
         }
         Err(_) => {
-            eprintln!(
-                "{addr} timed out loading COMMAND metadata; --flags will not \
-                 filter this source"
-            );
+            eprintln!("{addr} timed out loading COMMAND metadata ({effect})");
             None
         }
     }
@@ -1427,6 +1492,11 @@ fn stats_interval(opt: &Options) -> Option<Duration> {
 }
 
 async fn run_stdin(opt: Options, shutdown: watch::Sender<bool>) -> Result<()> {
+    if !opt.key_filter.is_empty() {
+        bail!(
+            "--key-filter needs COMMAND metadata from a live server and cannot be used with --stdin"
+        );
+    }
     if !opt.flags.is_empty() {
         bail!(
             "--flags needs COMMAND metadata from a live server and cannot be \
@@ -1604,6 +1674,10 @@ fn main() -> Result<()> {
 }
 
 #[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod key_fixture;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::monitor::Line;
@@ -1697,6 +1771,7 @@ mod tests {
     fn empty_filter() -> LineFilter {
         LineFilter::new(
             None,
+            Filter::new(Vec::new()).unwrap(),
             Filter::new(Vec::new()).unwrap(),
             commands::Filter::default(),
         )
@@ -2056,6 +2131,7 @@ mod tests {
         LineFilter::new(
             Some(db),
             Filter::new(Vec::new()).unwrap(),
+            Filter::new(Vec::new()).unwrap(),
             commands::Filter::default(),
         )
     }
@@ -2064,17 +2140,28 @@ mod tests {
     fn db_filter_selects_only_the_requested_database() {
         let filter = db_filter(3);
 
-        assert!(filter.matches(None, br#"1.0 [3 127.0.0.1:1] "GET" "k""#));
-        assert!(!filter.matches(None, br#"1.0 [0 127.0.0.1:1] "GET" "k""#));
-        assert!(!filter.matches(None, br#"1.0 [30 127.0.0.1:1] "GET" "k""#));
-        assert!(!filter.matches(None, b"1.0 "));
-        assert!(!filter.matches(None, b"OK"));
-        assert!(
-            !filter.matches(
-                None,
-                br#"1.0 [99999999999999999999 127.0.0.1:1] "GET""#
-            )
-        );
+        assert!(filter.matches(
+            None,
+            br#"1.0 [3 127.0.0.1:1] "GET" "k""#,
+            &mut Vec::new()
+        ));
+        assert!(!filter.matches(
+            None,
+            br#"1.0 [0 127.0.0.1:1] "GET" "k""#,
+            &mut Vec::new()
+        ));
+        assert!(!filter.matches(
+            None,
+            br#"1.0 [30 127.0.0.1:1] "GET" "k""#,
+            &mut Vec::new()
+        ));
+        assert!(!filter.matches(None, b"1.0 ", &mut Vec::new()));
+        assert!(!filter.matches(None, b"OK", &mut Vec::new()));
+        assert!(!filter.matches(
+            None,
+            br#"1.0 [99999999999999999999 127.0.0.1:1] "GET""#,
+            &mut Vec::new()
+        ));
     }
 
     #[test]
@@ -2083,8 +2170,16 @@ mod tests {
             Options::try_parse_from(["redis-monitor", "--db", "2"]).unwrap();
         let filter = LineFilter::from_options(&opt).unwrap();
 
-        assert!(filter.matches(None, br#"1.0 [2 127.0.0.1:1] "GET""#));
-        assert!(!filter.matches(None, br#"1.0 [1 127.0.0.1:1] "GET""#));
+        assert!(filter.matches(
+            None,
+            br#"1.0 [2 127.0.0.1:1] "GET""#,
+            &mut Vec::new()
+        ));
+        assert!(!filter.matches(
+            None,
+            br#"1.0 [1 127.0.0.1:1] "GET""#,
+            &mut Vec::new()
+        ));
     }
 
     #[test]
@@ -2159,5 +2254,224 @@ mod tests {
         shutdown_tx.send_replace(true);
         assert!(futures::poll!(task.as_mut()).is_ready());
         server.abort();
+    }
+
+    fn key_filter(patterns: &[&str]) -> LineFilter {
+        let mut options = vec!["redis-monitor"];
+        for pattern in patterns {
+            options.extend(["--key-filter", pattern]);
+        }
+        LineFilter::from_options(&Options::try_parse_from(options).unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn key_filter_sees_keys_and_combines_with_existing_filters() {
+        let lookup = key_fixture::lookup();
+        let filter = key_filter(&["/^user:/", "!private"]);
+        assert!(filter.needs_cmds());
+        for (line, expected) in [
+            (
+                br#"1.0 [0 127.0.0.1:1] "SET" "user:1" "value""#.as_slice(),
+                true,
+            ),
+            (br#"1.0 [0 127.0.0.1:1] "SET" "other" "user:1""#, false),
+            (br#"1.0 [0 127.0.0.1:1] "MGET" "user:1" "private:2""#, false),
+            (br#"1.0 [0 127.0.0.1:1] "SET" "user:1" "private""#, true),
+            (br#"1.0 [0 127.0.0.1:1] "PING""#, false),
+            (br#"1.0 [0 127.0.0.1:1] "UNKNOWN" "user:1""#, false),
+            (
+                br#"1.0 [0 127.0.0.1:1] "SET" "user:1" "unterminated"#
+                    .as_slice(),
+                false,
+            ),
+            (br#"broken "GET" "user:1""#, false),
+        ] {
+            assert_eq!(
+                filter.matches(Some(&lookup), line, &mut Vec::new()),
+                expected,
+                "{line:?}"
+            );
+        }
+        let options = Options::try_parse_from([
+            "redis-monitor",
+            "--key-filter",
+            "user:",
+            "--filter",
+            "set",
+            "--flags",
+            "write",
+            "--db",
+            "2",
+        ])
+        .unwrap();
+        let filter = LineFilter::from_options(&options).unwrap();
+        assert!(filter.matches(
+            Some(&lookup),
+            br#"1.0 [2 127.0.0.1:1] "SET" "user:1" "v""#,
+            &mut Vec::new()
+        ));
+        assert!(!filter.matches(
+            Some(&lookup),
+            br#"1.0 [0 127.0.0.1:1] "SET" "user:1" "v""#,
+            &mut Vec::new()
+        ));
+        assert!(!filter.matches(
+            Some(&lookup),
+            br#"1.0 [2 127.0.0.1:1] "GET" "user:1""#,
+            &mut Vec::new()
+        ));
+    }
+
+    #[test]
+    fn key_filter_handles_decoded_arguments_for_all_command_fixtures() {
+        use std::fmt::Write;
+        let lookup = key_fixture::lookup();
+        let filter = key_filter(&["/^a$/"]);
+        for case in key_fixture::cases() {
+            let mut line = format!("1.0 [0 127.0.0.1:1] \"{}\"", case.command);
+            for arg in &case.args {
+                line.push_str(" \"");
+                for byte in *arg {
+                    write!(line, "\\x{byte:02x}").unwrap();
+                }
+                line.push('"');
+            }
+            assert_eq!(
+                filter.matches(Some(&lookup), line.as_bytes(), &mut Vec::new()),
+                case.keys.contains(&b"a".as_slice()),
+                "{line}"
+            );
+        }
+        let filter = key_filter(&[r"/(?-u:^user:\xff\x00$)/"]);
+        assert!(filter.matches(
+            Some(&lookup),
+            br#"1.0 [0 127.0.0.1:1] "GET" "user:\xff\x00""#,
+            &mut Vec::new()
+        ));
+        let filter = key_filter(&["/^$/"]);
+        assert!(filter.matches(
+            Some(&lookup),
+            br#"1.0 [0 127.0.0.1:1] "GET" """#,
+            &mut Vec::new()
+        ));
+    }
+
+    #[test]
+    fn key_filter_unknown_discovery_does_not_bypass_exclusions() {
+        let lookup = key_fixture::lookup();
+        let filter = key_filter(&["!private"]);
+        let ping = br#"1.0 [0 127.0.0.1:1] "PING""#;
+        assert!(filter.matches(Some(&lookup), ping, &mut Vec::new()));
+        assert!(!filter.matches(None, ping, &mut Vec::new()));
+        assert!(!filter.matches(
+            Some(&lookup),
+            br#"1.0 [0 127.0.0.1:1] "UNKNOWN" "public""#,
+            &mut Vec::new()
+        ));
+        let redis::Value::Array(mut rows) = key_fixture::reply() else {
+            unreachable!()
+        };
+        let redis::Value::Array(get) = &mut rows[0] else {
+            unreachable!()
+        };
+        get[8] = redis::Value::Nil;
+        let lookup: commands::Lookup =
+            Command::from_reply(&redis::Value::Array(rows))
+                .unwrap()
+                .into();
+        assert!(!filter.matches(
+            Some(&lookup),
+            br#"1.0 [0 127.0.0.1:1] "GET" "public""#,
+            &mut Vec::new()
+        ));
+    }
+
+    #[test]
+    fn key_filter_counts_rejections_and_preserves_frame_bytes() {
+        let input = b"+1.0 [0 127.0.0.1:1] \"SET\" \"user:1\" \"v\"\r\n1.0 [0 127.0.0.1:1] \"SET\" \"other\" \"user:2\"\n1.0 [0 127.0.0.1:1] \"GET\" \"user:3\"\n";
+        let mut stats = LocalStats::new(u64::MAX);
+        let scan = scan_frames(
+            input,
+            &key_filter(&["user:"]),
+            Some(&key_fixture::lookup()),
+            &mut stats,
+            usize::MAX,
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(stats.total, 3);
+        assert_eq!(stats.filtered, 1);
+        assert_eq!(scan.end, input.len());
+        assert_eq!(scan.lines.len(), 2);
+        assert_eq!(
+            &input[scan.lines[0].clone()],
+            br#"1.0 [0 127.0.0.1:1] "SET" "user:1" "v""#
+        );
+        assert_eq!(
+            &input[scan.lines[1].clone()],
+            br#"1.0 [0 127.0.0.1:1] "GET" "user:3""#
+        );
+    }
+
+    #[tokio::test]
+    async fn stdin_rejects_key_filters_without_metadata() {
+        let opt = Options::try_parse_from([
+            "redis-monitor",
+            "--stdin",
+            "--key-filter",
+            "user:",
+        ])
+        .unwrap();
+        let (shutdown, _) = watch::channel(false);
+        assert!(
+            run(opt, shutdown)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("--key-filter")
+        );
+        assert!(
+            Options::try_parse_from(["redis-monitor", "--key-filter", "/[/"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release key-filter microbenchmark"]
+    fn benchmark_key_filter() {
+        use std::hint::black_box;
+        let lookup = key_fixture::lookup();
+        let lines: [&[u8]; 3] = [
+            br#"1.0 [0 127.0.0.1:1] "SET" "user:1" "value""#,
+            br#"1.0 [0 127.0.0.1:1] "MSET" "a" "value" "user:2" "value""#,
+            br#"1.0 [0 127.0.0.1:1] "XREAD" "STREAMS" "a" "user:3" "0" "$""#,
+        ];
+        for (name, filter) in [
+            ("disabled", empty_filter()),
+            ("accept", key_filter(&["user:"])),
+            ("reject", key_filter(&["missing"])),
+        ] {
+            let mut args = Vec::new();
+            let mut samples = Vec::new();
+            for _ in 0..7 {
+                let start = Instant::now();
+                for _ in 0..100_000 {
+                    for line in lines {
+                        black_box(filter.matches(
+                            Some(&lookup),
+                            black_box(line),
+                            &mut args,
+                        ));
+                    }
+                }
+                samples.push(start.elapsed().as_secs_f64() * 1e9 / 300_000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "{name}: median {:.2} ns/record, {samples:.2?}",
+                samples[3]
+            );
+        }
     }
 }

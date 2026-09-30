@@ -8,14 +8,18 @@ use std::{
     sync::LazyLock,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use bitflags::bitflags;
-use redis::{self, RedisError, aio::ConnectionManager};
+use redis::{self, aio::ConnectionManager};
+
+mod keys;
+pub use keys::{KeyError, Keys};
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Metadata {
     pub name: String,
+    pub arity: i64,
+    subcommands: Lookup,
     pub flags: Flags,
     pub categories: Categories,
     pub first_key: i64,
@@ -31,9 +35,9 @@ struct CiStr(str);
 pub struct Lookup(HashSet<Metadata>);
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct Command {
     name: String,
+    subcommands: HashSet<Self>,
     arity: i64,
     flags: Flags,
     first_key: i64,
@@ -44,7 +48,6 @@ pub struct Command {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct KeySpec {
     flags: KeySpecFlags,
     begin_search: BeginSearch,
@@ -387,11 +390,13 @@ impl Categories {
 }
 
 impl Filter {
+    #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.flags.is_none() && self.categories.is_none()
     }
 
     #[inline]
+    #[must_use]
     pub const fn matches(self, f: Flags, c: Categories) -> bool {
         if let Some(req_flags) = self.flags
             && !f.contains(req_flags)
@@ -447,77 +452,88 @@ impl Command {
         }
     }
 
-    fn value_as_array(value: &redis::Value) -> Option<&[redis::Value]> {
+    fn value_as_sequence(value: &redis::Value) -> Option<&[redis::Value]> {
         match value {
-            redis::Value::Array(values) => Some(values),
+            redis::Value::Array(values) | redis::Value::Set(values) => {
+                Some(values)
+            }
             _ => None,
         }
     }
 
-    fn lookup_flat_array<'a>(
-        arr: &'a [redis::Value],
+    // RESP2 represents maps as alternating key/value arrays; RESP3 uses maps.
+    fn lookup_field<'a>(
+        value: &'a redis::Value,
         key: &str,
     ) -> Option<&'a redis::Value> {
-        let mut idx = 0;
-        while idx + 1 < arr.len() {
-            if let Some(k) = Self::value_to_str(&arr[idx])
-                && k.eq_ignore_ascii_case(key)
-            {
-                return arr.get(idx + 1);
+        match value {
+            redis::Value::Array(arr) => {
+                arr.as_chunks::<2>().0.iter().find_map(|pair| {
+                    Self::value_to_str(&pair[0])
+                        .filter(|name| name.eq_ignore_ascii_case(key))
+                        .map(|_| &pair[1])
+                })
             }
-            idx += 2;
+            redis::Value::Map(pairs) => {
+                pairs.iter().find_map(|(name, value)| {
+                    Self::value_to_str(name)
+                        .filter(|name| name.eq_ignore_ascii_case(key))
+                        .map(|_| value)
+                })
+            }
+            _ => None,
         }
-        None
     }
 
     fn parse_key_specs(value: Option<&redis::Value>) -> Vec<KeySpec> {
         match value {
-            Some(redis::Value::Array(specs)) => {
-                specs.iter().filter_map(Self::parse_key_spec).collect()
+            Some(redis::Value::Array(specs) | redis::Value::Set(specs)) => {
+                specs.iter().map(Self::parse_key_spec).collect()
             }
-            _ => Vec::new(),
+            None => Vec::new(),
+            // Never drop an unrecognized spec: that would claim completeness.
+            Some(_) => vec![Self::parse_key_spec(&redis::Value::Nil)],
         }
     }
 
-    fn parse_key_spec(value: &redis::Value) -> Option<KeySpec> {
-        let redis::Value::Array(arr) = value else {
-            return None;
+    fn parse_key_spec(value: &redis::Value) -> KeySpec {
+        let Some(values) = Self::lookup_field(value, "flags")
+            .and_then(Self::value_as_sequence)
+            .filter(|values| {
+                values.iter().all(|v| Self::value_to_str(v).is_some())
+            })
+        else {
+            return KeySpec {
+                flags: KeySpecFlags::empty(),
+                begin_search: BeginSearch::Unknown,
+                find_keys: FindKeys::Unknown,
+            };
         };
+        let flags = Self::parse_mask(Self::iter_simplestring(values));
 
-        let flags = Self::lookup_flat_array(arr, "flags")
-            .and_then(Self::value_as_array)
-            .map_or_else(KeySpecFlags::empty, |values| {
-                Self::parse_mask(Self::iter_simplestring(values))
-            });
-
-        let begin_search = Self::lookup_flat_array(arr, "begin_search")
+        let begin_search = Self::lookup_field(value, "begin_search")
             .map_or(BeginSearch::Unknown, Self::parse_begin_search);
 
-        let find_keys = Self::lookup_flat_array(arr, "find_keys")
+        let find_keys = Self::lookup_field(value, "find_keys")
             .map_or(FindKeys::Unknown, Self::parse_find_keys);
 
-        Some(KeySpec {
+        KeySpec {
             flags,
             begin_search,
             find_keys,
-        })
+        }
     }
 
     fn parse_begin_search(value: &redis::Value) -> BeginSearch {
-        let redis::Value::Array(arr) = value else {
-            return BeginSearch::Unknown;
-        };
-
-        let ty = Self::lookup_flat_array(arr, "type")
+        let ty = Self::lookup_field(value, "type")
             .and_then(Self::value_to_str)
             .map(str::to_ascii_lowercase);
 
         match ty.as_deref() {
             Some("index") => {
-                let spec = Self::lookup_flat_array(arr, "spec")
-                    .and_then(Self::value_as_array);
+                let spec = Self::lookup_field(value, "spec");
                 if let Some(spec) = spec
-                    && let Some(index) = Self::lookup_flat_array(spec, "index")
+                    && let Some(index) = Self::lookup_field(spec, "index")
                         .and_then(Self::value_to_i64)
                 {
                     return BeginSearch::Index { index };
@@ -525,13 +541,12 @@ impl Command {
                 BeginSearch::Unknown
             }
             Some("keyword") => {
-                let spec = Self::lookup_flat_array(arr, "spec")
-                    .and_then(Self::value_as_array);
+                let spec = Self::lookup_field(value, "spec");
                 if let Some(spec) = spec
                     && let (Some(keyword), Some(start_from)) = (
-                        Self::lookup_flat_array(spec, "keyword")
+                        Self::lookup_field(spec, "keyword")
                             .and_then(Self::value_to_str),
-                        Self::lookup_flat_array(spec, "startfrom")
+                        Self::lookup_field(spec, "startfrom")
                             .and_then(Self::value_to_i64),
                     )
                 {
@@ -547,25 +562,20 @@ impl Command {
     }
 
     fn parse_find_keys(value: &redis::Value) -> FindKeys {
-        let redis::Value::Array(arr) = value else {
-            return FindKeys::Unknown;
-        };
-
-        let ty = Self::lookup_flat_array(arr, "type")
+        let ty = Self::lookup_field(value, "type")
             .and_then(Self::value_to_str)
             .map(str::to_ascii_lowercase);
 
         match ty.as_deref() {
             Some("range") => {
-                let spec = Self::lookup_flat_array(arr, "spec")
-                    .and_then(Self::value_as_array);
+                let spec = Self::lookup_field(value, "spec");
                 if let Some(spec) = spec
                     && let (Some(last_key), Some(key_step), Some(limit)) = (
-                        Self::lookup_flat_array(spec, "lastkey")
+                        Self::lookup_field(spec, "lastkey")
                             .and_then(Self::value_to_i64),
-                        Self::lookup_flat_array(spec, "keystep")
+                        Self::lookup_field(spec, "keystep")
                             .and_then(Self::value_to_i64),
-                        Self::lookup_flat_array(spec, "limit")
+                        Self::lookup_field(spec, "limit")
                             .and_then(Self::value_to_i64),
                     )
                 {
@@ -578,15 +588,14 @@ impl Command {
                 FindKeys::Unknown
             }
             Some("keynum") => {
-                let spec = Self::lookup_flat_array(arr, "spec")
-                    .and_then(Self::value_as_array);
+                let spec = Self::lookup_field(value, "spec");
                 if let Some(spec) = spec
                     && let (Some(keynum_idx), Some(first_key), Some(key_step)) = (
-                        Self::lookup_flat_array(spec, "keynumidx")
+                        Self::lookup_field(spec, "keynumidx")
                             .and_then(Self::value_to_i64),
-                        Self::lookup_flat_array(spec, "firstkey")
+                        Self::lookup_field(spec, "firstkey")
                             .and_then(Self::value_to_i64),
-                        Self::lookup_flat_array(spec, "keystep")
+                        Self::lookup_field(spec, "keystep")
                             .and_then(Self::value_to_i64),
                     )
                 {
@@ -603,7 +612,7 @@ impl Command {
     }
 
     fn from_redis_values(values: &[redis::Value]) -> Option<Self> {
-        if values.len() < 7 {
+        if values.len() < 6 {
             return None;
         }
 
@@ -633,14 +642,14 @@ impl Command {
         };
 
         let flags = match &values[2] {
-            redis::Value::Array(a) => {
+            redis::Value::Array(a) | redis::Value::Set(a) => {
                 Self::parse_mask(Self::iter_simplestring(a))
             }
-            _ => Flags::empty(),
+            _ => return None,
         };
 
-        let categories = match &values[6] {
-            redis::Value::Array(a) => {
+        let categories = match values.get(6) {
+            Some(redis::Value::Array(a) | redis::Value::Set(a)) => {
                 Self::parse_mask(Self::iter_simplestring(a))
             }
             _ => Categories::empty(),
@@ -648,8 +657,20 @@ impl Command {
 
         let key_specs = Self::parse_key_specs(values.get(8));
 
+        let subcommands = match values.get(9) {
+            None => HashSet::new(),
+            Some(redis::Value::Array(rows) | redis::Value::Set(rows)) => rows
+                .iter()
+                .map(|row| {
+                    Self::from_redis_values(Self::value_as_sequence(row)?)
+                })
+                .collect::<Option<HashSet<_>>>()?,
+            Some(_) => return None,
+        };
+
         Some(Self {
             name,
+            subcommands,
             arity,
             flags,
             first_key,
@@ -660,35 +681,52 @@ impl Command {
         })
     }
 
+    /// Fetch the server command table.
+    ///
+    /// # Errors
+    /// Returns the underlying connection/query error or invalid metadata error.
     pub async fn load(con: &mut ConnectionManager) -> Result<HashSet<Self>> {
-        let commands: Vec<Vec<redis::Value>> = redis::cmd("COMMAND")
+        let reply: redis::Value = redis::cmd("COMMAND")
             .query_async(con)
             .await
-            .map_err(|err| {
-                RedisError::from((
-                    redis::ErrorKind::Io,
-                    "Failed to execute COMMAND command",
-                    err.to_string(),
-                ))
-            })?;
+            .context("Failed to execute COMMAND command")?;
+        Self::from_reply(&reply)
+    }
 
-        let mut set = HashSet::new();
-        for row in &commands {
-            if let Some(cmd) = Self::from_redis_values(row) {
-                set.insert(cmd);
-            }
-        }
-
-        Ok(set)
+    /// Parse a COMMAND reply, including nested subcommands and legacy rows.
+    ///
+    /// # Errors
+    /// Returns an error for malformed command rows, including subcommands.
+    pub fn from_reply(reply: &redis::Value) -> Result<HashSet<Self>> {
+        let rows = Self::value_as_sequence(reply)
+            .ok_or_else(|| anyhow!("COMMAND reply is not an array"))?;
+        rows.iter()
+            .enumerate()
+            .map(|(index, row)| {
+                Self::value_as_sequence(row)
+                    .and_then(Self::from_redis_values)
+                    .ok_or_else(|| {
+                        anyhow!("Invalid COMMAND metadata at row {index}")
+                    })
+            })
+            .collect()
     }
 }
 
 impl From<HashSet<Command>> for Lookup {
     fn from(commands: HashSet<Command>) -> Self {
+        Self::from_commands(commands, false)
+    }
+}
+
+impl Lookup {
+    fn from_commands(commands: HashSet<Command>, subcommands: bool) -> Self {
         let mut set = HashSet::new();
         for cmd in commands {
             let metadata = Metadata {
                 name: cmd.name,
+                arity: cmd.arity,
+                subcommands: Self::from_commands(cmd.subcommands, true),
                 flags: cmd.flags,
                 categories: cmd.categories,
                 first_key: cmd.first_key,
@@ -696,6 +734,10 @@ impl From<HashSet<Command>> for Lookup {
                 step_count: cmd.step_count,
                 key_specs: cmd.key_specs,
             };
+            let mut metadata = metadata;
+            if subcommands && let Some(separator) = metadata.name.rfind('|') {
+                metadata.name.drain(..=separator);
+            }
             set.insert(metadata);
         }
         Self(set)
@@ -704,16 +746,19 @@ impl From<HashSet<Command>> for Lookup {
 
 impl Lookup {
     #[inline]
+    #[must_use]
     pub fn get(&self, cmd: &str) -> Option<&Metadata> {
         self.0.get(CiStr::from_str(cmd))
     }
 
     #[inline]
+    #[must_use]
     pub fn get_bytes(&self, cmd: &[u8]) -> Option<&Metadata> {
         std::str::from_utf8(cmd).ok().and_then(|s| self.get(s))
     }
 
     #[inline]
+    #[must_use]
     pub fn matches_bytes_or(
         &self,
         cmd: &[u8],

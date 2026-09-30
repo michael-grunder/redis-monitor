@@ -133,9 +133,9 @@ impl Filter {
         let (exc_lits, exc_res) = Self::split_patterns(exclude);
 
         let include = Self::build_matchers(&inc_lits, inc_res)
-            .context("Failed to compile inclusive command filters")?;
+            .context("Failed to compile inclusive filters")?;
         let exclude = Self::build_matchers(&exc_lits, exc_res)
-            .context("Failed to compile exclusive command filters")?;
+            .context("Failed to compile exclusive filters")?;
 
         Ok(Self { include, exclude })
     }
@@ -176,6 +176,28 @@ impl Filter {
 
     const fn has_includes(&self) -> bool {
         !self.include.is_empty()
+    }
+
+    /// Match a set of values without joining or collecting them. Any exclusion
+    /// vetoes the entire set, even after an earlier value matched an inclusion.
+    pub fn matches_values<'a>(
+        &self,
+        values: impl IntoIterator<Item = &'a [u8]>,
+    ) -> bool {
+        let mut included = !self.has_includes();
+        for value in values {
+            if self.exclude.iter().any(|matcher| matcher.is_match(value)) {
+                return false;
+            }
+            if !included {
+                included =
+                    self.include.iter().any(|matcher| matcher.is_match(value));
+            }
+            if included && self.exclude.is_empty() {
+                return true;
+            }
+        }
+        included
     }
 
     #[inline]
@@ -224,5 +246,42 @@ impl fmt::Debug for Filter {
                 &format_args!("{exc_lit} literal set(s), {exc_re} regex(es)"),
             )
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filter(patterns: &[&str]) -> Filter {
+        Filter::new(patterns.iter().map(|s| s.parse().unwrap()).collect())
+            .unwrap()
+    }
+
+    #[test]
+    fn any_include_matches_but_any_exclusion_vetoes_the_set() {
+        let filter =
+            filter(&["user:", "/^session:/", "!secret", "!/^private:/"]);
+        assert!(filter.matches_values([b"other".as_slice(), b"USER:1"]));
+        assert!(filter.matches_values([b"session:1".as_slice()]));
+        assert!(!filter.matches_values([b"user:1".as_slice(), b"secret"]));
+        assert!(
+            !filter.matches_values([b"private:1".as_slice(), b"session:1"])
+        );
+        assert!(!filter.matches_values([b"user".as_slice(), b":1"]));
+        assert!(!filter.matches_values(std::iter::empty()));
+    }
+
+    #[test]
+    fn exclusion_only_and_empty_keys() {
+        let filter = filter(&["!secret"]);
+        assert!(filter.matches_values(std::iter::empty()));
+        assert!(filter.matches_values([b"".as_slice(), b"public"]));
+        assert!(!filter.matches_values([b"public".as_slice(), b"secret"]));
+        assert!(self::filter(&["/^$/"]).matches_values([b"".as_slice()]));
+        assert!(
+            self::filter(&[r"/(?-u:\xff)/"])
+                .matches_values([b"\xff".as_slice()])
+        );
     }
 }

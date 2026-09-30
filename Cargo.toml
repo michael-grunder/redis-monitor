@@ -50,3 +50,7 @@ panic = "abort"
 
 [profile.release-static]
 inherits = "release"
+
+[[bench]]
+name = "command_keys"
+harness = false

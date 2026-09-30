@@ -54,6 +54,8 @@ Options:
           Redis password
       --filter <FILTER>
           One or more literal or regex patterns to filter command names
+      --key-filter <PATTERN>
+          Filter command keys using literal substrings or /regex/; prefix ! to exclude
       --flags <FLAG|@CATEGORY>
           Require flags (e.g. write) and/or categories (e.g. @hash)
   -o, --output <OUTPUT>
@@ -113,7 +115,7 @@ Instances may be given as `port`, `host`, `host:port`, `[ipv6]:port`, a bare
 IPv6 address, or a unix socket path. `--db` keeps only commands executed against
 that database. Unknown `--flags` names are rejected, and `--flags` cannot be used
 with `--stdin` because it needs `COMMAND` metadata from a live server; that
-metadata is loaded on the first successful connection to each source.
+metadata is refreshed on each successful connection to a source.
 Connection attempts time out after 10 seconds and are retried with backoff.
 Ctrl-C shuts down gracefully; press it a second time to exit immediately. If
 the output is closed (for example `redis-monitor | head`), every source stops
@@ -161,3 +163,152 @@ Examples:
   # Filtering by command flags and categories
   redis-monitor --flags write,@hash
 ```
+
+## Filtering by keys
+
+Use `--key-filter` to match only a command's key arguments:
+
+```sh
+redis-monitor --key-filter 'user:'
+redis-monitor --key-filter '/^user:[0-9]+$/' --key-filter '!private'
+redis-monitor --filter set --key-filter 'session:' --db 2
+```
+
+Like `--filter`, plain patterns are case-insensitive literal substrings;
+`/regex/` patterns are case-sensitive unless the regex enables `(?i)`.
+Redis key identity remains case-sensitive: use an anchored regex for an exact
+case-sensitive match. Prefix either form with `!` to exclude. Quote patterns
+so the shell does not interpret them.
+
+Repeated inclusions are ORed: at least one key must match one inclusion.
+An exclusion matching **any** key rejects the entire command, even if another
+key matched an inclusion. Patterns are evaluated against each decoded key
+separately, never against values, non-key arguments, or concatenated keys.
+With exclusions alone, commands with no keys pass. With inclusions, they do not.
+`--db`, `--filter`, `--flags`, and `--key-filter` must all pass when combined.
+
+Each monitored server must permit `COMMAND` to provide its command metadata.
+`--key-filter` is unavailable with `--stdin`. If metadata loading fails, the
+source logs the failure and reconnects with backoff; it does not emit records
+with key filtering bypassed. Metadata is refreshed after reconnecting.
+Malformed records and commands whose keys cannot be completely identified
+(including unknown commands and unsupported module specs) are rejected and
+counted in the final filtered total, including with exclusion-only filters.
+Key discovery itself makes no per-command server requests.
+
+Argument decoding runs after the cheaper database/name/flag filters, and only
+when key filtering is enabled. Unescaped arguments borrow the input buffer;
+argument storage is reused within each scanned chunk and released afterwards.
+Escaped arguments need decoding allocations. Structured output currently
+parses accepted arguments again on the output thread.
+
+## Command key discovery (library)
+
+The `redis_monitor::commands` module resolves decoded command arguments to a
+borrowed iterator of key bytes. Load `Command::load(&mut connection).await?` once
+per server and convert its result into a `Lookup`. `Command::from_reply` also
+accepts a saved `redis::Value` reply for offline use.
+
+```rust,ignore
+let lookup: redis_monitor::commands::Lookup = commands.into();
+// The command name is separate; args contains arguments 1..N.
+let args: &[&[u8]] = &[b"first", b"value", b"second", b"other value"];
+let keys = lookup.keys(b"MSET", args)?;
+// keys yields b"first", b"second", borrowing args without allocating.
+```
+
+`Lookup::keys` also accepts the parser's `&[Cow<[u8]>]`, handles subcommands
+case-insensitively, and supports binary/empty key names. It validates all key
+specifications before returning an iterator, allowing a caller to short-circuit
+safely. Keys follow spec order and argument order within each spec; duplicate
+keys and overlapping specs are retained. Since keys can be interleaved with
+values, the result is an iterator rather than a contiguous slice.
+
+Discovery supports index/keyword searches, ranges, key counts, and legacy
+fixed-position metadata. `SORT`, `SORT_RO`, `MIGRATE`, and the writable
+`GEORADIUS` variants have local grammar handling. `not_key` arguments such as
+sharded pub/sub channels are excluded. SORT's data-dependent BY/GET expansions
+are not argument keys and cannot be discovered from the argument array.
+Unknown commands, unsupported/incomplete module specs, and legacy `movablekeys`
+metadata without usable specs return `KeyError`, rather than an incomplete key
+set. Invalid arity, counts, and positions also return errors; this is not a full
+command syntax validator. Extraction makes no server requests.
+
+The CLI uses this API when `--key-filter` is enabled. Existing `--filter`
+command-name matching is unchanged.
+
+Run the retained extraction benchmark with `cargo bench --bench command_keys`.
+It compares lookup alone, borrowed key iteration, and collecting keys into a
+vector; includes short, binary, multi-key, and large-value cases; and exercises
+four concurrent readers. `KEY_BENCH_ROUNDS` adjusts iterations per sample; `KEY_BENCH_MODE=borrow`
+limits measurement to borrowed iteration for allocation profiling.
+The fixture tests run without a server. To additionally compare against a local
+Redis 7+/Valkey server in RESP2 and RESP3:
+
+```sh
+KEY_TEST_REDIS_URL=redis://127.0.0.1:6379 \
+  cargo test --test command_keys compare_live_command_getkeys -- --ignored
+```
+
+The fixture in `tests/fixtures/command.json` was captured with Valkey 8.1.0
+`COMMAND INFO` for the commands named in its rows. It retains the server's key
+specifications and subcommands. Valkey 8.1's `COMMAND GETKEYS` can misclassify
+`GEORADIUS` destination names equal to `STORE`/`STOREDIST`; those cases have
+separate grammar regression expectations.
+
+On an Intel Xeon Platinum 8160 (Linux x86-64, rustc 1.98.1), the portable
+optimized bench profile measured medians of 41.68 ns/command for lookup alone,
+81.06 ns for lookup plus borrowed extraction, and 110.62 ns when collecting
+keys. Seven samples each replayed 100,000 rounds of the 27-case workload; four
+concurrent readers reached 46.80 million commands/s. Lookup alone is the
+pre-extraction baseline, not an equivalent implementation: there was no prior
+extractor to compare against. These are extraction microbenchmarks, not MONITOR
+pipeline throughput. The CLI only performs key discovery when `--key-filter`
+is enabled.
+Heaptrack found no increase in allocation count when doubling borrowed-extraction
+rounds from 1,000 to 2,000 (2,140 allocations in each run, including four
+concurrent readers); allocations are
+confined to setup, fixture assertions, reporting, and thread startup.
+
+### Key-filter replay measurements
+
+On the same Xeon 8160 / Linux x86-64 / rustc 1.98.1 host, portable release
+builds replayed four concurrent simulated MONITOR sources. Short-record tests
+used 500,000 SET records per source and five samples; large-record tests used
+10,000 records per source with 4 KiB values and three samples. Values deliberately
+contain matching text to detect accidental filtering of non-key arguments.
+
+| Workload | Median seconds | Input million records/s | Input MB/s |
+| --- | ---: | ---: | ---: |
+| Before this option, plain, no key filter | 0.364 | 5.50 | 298 |
+| After, plain, key filter disabled | 0.358 | 5.58 | 302 |
+| Plain, key filter accepts 90% | 0.712 | 2.81 | 152 |
+| Plain, key filter accepts 10% | 0.738 | 2.71 | 149 |
+| 4 KiB values, plain, accepts 90% | 0.563 | 0.071 | 295 |
+| 4 KiB values, JSON, accepts 90% | 0.899 | 0.045 | 185 |
+| Same JSON workload, reader delays 2 ms per chunk | 5.760 | 0.007 | 29 |
+
+The disabled difference is within run-to-run noise. Enabling key filtering adds
+argument parsing and validation, roughly halving short-record throughput in this
+workload. Every replay verified the exact output count and processed/filtered
+counters, including slow-output and transient metadata-failure recovery runs. A separate
+escaped-value slow-reader run exercised 1,387 backpressure stalls with exact
+output counts.
+The release filter microbenchmark (SET, MSET, and XREAD records)
+measured about 360 ns/record with key filtering, versus 3 ns with filters disabled.
+The release executable grew from 8,977,040 to 8,998,224 bytes (about 0.24%).
+
+To reproduce or vary the workload:
+
+```sh
+cargo build --release
+cargo test --release --bin redis-monitor benchmark_key_filter -- --ignored --nocapture
+python3 scripts/bench_key_filter.py --records 500000
+python3 scripts/bench_key_filter.py --key-filter --records 500000 --accept-per-ten 1
+python3 scripts/bench_key_filter.py --key-filter --records 10000 --payload 4096 --output json --slow-ms 2
+python3 scripts/bench_key_filter.py --key-filter --records 1000 --metadata-failures 1 --samples 1
+```
+
+The replay starts temporary local TCP servers and does not access Redis data.
+Use `--escaped-payload` to exercise decoding allocations, `--producers` to change
+source count, and `--binary` to compare another build.

@@ -286,13 +286,29 @@ impl<'a> Line<'a> {
     }
 
     fn parse_escaped_args<E>(
-        mut input: &'a [u8],
+        input: &'a [u8],
     ) -> IResult<&'a [u8], Vec<Cow<'a, [u8]>>, E>
     where
         E: ParseError<&'a [u8]>
             + FromExternalError<&'a [u8], std::num::ParseIntError>,
     {
         let mut args = Vec::new();
+        let (input, ()) = Self::parse_args_into(input, &mut args)?;
+        Ok((input, args))
+    }
+
+    /// Decode arguments into reusable storage. Borrow unescaped arguments;
+    /// allocate only when an argument requires unescaping. On error the scratch
+    /// may contain a partial parse and must not be used for key discovery.
+    pub fn parse_args_into<E>(
+        mut input: &'a [u8],
+        args: &mut Vec<Cow<'a, [u8]>>,
+    ) -> IResult<&'a [u8], (), E>
+    where
+        E: ParseError<&'a [u8]>
+            + FromExternalError<&'a [u8], std::num::ParseIntError>,
+    {
+        args.clear();
 
         while !input.is_empty() {
             let (next, arg) = Self::parse_escaped_string(input)?;
@@ -317,7 +333,7 @@ impl<'a> Line<'a> {
             input = after_space;
         }
 
-        Ok((input, args))
+        Ok((input, ()))
     }
 
     // aaa.bbb.ccc.ddd:port
