@@ -1,4 +1,4 @@
-# reditop Agent Guide
+# redis-monitor Agent Guide
 
 ## Mission and Priorities
 

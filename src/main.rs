@@ -52,7 +52,7 @@ mod stats;
   %sa  Full address of the server (host:port or unix path)
   %sh  Host part of the server address
   %sp  Port part of the server address (or basename of unix path)
-  %Sn  Name of the server instance if it is set
+  %sn  Name of the server instance if it is set
   %ca  Full address of the client (ip:port or unix path)
   %ch  Host part of the client address
   %cp  Port part of the client address (or basename of unix path)
@@ -79,7 +79,7 @@ Examples:
   # Run while filtering specific commands
   redis-monitor --filter get --filter set
   redis-monitor --filter '!get' --filter '!set'
-  redis-monitor --filter '/^geo/'
+  redis-monitor --filter '/(?i)^geo/'
 
   # Match keys, excluding any command touching a private key
   redis-monitor --key-filter '/^user:/' --key-filter '!private'

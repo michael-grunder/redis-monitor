@@ -1,8 +1,36 @@
-# Performance opportunities
+# Performance opportunities (historical review)
 
 Date: 2026-08-06
 Revision reviewed: `c613143`
 Build profiled: `cargo build --release`
+
+## Status reviewed on 2026-09-29
+
+The measurements and estimates below describe revision `c613143`, not the
+current implementation. A source review at `6944473` found:
+
+| Finding | Current status |
+| --- | --- |
+| 1. Structured-output allocations | Partly implemented: JSON streams argument strings, CSV writes fields directly, addresses use serializer display formatting, and PHP borrows argument bytes. The parsed argument vector and escaped-argument allocations remain. |
+| 2. Many-instance CPU ceiling | Still applicable as an architectural concern: one current-thread Tokio runtime handles ingest and one output thread parses, formats, and writes. Producers now send directly to the writer; the central forwarding loop is gone. Batching and byte-budgeted backpressure are implemented. Re-profile before estimating a current scaling limit. |
+| 3. Stdin record cloning | Implemented: stdin and network readers share `BytesMut` framing, transfer chunks with record ranges, and strip `+` by slicing. There is no per-line `buf.clone()` or `remove(0)`. |
+| 4. Statistics overhead | Partly implemented: the output thread checks the interval once per drain. Command rescanning and per-command hash-map updates remain. |
+| 5. Flush policy | Still open: output flushes after each drain (now up to 16 queue messages, each potentially containing many records) and at shutdown. |
+
+The shared 64 MiB budget accounts for queued and producer-held batch data; it is
+not an RSS limit. Input framing buffers and oversized records can exceed it.
+Backpressure counters now count capacity-wait episodes, so they cannot be
+compared directly with the failed-send counts in the original profile.
+
+No new timings were collected for this documentation review. `monitor.log` is a
+local, untracked input, so the original replay cannot be reproduced from a clean
+checkout alone. The current repository enables `target-cpu=native` by default;
+use `RUSTFLAGS='' cargo build --release` for a portable target baseline, and
+record the flags used for any comparison. See the
+[README](../README.md#recorded-performance-measurements) for later measurements
+and available benchmark commands.
+
+## Original findings
 
 This report ranks opportunities by expected benefit relative to implementation
 effort. The percentages below are estimates for the workloads where each change
@@ -81,10 +109,10 @@ sink alone is saturated.
 queue and parsing work above.
 **Confidence:** High for the current ceiling, medium for the gain.
 
-The binary uses `#[tokio::main(flavor = "current_thread")]`, so all connections,
-framing, early filters, and the central forwarding loop share one core. Parsing,
-formatting, and writing share one other core. During the offered 21-node cluster
-test, `perf` found only those two busy threads and sampled them evenly even
+At the reviewed revision, the binary used a current-thread Tokio runtime, so
+all connections, framing, early filters, and the central forwarding loop shared
+one core. Parsing, formatting, and writing shared one other core. During the
+offered 21-node cluster test, `perf` found only those two busy threads and sampled them evenly even
 though the host has 48 physical cores.
 
 **Proposed change:** Do not merely switch runtime flavors and accept more
@@ -157,13 +185,13 @@ only if measurement justifies the added policy. Verify partial writes, broken
 pipes, timely interactive output, stats visibility, and shutdown flushes with a
 deterministic writer test.
 
-## Suggested implementation order
+## Next measurements
 
-Findings 1 and 2 address the dominant queue and structured-output costs.
-Re-profile before undertaking finding 3: the earlier changes will determine
-whether ingest, formatting, or the sink is the remaining scaling limit.
-Findings 4-6 can be scheduled by feature priority and can share the batching
-infrastructure.
+Re-profile the current pipeline before ranking the remaining work. Finding 3
+and the prerequisites for finding 2 have been implemented. Measure the remaining
+argument allocations in finding 1, many-source scaling in finding 2, and the
+statistics/flush costs in findings 4 and 5 independently. The original estimates
+are not expected gains for today's implementation.
 
 For every hot-path change, retain a release-mode replay benchmark plus an
 end-to-end multi-producer workload with a slow-consumer case. Report both

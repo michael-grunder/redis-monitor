@@ -1,168 +1,255 @@
 # redis-monitor
 
-A cli utility for monitoring one or more RESP compatible servers.
+A CLI utility for consuming, filtering, and formatting Redis/Valkey `MONITOR`
+streams from one or more servers, or from stdin.
 
 ## Building
 
-```bash
+Use a Rust toolchain that supports the project's Rust 2024 edition and current
+dependencies.
+
+```sh
 git clone git@github.com:michael-grunder/redis-monitor.git
 cd redis-monitor
 cargo build --release
+./target/release/redis-monitor --help
+```
 
+The examples below assume `redis-monitor` is on your `PATH`; otherwise use
+`./target/release/redis-monitor`.
+
+The repository's `.cargo/config.toml` enables `target-cpu=native` for default
+builds. To build for the target's default CPU instead, override those flags:
+
+```sh
+RUSTFLAGS='' cargo build --release
 ```
 
 ### Building a static binary
 
-To produce a static binary with no runtime dependencies, compile with the `release-static` profile against the MUSL target:
+On Linux, install the MUSL target and a matching C compiler/linker (for example,
+`musl-gcc` for a native x86-64 Linux build), then run:
 
-```bash
+```sh
 rustup target add x86_64-unknown-linux-musl
 cargo build --profile release-static --target x86_64-unknown-linux-musl
 ```
 
-The resulting binary in `target/x86_64-unknown-linux-musl/release-static/redis-monitor` is fully self-contained.
+The binary is written to
+`target/x86_64-unknown-linux-musl/release-static/redis-monitor`.
+`release-static` inherits the release profile; the MUSL target provides static
+linking. The repository config selects a baseline x86-64 CPU for this target.
+TLS still needs system CA certificates or an explicit `--tls-ca` file at runtime.
+
 ## Usage
 
+```text
+redis-monitor [OPTIONS] [INSTANCES]... [COMMAND]
 ```
-A utility to monitor one or more RESP compatible servers
 
-Usage: redis-monitor [OPTIONS] [INSTANCES]... [COMMAND]
+Run `redis-monitor --help` for the full option reference, or
+`redis-monitor --version` for the package version and build revision.
 
-Commands:
-  completions  Generate shell completion scripts
-  help         Print this message or the help of the given subcommand(s)
+```sh
+# Monitor localhost:6379 by default
+redis-monitor
 
-Arguments:
-  [INSTANCES]...  
+# Monitor two standalone instances
+redis-monitor host1:6379 host2:6379
 
-Options:
-  -c, --cluster
-          Treat each instance like its a cluster seed
-  -f, --format <FORMAT>
-          How to format each MONITOR line
-  -r, --replicas
-          Also connect and MONITOR cluster replicas
-      --config-file <CONFIG_FILE>
-          
-      --no-color
-          Disable colored output
-      --db <DB>
-          Only show commands for a specific database
-  -u, --user <USER>
-          Redis user
-  -p, --pass <PASS>
-          Redis password
-      --filter <FILTER>
-          Filter command names, or [N] arguments (command is 0); /regex/, =literal, !exclude
-      --key-filter <PATTERN>
-          Filter keys, or [N]th key (first key is 0); /regex/, =literal, !exclude
-      --flags <FLAG|@CATEGORY>
-          Require flags (e.g. write) and/or categories (e.g. @hash)
-  -o, --output <OUTPUT>
-          How to serialize the output. Values: plain, json, php, csv, resp [default:
-          plain]
-      --tls
-          Connect using TLS
-      --insecure
-          Disable TLS certificate verification
-      --tls-ca <TLS_CA>
-          Path to CA cert for TLS
-      --tls-cert <TLS_CERT>
-          Path to client cert for TLS
-      --tls-key <TLS_KEY>
-          Path to client private key for TLS
-  -v, --version
-          Display the version and exit
-      --stats <SECONDS>
-          Periodically report per-command statistics (plain output only)
-      --stdin
-          Read from stdin instead of connecting to servers
-      --batch
-          Enable producer batching for higher throughput (may delay records by 5 ms)
-      --debug
-          Output debug information such as detailed filter info
-  -h, --help
-          Print help
+# Discover cluster primaries, and optionally include replicas
+redis-monitor --cluster 6379
+redis-monitor --cluster --replicas 6379
 
-Format specifiers:
-  %S   Short form of server and client address
-  %sa  Full address of the server (host:port or unix path)
-  %sh  Host part of the server address
-  %sp  Port part of the server address (or basename of unix path)
-  %Sn  Name of the server instance if it is set
-  %ca  Full address of the client (ip:port or unix path)
-  %ch  Host part of the client address
-  %cp  Port part of the client address (or basename of unix path)
-  %d   The database number
-  %t   The timestamp as reported by MONITOR
-  %l   The full command and all arguments
-  %C   Argument 0 (the command)
-  %a   Arguments 1..N
+# Match command names (case-insensitive substrings), or exclude them
+redis-monitor --filter get --filter set
+redis-monitor --filter '!get' --filter '!set'
 
-  The default formats are:
-    Single instance:    "%t [%d %ca] %l";
-    Multiple Instances: "%t [%S %d] %l";
+# Regexes are case-sensitive unless requested otherwise
+redis-monitor --filter '/(?i)^geo/'
 
-Structured outputs (`json`, `php`, `csv`, and `resp`) parse MONITOR arguments as
-strings and preserve quoted argument content, including JSON-like values,
-serialized PHP values, and literal backslash sequences. CSV output starts with a
-`timestamp,db,addr,cmd,args` header and writes one column per argument.
-Module commands with punctuation in their names, such as `FT.SEARCH` or
-`JSON.SET`, are parsed like any other command.
-Standalone `OK` replies from entering MONITOR mode are ignored.
+# Require both the write flag and the hash category
+redis-monitor --flags write,@hash
 
-Instances may be given as `port`, `host`, `host:port`, `[ipv6]:port`, a bare
-IPv6 address, or a unix socket path. `--db` keeps only commands executed against
-that database. Unknown `--flags` names are rejected, and `--flags` cannot be used
-with `--stdin` because it needs `COMMAND` metadata from a live server; that
-metadata is refreshed on each successful connection to a source.
-Connection attempts time out after 10 seconds and are retried with backoff.
-Ctrl-C shuts down gracefully; press it a second time to exit immediately. If
-the output is closed (for example `redis-monitor | head`), every source stops
-and the process exits successfully.
-When `--cluster` is used, every instance must be a reachable Redis Cluster seed.
-Discovery failures exit nonzero with the failing seed, underlying Redis or I/O
-error, and a hint to remove `--cluster` for standalone instances.
-Invalid instance arguments, malformed discovered or explicit config files,
-incomplete named instances, invalid TLS files, and malformed cluster metadata
-also exit nonzero with contextual errors rather than panic.
-
-By default, each source never holds a record back: after every read it hands
-all complete accepted records (up to 256 KiB) to the output thread at once, so
-records that arrived together share one handoff without adding latency. Use
-`--batch` to additionally hold records for up to 5 ms, batching up to 64
-records or 256 KiB per source before handoff. In both modes, queued and producer-held records share a 64 MiB byte
-budget, with a bounded queue length as a secondary
-guard. This preserves every accepted record and applies backpressure instead of
-dropping data when output is slow. A record larger than the byte budget is
-allowed through while temporarily consuming the full budget.
-
-Records from an individual source retain their original order in both modes.
-There is no total ordering guarantee between sources, and output is not sorted
-by timestamp. Each handoff is atomic at the output queue, so records from one
-source that arrived in the same read are never interleaved with another
-source's; with `--batch`, the longer hold can further change how records from
-different sources are interleaved. The former `--no-batch` flag has been removed; omit `--batch` for
-individual record handoff.
-
-Examples:
-  # Monitor localhost:6379 by default
-  redis-monitor
-
-  # Monitor a cluster expecting one node to be 127.0.0.1:6379
-  redis-monitor -c 6379
-
-  # Monitor two standalone instances
-  redis-monitor host1:6379 host2:6379
-
-  # Run while filtering specific commands
-  redis-monitor --filter get --filter set
-  redis-monitor --filter '!get' --filter '!set'
-  redis-monitor --filter '/^geo/'
-
-  # Filtering by command flags and categories
-  redis-monitor --flags write,@hash
+# Generate completions (bash, elvish, fish, powershell, or zsh)
+redis-monitor completions zsh > _redis-monitor
 ```
+
+### Connections and named instances
+
+Instances accept a port (`6379`, using `127.0.0.1`), a host, `host:port`,
+`[ipv6]:port`, `[ipv6]`, a bare IPv6 address, or a Unix socket path containing
+`/`. Hosts without a port use 6379. Redis URLs such as `redis://host:6379` are
+not supported as CLI instance arguments.
+
+For direct addresses, use `--user`/`-u` and `--pass`/`-p` (`-a` is also a
+password alias). Enable TLS explicitly with `--tls`; `--tls-ca` supplies a PEM
+CA bundle, and `--tls-cert` plus `--tls-key` supplies a client certificate and
+private key. Without `--tls-ca`, TLS uses the system trust store. `--insecure`
+disables certificate verification; the current MONITOR TLS path also omits
+client authentication in this mode.
+
+Named instances are TOML tables loaded from `--config-file PATH`, or the first
+file found in this order:
+
+1. `./.redis-monitor`
+2. `./.redis-monitor.toml`
+3. `$HOME/.redis-monitor`
+4. `$HOME/.redis-monitor.toml`
+
+For example, save this as `.redis-monitor.toml`:
+
+```toml
+[local]
+host = "127.0.0.1"
+port = 6379
+
+[cache]
+addresses = ["cache-a:6379", "cache-b:6379"]
+user = "monitor"
+pass = "replace-me"
+tls = true
+tls_ca = "/path/to/ca.pem"
+# tls_cert = "/path/to/client.pem"
+# tls_key = "/path/to/client-key.pem"
+
+[socket]
+path = "/run/redis/redis.sock"
+
+[production]
+cluster = true
+addresses = ["seed-a:6379", "seed-b:6379"]
+```
+
+```sh
+redis-monitor local
+redis-monitor --config-file .redis-monitor.toml local cache
+redis-monitor --format '%t [%sn %sa %d] %l' production
+```
+
+Use one address form per entry: `host` and `port` together, a nonempty
+`addresses` list, or `path`. Naming an entry selects it; loading a config does
+not automatically monitor every entry. A named entry uses its own credentials
+and TLS settings, without inheriting the CLI connection options.
+
+A named entry with `cluster = true` tries its seeds until discovery succeeds
+and monitors primaries. The CLI `--cluster` mode instead treats every positional
+argument as a direct seed address, bypassing named entries, and every seed must
+be reachable. `--replicas` applies only to that CLI cluster mode. Discovery runs
+at startup; it is not periodically refreshed.
+
+Use CLI `--format` to control plain output. Per-entry `format` and `color`
+settings are currently accepted but do not affect output; `--no-color` also has
+no effect because the current writers emit no color.
+
+### Reading from stdin
+
+```sh
+redis-monitor --stdin --filter '[2]/^bar$/' < monitor.log
+redis-monitor --stdin --output json < monitor.log
+redis-cli MONITOR | redis-monitor --stdin --format '%C %a'
+```
+
+Stdin accepts newline-delimited MONITOR records, with LF or CRLF and an optional
+RESP simple-string `+` prefix. A final stdin record without a newline is also
+processed. Standalone `OK` replies are ignored. A truncated network record is
+discarded when its connection closes.
+
+`--stdin` bypasses server connections and config loading. Command/argument
+filters and `--db` work here; `--flags` and `--key-filter` are rejected because
+they require live `COMMAND` metadata.
+
+### Output and formatting
+
+Records go to stdout. Connection messages, parse errors, debug information,
+statistics, and the final processed/filtered/backpressure summary go to stderr.
+
+| `--output` | Record representation |
+| --- | --- |
+| `plain` (default) | MONITOR-style text, customizable with `--format`/`-f` |
+| `json` | One JSON object per line with `timestamp`, `db`, `addr`, `cmd`, and an `args` array |
+| `php` | One PHP-serialized record per line with the same fields |
+| `csv` | Header `timestamp,db,addr,cmd,args`, then four metadata columns and one column per argument; row widths vary |
+| `resp` | A RESP array of bulk strings containing the command and arguments, without timestamp, database, or address metadata |
+
+Structured outputs decode MONITOR argument escapes and preserve quoted content,
+including JSON-like values, serialized PHP values, and literal backslash
+sequences. JSON replaces invalid UTF-8 argument bytes with the Unicode replacement
+character; PHP, CSV, and RESP preserve decoded argument bytes. Structured output
+does not include the monitored server address or configured instance name.
+`--format` applies only to plain output.
+
+| Format token | Value |
+| --- | --- |
+| `%S` | Short form of server and client address |
+| `%sa` | Full server address (`host:port` or Unix path) |
+| `%sh` | Server host |
+| `%sp` | Server port, or basename of its Unix path |
+| `%sn` | Configured instance name, or cluster node ID in CLI cluster mode, when set; otherwise `-` |
+| `%ca` | Full client address |
+| `%ch` | Client host |
+| `%cp` | Client port, or basename of its Unix path |
+| `%d` | Database number |
+| `%t` | MONITOR timestamp |
+| `%l` | Full quoted command and arguments |
+| `%C` | Command name (argument 0) |
+| `%a` | Arguments 1..N |
+
+The default is `%t [%d %ca] %l` for one source or stdin, and `%t [%S %d] %l`
+for multiple resolved server connections. Module commands such as `FT.SEARCH`
+and `JSON.SET` are supported.
+
+### Database, flags, and statistics
+
+`--db N` selects the database in each MONITOR record. It does not change which
+databases the server monitors.
+
+`--flags` accepts comma-separated names and can be repeated. All requested
+flags and categories must be present; unknown names are errors. Metadata is
+loaded after connecting and refreshed on reconnect. If loading fails without
+`--key-filter` enabled, a diagnostic is printed and flag filtering is bypassed for
+that source until the next reconnect. Commands absent from the metadata also
+pass flag filtering. Other configured filters still apply. Key filtering has
+stricter metadata requirements, described below.
+
+`--stats SECONDS` accepts a positive, finite interval (including fractional
+seconds). In plain mode it reports cumulative per-command counts and MONITOR
+line bytes after filtering, on stderr. The interval is checked after output
+drains, so an idle source does not trigger reports. With structured output,
+`--stats` is ignored. The final processed/filtered/backpressure summary is
+independent of this option. `--debug` prints the compiled filter configuration
+to stderr.
+
+### Batching, ordering, and shutdown
+
+By default, each source hands off complete accepted records already available
+from a read together, with a 256 KiB chunk target and no wait for more input.
+`--batch` additionally coalesces records across reads, with a 64-record limit,
+a 256 KiB target, and a 5 ms producer hold deadline. Slow output can delay either
+mode beyond that deadline. A single oversized record is kept intact.
+
+Queued and producer-held batches share a 64 MiB byte budget. Queue length is
+also bounded: 16,384 messages by default or 1,024 with `--batch`. Slow output
+applies backpressure instead of silently dropping accepted records. A record
+larger than the byte budget temporarily consumes the full budget. This is not
+a process memory cap: input framing buffers, incomplete records, allocation
+capacity, and serialization storage also consume memory, and there is no maximum
+input record size.
+
+Per-source order is preserved. Across sources, output is not sorted by timestamp
+and has no total ordering guarantee. A single queue handoff is written without
+interleaving another source's records, but a large read may be split into multiple
+handoffs. `--batch` can change cross-source interleaving. The former `--no-batch`
+flag is no longer accepted; omit `--batch` for the default behavior.
+
+MONITOR connection attempts time out after 10 seconds and retry with backoff;
+disconnected sources reconnect. Cluster discovery failures instead exit nonzero
+with context. Invalid addresses, malformed config files, incomplete named
+entries, and invalid TLS files also report contextual errors.
+
+Ctrl-C requests shutdown and drains pending output; a second Ctrl-C exits
+immediately. If stdout closes (for example `redis-monitor | head`), all sources
+stop and the process exits successfully. Other output failures exit nonzero.
 
 ## Filtering by keys
 
@@ -174,7 +261,7 @@ redis-monitor --key-filter '/^user:[0-9]+$/' --key-filter '!private'
 redis-monitor --filter set --key-filter 'session:' --db 2
 ```
 
-Like `--filter`, plain patterns are case-insensitive literal substrings;
+Like `--filter`, plain patterns are ASCII case-insensitive literal substrings;
 `/regex/` patterns are case-sensitive unless the regex enables `(?i)`.
 Redis key identity remains case-sensitive: use an anchored regex for an exact
 case-sensitive match. Prefix either form with `!` to exclude. Quote patterns
@@ -183,8 +270,9 @@ so the shell does not interpret them.
 Repeated inclusions are ORed: at least one key must match one inclusion.
 An unindexed exclusion matching **any** key rejects the entire command, even
 if another key matched an inclusion. Indexed patterns only examine the selected
-key; any matching exclusion still rejects the whole command. Patterns are evaluated against each decoded key
-separately, never against values, non-key arguments, or concatenated keys.
+key; any matching exclusion still rejects the whole command. Patterns are
+evaluated against each decoded key separately, never against values, non-key
+arguments, or concatenated keys.
 With exclusions alone, commands with no keys pass. With inclusions, they do not.
 `--db`, `--filter`, `--flags`, and `--key-filter` must all pass when combined.
 
@@ -197,8 +285,9 @@ Malformed records and commands whose keys cannot be completely identified
 counted in the final filtered total, including with exclusion-only filters.
 Key discovery itself makes no per-command server requests.
 
-Argument decoding runs after the cheaper database/command-only/flag filters,
-and only when key filtering or an argument index beyond zero requires it.
+Argument decoding runs after the cheaper database and flag filters, and after
+command-name filtering when no argument index beyond zero is requested. It runs
+only when key filtering or an argument index beyond zero requires it.
 Unescaped arguments borrow the input buffer;
 argument storage is reused within each scanned chunk and released afterwards.
 Escaped arguments need decoding allocations. Structured output currently
@@ -292,7 +381,23 @@ command syntax validator. Extraction makes no server requests.
 The CLI uses this API when `--key-filter` is enabled. Unindexed `--filter`
 command-name matching is unchanged.
 
-Run the retained extraction benchmark with `cargo bench --bench command_keys`.
+## Development and verification
+
+Run the required checks from the repository root:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+```
+
+Normal tests use local fixtures and temporary loopback listeners; they do not
+require a running Redis server. Manual benchmarks and the live-server comparison
+are separate opt-in checks. See [AGENTS.md](AGENTS.md) for contribution and
+performance requirements, and [CHANGELOG.md](CHANGELOG.md) for unreleased changes.
+
+Run the retained extraction benchmark with
+`RUSTFLAGS='' cargo bench --bench command_keys`.
 It compares lookup alone, borrowed key iteration, and collecting keys into a
 vector; includes short, binary, multi-key, and large-value cases; and exercises
 four concurrent readers. `KEY_BENCH_ROUNDS` adjusts iterations per sample; `KEY_BENCH_MODE=borrow`
@@ -310,6 +415,15 @@ The fixture in `tests/fixtures/command.json` was captured with Valkey 8.1.0
 specifications and subcommands. Valkey 8.1's `COMMAND GETKEYS` can misclassify
 `GEORADIUS` destination names equal to `STORE`/`STOREDIST`; those cases have
 separate grammar regression expectations.
+
+## Recorded performance measurements
+
+These measurements were recorded when key discovery, key filtering, and
+positional filtering were introduced. They are historical comparisons, not
+fresh measurements of the current checkout. Use optimized builds and explicitly
+override the repository's native CPU flags for portable comparisons.
+The earlier [performance opportunities report](specs/PERFORMANCE_OPPORTUNITIES.md)
+includes a status review of its original recommendations.
 
 On an Intel Xeon Platinum 8160 (Linux x86-64, rustc 1.98.1), the portable
 optimized bench profile measured medians of 41.68 ns/command for lookup alone,
@@ -353,11 +467,14 @@ The release filter microbenchmark (SET, MSET, and XREAD records)
 measured about 360 ns/record with key filtering, versus 3 ns with filters disabled.
 The release executable grew from 8,977,040 to 8,998,224 bytes (about 0.24%).
 
-To reproduce or vary the workload:
+The replay commands below require `scripts/bench_key_filter.py`, which is
+present in this workspace but is not tracked in the repository. A clean checkout
+can run the retained Rust benchmarks, but needs that helper to reproduce these
+end-to-end replays. With the helper available:
 
 ```sh
-cargo build --release
-cargo test --release --bin redis-monitor benchmark_key_filter -- --ignored --nocapture
+RUSTFLAGS='' cargo build --release
+RUSTFLAGS='' cargo test --release --bin redis-monitor benchmark_key_filter -- --ignored --nocapture
 python3 scripts/bench_key_filter.py --records 500000
 python3 scripts/bench_key_filter.py --key-filter --records 500000 --accept-per-ten 1
 python3 scripts/bench_key_filter.py --key-filter --records 10000 --payload 4096 --output json --slow-ms 2

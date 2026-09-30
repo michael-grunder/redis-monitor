@@ -46,10 +46,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Batch records per producer and route them directly to the output thread,
   reducing queue contention and repeated source-metadata updates. Batching is
   bounded by record count, bytes, and a 5 ms deadline, and is opt-in with
-  `--batch`. By default, hand off each accepted record individually for minimum
-  output latency. This replaces `--no-batch` and applies to both stdin and live
-  connections; per-source order is preserved, with no cross-source ordering
-  guarantee.
+  `--batch`. By default, hand off complete records already available from each
+  read together, without waiting for more input. This replaces `--no-batch` and
+  applies to both stdin and live connections; per-source order is preserved,
+  with no cross-source ordering guarantee.
 - Bound queued record data with a shared 64 MiB byte budget while retaining a
   smaller item-count guard and lossless backpressure, including support for
   oversized individual records.
@@ -80,6 +80,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Documentation
 
+- Refresh the README against the current CLI and implementation: document
+  config discovery and named instances, TLS, stdin, output schemas, metadata
+  failure behavior, statistics, batching limits, and build CPU settings.
+  Clarify inactive formatting/color settings and the local-only replay helper;
+  label historical measurements and update the performance report's status.
+- Correct the instance-name format token to `%sn` in the README and CLI help,
+  and make the CLI's GEO regex example match uppercase command names.
+- Correct the agent guide's project name (also exposed through `CLAUDE.md`).
 - Expand the agent guide with firehose-oriented performance requirements,
   measurement practices, Rust abstraction tradeoffs, and completion checks.
 - Add a measured, ranked report of potential throughput and resource-use
