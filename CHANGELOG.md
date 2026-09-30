@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Add opt-in `--output json-source` with borrowed server address and instance
+  name in a `source` object, keeping `addr` as the client address. Unnamed
+  servers use a null name; stdin uses null for both source fields. Existing
+  output schemas are unchanged.
 - Refresh cluster membership every 30 seconds, configurable with
   `--cluster-refresh SECONDS`, for CLI and named clusters. Preserve unchanged
   connections, reconcile node/role/address changes, and retain the last topology
@@ -106,6 +110,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   can be validated and copied from the input without typed round trips.
 
 ### Tests/CI
+
+- Cover source-aware JSON with golden output, address/name escaping, unknown
+  stdin identity, and multi-source merging under backpressure. Retain a release
+  formatter measurement and a finite multi-server output replay benchmark.
 
 - Cover cluster refresh failures, promotion, address changes, repeated remaps,
   seed fallback/deduplication, named cluster settings, malformed topology, and

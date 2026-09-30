@@ -31,7 +31,7 @@ use tokio::{
 };
 
 use crate::{
-    connection::{self, Monitor, ServerAddr},
+    connection::{self, Monitor},
     filter::LineFilter,
     output::{FormatError, Formatter, Source},
     stats::CommandStats,
@@ -800,7 +800,7 @@ pub async fn run_from_reader<R>(
 ) where
     R: AsyncRead + Unpin,
 {
-    let source = Source::new(&ServerAddr::from_path(name), None);
+    let source = Source::from_reader(name);
     let mut producer = Producer::new(source, pipeline);
     producer
         .consume(BytesMut::new(), reader, &mut shutdown, true)
@@ -1068,6 +1068,7 @@ pub mod tests {
 
     use super::*;
     use crate::{
+        connection::ServerAddr,
         filter::{Filter, LineFilter},
         key_fixture,
         output::OutputKind,
@@ -1356,6 +1357,70 @@ pub mod tests {
             batch_lines(&rx),
             [[br#"{"timestamp":1.5,"db":2,"addr":"lua","cmd":"GET","args":["k"]}"#]]
         );
+    }
+
+    #[tokio::test]
+    async fn json_source_identity_survives_merging_and_backpressure() {
+        let (io, rx) = test_io(1, 128);
+        let mut pipeline = pipeline(io, BatchConfig::new(false));
+        pipeline.formatter =
+            Arc::new(Formatter::new(OutputKind::JsonSource, ""));
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let mut second_shutdown = shutdown_rx.clone();
+        let mut first = Producer::new(
+            Source::new(
+                &ServerAddr::from_tcp_addr("127.0.0.1", 6379),
+                Some("primary".into()),
+            ),
+            pipeline.clone(),
+        );
+        let mut second = Producer::new(
+            Source::new(&ServerAddr::from_tcp_addr("::1", 6380), None),
+            pipeline,
+        );
+        let input = &b"1.5 [2 lua] \"GET\" \"first\"\ninvalid\n1.5 [2 lua] \"GET\" \"last\""[..];
+        let drain = async move {
+            let mut records = Vec::new();
+            while let Ok(message) = rx.recv_async().await {
+                if let IoMessage::Batch(batch) = message {
+                    for line in batch.data.split_inclusive(|&b| b == b'\n') {
+                        records.push(
+                            serde_json::from_slice::<serde_json::Value>(line)
+                                .unwrap(),
+                        );
+                    }
+                }
+            }
+            records
+        };
+        let ((), (), records) = tokio::join!(
+            async move {
+                first
+                    .consume(BytesMut::new(), input, &mut shutdown_rx, true)
+                    .await;
+            },
+            async move {
+                second
+                    .consume(BytesMut::new(), input, &mut second_shutdown, true)
+                    .await;
+            },
+            drain,
+        );
+        assert_eq!(records.len(), 4);
+        for (address, name) in
+            [("127.0.0.1:6379", Some("primary")), ("[::1]:6380", None)]
+        {
+            let from_source: Vec<_> = records
+                .iter()
+                .filter(|record| record["source"]["address"] == address)
+                .collect();
+            assert_eq!(from_source.len(), 2);
+            for (record, arg) in from_source.iter().zip(["first", "last"]) {
+                assert_eq!(record["source"]["name"], serde_json::json!(name));
+                assert_eq!(record["addr"], "lua");
+                assert_eq!(record["args"], serde_json::json!([arg]));
+            }
+        }
     }
 
     #[tokio::test]

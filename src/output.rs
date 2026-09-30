@@ -57,11 +57,18 @@ impl FormatError {
 /// once instead of per record.
 #[derive(Debug)]
 pub struct Source {
+    origin: SourceOrigin,
     name: Option<String>,
     ip: Option<IpAddr>,
     addr: String,
     host: String,
     port: String,
+}
+
+#[derive(Debug, Copy, Clone)]
+enum SourceOrigin {
+    Server,
+    Reader,
 }
 
 impl fmt::Display for Source {
@@ -79,11 +86,30 @@ impl Source {
             }
         };
         Self {
+            origin: SourceOrigin::Server,
             name,
             ip,
             addr: server.to_string(),
             host: server.get_host().to_owned(),
             port,
+        }
+    }
+
+    /// Keep the reader label for diagnostics/plain output, without claiming
+    /// it identifies the server that originally produced the captured records.
+    pub fn from_reader(label: &str) -> Self {
+        let mut source = Self::new(&ServerAddr::from_path(label), None);
+        source.origin = SourceOrigin::Reader;
+        source
+    }
+
+    fn structured(&self) -> StructuredSource<'_> {
+        StructuredSource {
+            address: match self.origin {
+                SourceOrigin::Server => Some(self.addr.as_str()),
+                SourceOrigin::Reader => None,
+            },
+            name: self.name.as_deref(),
         }
     }
 }
@@ -92,6 +118,7 @@ impl Source {
 pub enum OutputKind {
     Plain,
     Json,
+    JsonSource,
     Csv,
     Resp,
     Php,
@@ -105,11 +132,12 @@ impl FromStr for OutputKind {
             "plain" => Ok(Self::Plain),
             "resp" => Ok(Self::Resp),
             "json" => Ok(Self::Json),
+            "json-source" => Ok(Self::JsonSource),
             "csv" => Ok(Self::Csv),
             "php" => Ok(Self::Php),
             _ => Err(anyhow!(
                 "Invalid output format '{s}'. Supported: \
-                 plain, resp, json, csv, php"
+                 plain, resp, json, json-source, csv, php"
             )),
         }
     }
@@ -120,6 +148,7 @@ impl FromStr for OutputKind {
 pub enum Formatter {
     Plain(PlainFormat),
     Json,
+    JsonSource,
     Csv,
     Resp,
     Php,
@@ -134,6 +163,7 @@ impl Formatter {
         match kind {
             OutputKind::Plain => Self::Plain(PlainFormat::new(format)),
             OutputKind::Json => Self::Json,
+            OutputKind::JsonSource => Self::JsonSource,
             OutputKind::Csv => Self::Csv,
             OutputKind::Resp => Self::Resp,
             OutputKind::Php => Self::Php,
@@ -168,13 +198,14 @@ impl Formatter {
                     .map_err(|e| FormatError::new(line, e))?;
                 plain.write(out, source, &record)
             }
-            Self::Json => {
+            Self::Json | Self::JsonSource => {
                 let record = parse_structured(line, args)?;
-                serde_json::to_writer(
-                    &mut *out,
-                    &Structured::new(&record, TextArgs(args)),
-                )
-                .map_err(io::Error::from)
+                let mut structured = Structured::new(&record, TextArgs(args));
+                if matches!(self, Self::JsonSource) {
+                    structured.source = Some(source.structured());
+                }
+                serde_json::to_writer(&mut *out, &structured)
+                    .map_err(io::Error::from)
             }
             Self::Php => {
                 let record = parse_structured(line, args)?;
@@ -419,6 +450,15 @@ struct Structured<'r, A> {
     addr: Addr<'r>,
     cmd: &'r str,
     args: A,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<StructuredSource<'r>>,
+}
+
+/// Source strings are prepared once at connection setup and borrowed here.
+#[derive(Serialize)]
+struct StructuredSource<'s> {
+    address: Option<&'s str>,
+    name: Option<&'s str>,
 }
 
 impl<'r, A> Structured<'r, A> {
@@ -429,6 +469,7 @@ impl<'r, A> Structured<'r, A> {
             addr: Addr(&record.client),
             cmd: record.cmd_str(),
             args,
+            source: None,
         }
     }
 }
@@ -546,6 +587,57 @@ mod tests {
     };
     use crate::connection::ServerAddr;
 
+    /// Portable release measurement, separate from correctness tests:
+    /// `RUSTFLAGS='' cargo test --release --bin redis-monitor benchmark_json -- --ignored --nocapture`
+    #[test]
+    #[ignore = "release throughput measurement"]
+    fn benchmark_json() {
+        use std::{hint::black_box, time::Instant};
+
+        let source = Source::new(
+            &ServerAddr::from_tcp_addr("127.0.0.1", 6379),
+            Some("primary".into()),
+        );
+        let large = format!(
+            r#"1.5 [0 127.0.0.1:49152] "SET" "key" "{}""#,
+            r#"value\"\x00"#.repeat(256)
+        );
+        for (label, line) in [
+            ("short", &br#"1.5 [0 127.0.0.1:49152] "GET" "key""#[..]),
+            ("large", large.as_bytes()),
+        ] {
+            for kind in [OutputKind::Json, OutputKind::JsonSource] {
+                let formatter = Formatter::new(kind, "");
+                let mut out = Vec::new();
+                let mut args = Vec::new();
+                let mut samples = Vec::new();
+                for _ in 0..7 {
+                    let start = Instant::now();
+                    for _ in 0..100_000 {
+                        out.clear();
+                        formatter
+                            .format(
+                                &mut out,
+                                &source,
+                                black_box(line),
+                                &mut args,
+                            )
+                            .unwrap();
+                        black_box(&out);
+                    }
+                    samples
+                        .push(start.elapsed().as_secs_f64() * 1e9 / 100_000.0);
+                }
+                samples.sort_by(f64::total_cmp);
+                println!(
+                    "{label} {kind:?}: {:.2} ns/record; {} bytes/record; samples {samples:.2?}",
+                    samples[3],
+                    out.len()
+                );
+            }
+        }
+    }
+
     fn render(
         kind: OutputKind,
         format: &str,
@@ -636,6 +728,63 @@ mod tests {
     }
 
     #[test]
+    fn json_source_preserves_identity_and_legacy_fields() {
+        let cases = [
+            (
+                Source::new(
+                    &ServerAddr::from_tcp_addr("redis.example", 6379),
+                    Some("primary\"\n東京".into()),
+                ),
+                serde_json::json!({"address": "redis.example:6379", "name": "primary\"\n東京"}),
+            ),
+            (
+                Source::new(&ServerAddr::from_tcp_addr("::1", 6380), None),
+                serde_json::json!({"address": "[::1]:6380", "name": null}),
+            ),
+            (
+                Source::new(
+                    &ServerAddr::from_path("/tmp/redis\"\\socket"),
+                    Some(String::new()),
+                ),
+                serde_json::json!({"address": "/tmp/redis\"\\socket", "name": ""}),
+            ),
+            // A server socket named "stdin" is distinct from unknown identity.
+            (
+                Source::new(&ServerAddr::from_path("stdin"), None),
+                serde_json::json!({"address": "stdin", "name": null}),
+            ),
+            (
+                Source::from_reader("stdin"),
+                serde_json::json!({"address": null, "name": null}),
+            ),
+        ];
+        let input = br#"1.5 [2 127.0.0.1:49152] "SET" "key" "\xff\"\n""#;
+        for (source, expected) in cases {
+            let mut out = Vec::new();
+            let mut args = Vec::new();
+            Formatter::new(OutputKind::JsonSource, "")
+                .format(&mut out, &source, input, &mut args)
+                .unwrap();
+            assert_eq!(memchr::memchr_iter(b'\n', &out).count(), 1);
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&out).unwrap();
+            assert_eq!(
+                value.as_object_mut().unwrap().remove("source"),
+                Some(expected)
+            );
+            assert_eq!(value["addr"], "127.0.0.1:49152");
+            out.clear();
+            Formatter::new(OutputKind::Json, "")
+                .format(&mut out, &source, input, &mut args)
+                .unwrap();
+            assert_eq!(
+                value,
+                serde_json::from_slice::<serde_json::Value>(&out).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn format_percent_escapes_and_unknown_specifiers_are_literal() {
         assert_eq!(
             compile_format("%%|%%t|%x|%s|%sx|%c|%"),
@@ -699,6 +848,7 @@ mod tests {
         for kind in [
             OutputKind::Plain,
             OutputKind::Json,
+            OutputKind::JsonSource,
             OutputKind::Csv,
             OutputKind::Resp,
             OutputKind::Php,

@@ -22,6 +22,7 @@ const CASES: &[(&str, &[&str])] = &[
         ],
     ),
     ("json.out", &["-o", "json"]),
+    ("json-source.out", &["-o", "json-source"]),
     ("csv.out", &["-o", "csv"]),
     ("resp.out", &["-o", "resp"]),
     ("php.out", &["-o", "php"]),

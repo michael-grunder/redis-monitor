@@ -140,7 +140,7 @@ struct Options {
         short,
         long,
         default_value = "plain",
-        help = "How to serialize the output. Values: plain, json, php, csv, resp"
+        help = "How to serialize the output. Values: plain, json, json-source, php, csv, resp"
     )]
     output: OutputKind,
 

@@ -200,16 +200,41 @@ stderr. Invalid records are skipped and reported with a bounded excerpt; at most
 | --- | --- |
 | `plain` (default) | MONITOR-style text, customizable with `--format`/`-f` |
 | `json` | One JSON object per line with `timestamp`, `db`, `addr`, `cmd`, and an `args` array |
-| `php` | One PHP-serialized record per line with the same fields |
+| `json-source` | The JSON fields above plus `source: {"address": ..., "name": ...}` identifying the monitored server |
+| `php` | One PHP-serialized record per line with the legacy `json` fields |
 | `csv` | Header `timestamp,db,addr,cmd,args`, then four metadata columns and one column per argument; row widths vary |
 | `resp` | A RESP array of bulk strings containing the command and arguments, without timestamp, database, or address metadata |
 
 Structured outputs decode MONITOR argument escapes and preserve quoted content,
 including JSON-like values, serialized PHP values, and literal backslash
 sequences. JSON replaces invalid UTF-8 argument bytes with the Unicode replacement
-character; PHP, CSV, and RESP preserve decoded argument bytes. Structured output
-does not include the monitored server address or configured instance name.
+character; PHP, CSV, and RESP preserve decoded argument bytes.
 `--format` applies only to plain output.
+
+Use `--output json-source` to retain server identity when combining streams:
+
+```sh
+redis-monitor --output json-source production staging
+```
+
+```json
+{"timestamp":1.5,"db":0,"addr":"127.0.0.1:49152","cmd":"GET","args":["key"],"source":{"address":"redis.example:6379","name":"production"}}
+```
+
+`addr` always identifies the client. `source.address` is the monitored server's
+configured/discovered address (`host:port`, `[ipv6]:port`, or a Unix socket path),
+without authentication details. `source.name` has the same meaning as `%sn`:
+the configured instance name, or cluster node ID in CLI cluster mode; unnamed
+servers use JSON `null`. With `--stdin`, both source fields are `null`, since a
+MONITOR line does not identify the original server. An empty configured name
+remains an empty string. Records retain per-source order; merged streams have
+no global timestamp ordering guarantee.
+
+The explicit `json-source` format opts into these additional fields. Existing
+`json`, PHP, CSV, and RESP output retain their original schema and omit server
+identity; RESP remains a command array. See the reproducible
+[source-output measurements](specs/SOURCE_OUTPUT_MEASUREMENTS.md) for the
+throughput and output-size cost.
 
 | Format token | Value |
 | --- | --- |

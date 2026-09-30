@@ -1,0 +1,29 @@
+{"timestamp":1783484211.311904,"db":0,"addr":"127.0.0.1:52460","cmd":"SET","args":["key","value"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"127.0.0.1:52460","cmd":"GET","args":["key"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.3,"db":12,"addr":"10.0.0.1:6000","cmd":"PING","args":[],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.0,"db":0,"addr":"10.0.0.1:6000","cmd":"PING","args":[],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.3119,"db":3,"addr":"1.2.3.4:5","cmd":"SET","args":["a","b"],"source":{"address":null,"name":null}}
+{"timestamp":12345678901.123455,"db":0,"addr":"1.2.3.4:5","cmd":"DEL","args":["k"],"source":{"address":null,"name":null}}
+{"timestamp":0.1,"db":0,"addr":"1.2.3.4:5","cmd":"DEL","args":["k"],"source":{"address":null,"name":null}}
+{"timestamp":1.5,"db":0,"addr":"127.0.0.1:1","cmd":"FT.SEARCH","args":["idx","*"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"[2001:db8::1]:49152","cmd":"GET","args":["v6"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"[::1]:6379","cmd":"GET","args":["v6short"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"1.2.3.4:7","cmd":"GET","args":["bracketed-v4"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"/run/redis/client.sock","cmd":"GET","args":["unix"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"","cmd":"GET","args":["unix-empty"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":5,"addr":"lua","cmd":"SET","args":["from","lua"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"-","cmd":"GET","args":["unknown"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"127.0.0.1:1","cmd":"SET","args":["key","hello \"there\""],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"127.0.0.1:1","cmd":"SET","args":["\u0000�z","\\xZZ","\n\r\t\u0007\b\\"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"127.0.0.1:1","cmd":"ZADD","args":["analytics","1.5","{\"id\":\"99\",\"wp\":{\"hits\":1},\"relay\":null}"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"127.0.0.1:1","cmd":"SET","args":["terms:1","a:2:{s:11:\"description\";s:0:\"\";s:5:\"count\";s:1:\"1\";}","NX","EX","604800"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"127.0.0.1:1","cmd":"SET","args":["k","Foo\\Bar\\Baz it\\'s"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"127.0.0.1:1","cmd":"SET","args":["k","a,b","q\"uote"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"127.0.0.1:1","cmd":"SET","args":["k",""],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"127.0.0.1:1","cmd":"SET","args":["k","double spaced"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"127.0.0.1:1","cmd":"SET","args":["k","tabs"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"127.0.0.1:1","cmd":"SET","args":["k","é utf8 � raw"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"127.0.0.1:1","cmd":"SET","args":["k"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"127.0.0.1:1","cmd":"SET","args":["a\"\"b"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.999999,"db":0,"addr":"127.0.0.1:1","cmd":"get","args":["lower"],"source":{"address":null,"name":null}}
+{"timestamp":1783484211.311904,"db":0,"addr":"127.0.0.1:1","cmd":"SET","args":["k","v"],"source":{"address":null,"name":null}}

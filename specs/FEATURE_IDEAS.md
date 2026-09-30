@@ -18,6 +18,14 @@ extensions to the current pipeline over adding another processing layer.
 
 ## 1. Preserve source identity in structured output
 
+**Implemented on 2026-09-30.** `--output json-source` adds a `source` object
+with server `address` and `name`, borrowing strings prepared at connection
+setup. Unnamed instances use a null name; stdin uses null for both fields.
+Existing JSON/PHP/CSV schemas and RESP command arrays are unchanged. See the
+[output documentation](../README.md#output-and-formatting) and
+[release measurements](SOURCE_OUTPUT_MEASUREMENTS.md). The original proposal
+below is retained for context.
+
 **Current gap.** Plain output can include `%sa` and `%sn`, but JSON/PHP's
 `Structured` record and the CSV writer omit the monitored server. Their `addr`
 field identifies the client. Combining two servers into JSON therefore loses
