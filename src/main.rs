@@ -4,7 +4,6 @@
 // earlier drop is impossible or would change behavior.
 #![allow(clippy::significant_drop_tightening)]
 use std::{
-    collections::HashSet,
     path::PathBuf,
     str::FromStr,
     sync::{Arc, Mutex},
@@ -23,6 +22,7 @@ use crate::{
     filter::{Filter, FilterPattern, LineFilter},
     output::{Formatter, OutputKind},
     pipeline::{BatchConfig, IoMessage, OUTPUT_BYTE_BUDGET, Pipeline},
+    topology::ClusterGroup,
 };
 
 mod config;
@@ -31,6 +31,7 @@ mod filter;
 mod output;
 mod pipeline;
 mod stats;
+mod topology;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -88,6 +89,15 @@ struct Options {
 
     #[arg(short, long, help = "Treat each instance like its a cluster seed")]
     cluster: bool,
+
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value = "30",
+        value_parser = parse_interval,
+        help = "Refresh cluster membership this often (also for named clusters)"
+    )]
+    cluster_refresh: Duration,
 
     #[arg(short, long, help = "How to format each MONITOR line")]
     format: Option<String>,
@@ -211,7 +221,14 @@ fn parse_interval(s: &str) -> Result<Duration> {
     if secs.is_nan() || secs <= 0.0 {
         bail!("Value must be positive");
     }
-    Duration::try_from_secs_f64(secs).map_err(|_| anyhow!("Value is too large"))
+    let interval = Duration::try_from_secs_f64(secs)
+        .map_err(|_| anyhow!("Value is too large"))?;
+    if interval.is_zero()
+        || tokio::time::Instant::now().checked_add(interval).is_none()
+    {
+        bail!("Interval is outside the supported timer range");
+    }
+    Ok(interval)
 }
 
 impl Options {
@@ -286,68 +303,119 @@ impl Options {
     }
 }
 
-// Treat each instance as a cluster seed. Seeds of the same cluster discover
-// the same nodes, so each node address is monitored only once.
-fn process_cluster_instances(
+#[derive(Default)]
+struct Sources {
+    standalone: Vec<Monitor>,
+    clusters: Vec<ClusterGroup>,
+}
+
+impl Sources {
+    fn monitors(&self) -> Vec<Monitor> {
+        self.standalone
+            .iter()
+            .cloned()
+            .chain(self.clusters.iter().flat_map(ClusterGroup::monitors))
+            .collect()
+    }
+}
+
+// Preserve support for seeds from multiple clusters. Seeds discovering the same
+// cluster share a supervisor and serve as fallback candidates on later refreshes.
+async fn process_cluster_instances(
     opt: &Options,
     tls: Option<&Arc<TlsConfig>>,
     auth: &ServerAuth,
-) -> Result<Vec<Monitor>> {
-    let mut seen = HashSet::new();
-    let mut monitors = Vec::new();
-    let mut add = |id: &str, addr: &ServerAddr| {
-        if seen.insert(addr.clone()) {
-            monitors.push(Monitor::new(
-                Some(id),
-                addr.clone(),
-                tls.cloned(),
-                auth.clone(),
-            ));
-        }
-    };
-
+) -> Result<Sources> {
+    let mut sources = Sources::default();
     for input in &opt.instances {
         let address = ServerAddr::from_str(input).with_context(|| {
             format!("Invalid Redis Cluster seed address '{input}'")
         })?;
         let cluster = Cluster::from_seed(&address, auth, tls.map(Arc::as_ref))
+            .await
             .with_context(|| {
                 format!(
                     "Failed to discover a Redis Cluster from seed '{input}' \
-                 (resolved to {address}). The seed must be reachable and have \
-                 Redis Cluster enabled; remove --cluster to monitor a \
-                 standalone instance"
+                     (resolved to {address}). The seed must be reachable and have \
+                     Redis Cluster enabled; remove --cluster to monitor a \
+                     standalone instance"
                 )
             })?;
-
-        for primary in cluster.get_nodes() {
-            add(&primary.id, &primary.addr);
-            if opt.replicas {
-                for replica in &primary.replicas {
-                    add(&replica.id, &replica.addr);
-                }
+        let mut group = ClusterGroup {
+            name: None,
+            seeds: vec![address],
+            auth: auth.clone(),
+            tls: tls.cloned(),
+            replicas: opt.replicas,
+            cluster,
+        };
+        let mut index = 0;
+        while index < sources.clusters.len() {
+            if sources.clusters[index].overlaps(&group) {
+                let previous = sources.clusters.swap_remove(index);
+                group.seeds.extend(previous.seeds);
+            } else {
+                index += 1;
             }
         }
+        sources.clusters.push(group);
     }
-
-    Ok(monitors)
+    Ok(sources)
 }
 
-// Take the array of instances provided on the command line and attempt to map
-// them to one or more instances. These can either be named instances like
-// mycluster` which were loaded from our config file, or be in some parsable
-// form like "host:port", or "redis://...".
-fn process_instances(
+async fn process_instances(
     cfg: &Map,
     opt: &Options,
     tls: Option<&Arc<TlsConfig>>,
     auth: &ServerAuth,
-) -> Result<Vec<Monitor>> {
-    let mut monitors = Vec::new();
-
+) -> Result<Sources> {
+    let mut sources = Sources::default();
     for instance in &opt.instances {
         if let Some(entry) = cfg.get(instance) {
-            monitors.extend(Monitor::from_config_entry(instance, entry)?);
+            let addresses = entry.get_addresses().with_context(|| {
+                format!("Invalid configuration for instance '{instance}'")
+            })?;
+            let tls = entry
+                .get_tls_config()
+                .with_context(|| {
+                    format!("Failed to configure TLS for instance '{instance}'")
+                })?
+                .map(Arc::new);
+            let auth = entry.get_auth();
+            if entry.cluster {
+                // Selecting the same named cluster twice should not duplicate
+                // its discovery loop or its MONITOR connections.
+                if sources
+                    .clusters
+                    .iter()
+                    .any(|c| c.name.as_ref() == Some(instance))
+                {
+                    continue;
+                }
+                let cluster = Cluster::from_seeds(&addresses, &auth, tls.as_deref())
+                    .await.with_context(|| {
+                        format!("Failed to discover the cluster for configured instance '{instance}'")
+                    })?;
+                sources.clusters.push(ClusterGroup {
+                    name: Some(instance.clone()),
+                    seeds: addresses,
+                    auth,
+                    tls,
+                    replicas: opt.replicas,
+                    cluster,
+                });
+            } else {
+                sources.standalone.extend(addresses.into_iter().map(
+                    |address| {
+                        Monitor::new(
+                            Some(instance),
+                            address,
+                            tls.clone(),
+                            auth.clone(),
+                        )
+                    },
+                ));
+            }
         } else {
             let address = ServerAddr::from_str(instance).with_context(|| {
                 format!(
@@ -355,7 +423,7 @@ fn process_instances(
                      configuration entry with that name exists"
                 )
             })?;
-            monitors.push(Monitor::new(
+            sources.standalone.push(Monitor::new(
                 None,
                 address,
                 tls.cloned(),
@@ -363,8 +431,7 @@ fn process_instances(
             ));
         }
     }
-
-    Ok(monitors)
+    Ok(sources)
 }
 
 fn version_string() -> String {
@@ -465,19 +532,27 @@ async fn run_wire(opt: Options, shutdown: watch::Sender<bool>) -> Result<()> {
     let auth = opt.get_server_auth();
     let opt = Options { instances, ..opt };
 
-    // Cluster discovery uses blocking connections. It runs before any source
-    // task starts, so there is nothing else for it to block.
-    let monitors = if opt.cluster {
-        process_cluster_instances(&opt, tls.as_ref(), &auth)?
-    } else {
-        process_instances(&cfg, &opt, tls.as_ref(), &auth)?
+    let mut stopping = shutdown.subscribe();
+    let sources = tokio::select! {
+        biased;
+        _ = stopping.wait_for(|stop| *stop) => return Ok(()),
+        sources = async {
+            if opt.cluster {
+                process_cluster_instances(&opt, tls.as_ref(), &auth).await
+            } else {
+                process_instances(&cfg, &opt, tls.as_ref(), &auth).await
+            }
+        } => sources?,
     };
+    let monitors = sources.monitors();
 
-    let format = opt.format.as_deref().unwrap_or(if monitors.len() > 1 {
-        DEFAULT_MULTI_FORMAT
-    } else {
-        DEFAULT_SINGLE_FORMAT
-    });
+    let format = opt.format.as_deref().unwrap_or(
+        if monitors.len() > 1 || !sources.clusters.is_empty() {
+            DEFAULT_MULTI_FORMAT
+        } else {
+            DEFAULT_SINGLE_FORMAT
+        },
+    );
     let (pipeline, output) = start_pipeline(&opt, format, &shutdown)?;
     let io = pipeline.io.clone();
 
@@ -485,25 +560,39 @@ async fn run_wire(opt: Options, shutdown: watch::Sender<bool>) -> Result<()> {
         .await?;
 
     let mut tasks = JoinSet::new();
-    for mon in monitors {
-        tasks.spawn(pipeline::run_monitor(
-            mon,
+    for mon in sources.standalone {
+        let pipeline = pipeline.clone();
+        let shutdown = shutdown.subscribe();
+        tasks.spawn(async move {
+            pipeline::run_monitor(mon, pipeline, shutdown).await;
+            Ok(())
+        });
+    }
+    for group in sources.clusters {
+        tasks.spawn(topology::run(
+            group,
+            opt.cluster_refresh,
             pipeline.clone(),
             shutdown.subscribe(),
         ));
     }
     drop(pipeline);
 
+    let mut failure = None;
     while let Some(result) = tasks.join_next().await {
-        if let Err(e) = result {
-            eprintln!("Monitor task failed: {e}");
+        if let Err(error) = result
+            .context("Monitor supervisor task failed")
+            .and_then(|r| r)
+        {
+            failure.get_or_insert(error);
+            shutdown.send_replace(true);
         }
     }
 
     pipeline::finish_output(io, output).await?;
     pipeline::print_final_stats();
 
-    Ok(())
+    failure.map_or(Ok(()), Err)
 }
 
 async fn run(opt: Options, shutdown: watch::Sender<bool>) -> Result<()> {
@@ -670,8 +759,31 @@ mod tests {
     #[test]
     fn stats_interval_must_be_positive_and_finite() {
         assert_eq!(parse_interval("0.5").unwrap(), Duration::from_millis(500));
-        for bad in ["0", "-1", "nan", "inf", "1e300", "x"] {
+        for bad in ["0", "-1", "nan", "inf", "1e300", "1e-30", "1e19", "x"] {
             assert!(parse_interval(bad).is_err(), "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn cluster_refresh_interval_is_configurable_and_positive() {
+        let default = Options::try_parse_from(["redis-monitor"]).unwrap();
+        assert_eq!(default.cluster_refresh, Duration::from_secs(30));
+        let configured = Options::try_parse_from([
+            "redis-monitor",
+            "--cluster-refresh",
+            "0.5",
+        ])
+        .unwrap();
+        assert_eq!(configured.cluster_refresh, Duration::from_millis(500));
+        for bad in ["0", "-1", "nan", "inf", "1e-30"] {
+            assert!(
+                Options::try_parse_from([
+                    "redis-monitor",
+                    "--cluster-refresh",
+                    bad,
+                ])
+                .is_err()
+            );
         }
     }
 

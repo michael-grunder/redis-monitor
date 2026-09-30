@@ -1062,7 +1062,7 @@ pub async fn finish_output(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use redis_monitor::commands;
     use tokio::io::AsyncWriteExt;
 
@@ -1082,7 +1082,7 @@ mod tests {
         )
     }
 
-    fn test_io(
+    pub fn test_io(
         capacity: usize,
         byte_budget: usize,
     ) -> (IoHandle, flume::Receiver<IoMessage>) {
@@ -1090,7 +1090,7 @@ mod tests {
         (IoHandle::new(tx, byte_budget), rx)
     }
 
-    fn pipeline(io: IoHandle, batch: BatchConfig) -> Pipeline {
+    pub fn pipeline(io: IoHandle, batch: BatchConfig) -> Pipeline {
         Pipeline {
             io,
             filter: empty_filter(),

@@ -1,6 +1,6 @@
 use std::string::ToString;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     convert::AsRef,
     fs,
     hash::{Hash, Hasher},
@@ -10,12 +10,13 @@ use std::{
     pin::Pin,
     str::FromStr,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::BytesMut;
 use redis::{
-    Client, ClientTlsConfig, Connection, ConnectionAddr, IntoConnectionInfo,
+    Client, ClientTlsConfig, ConnectionAddr, IntoConnectionInfo,
     RedisConnectionInfo, TlsCertificates, Value,
 };
 use rustls::client::danger::ServerCertVerifier;
@@ -30,7 +31,7 @@ use tokio::{
 };
 use tokio_rustls::{TlsConnector, client::TlsStream as ClientTlsStream};
 
-use crate::{ServerAuth, config::Entry};
+use crate::ServerAuth;
 
 #[derive(Debug)]
 pub enum Stream {
@@ -225,19 +226,6 @@ impl ServerAddr {
     pub fn from_path<T: AsRef<str>>(path: T) -> Self {
         Self::Unix(path.as_ref().to_string())
     }
-
-    fn get_connection(
-        &self,
-        auth: &ServerAuth,
-        tls: Option<&TlsConfig>,
-    ) -> Result<Connection> {
-        let cli = client(self, auth, tls)?;
-        let con = cli.get_connection().map_err(|e| {
-            anyhow!("Failed to get connection from client: {e}")
-        })?;
-
-        Ok(con)
-    }
 }
 
 /// Build a `redis` crate client for an auxiliary (non-MONITOR) connection
@@ -386,6 +374,11 @@ impl Cluster {
                          {port}"
                     )
                 })?;
+                if host.is_empty() || id.is_empty() || port == 0 {
+                    bail!(
+                        "Redis Cluster returned an empty host/ID or zero port"
+                    );
+                }
                 Ok((
                     String::from_utf8_lossy(host).to_string(),
                     port,
@@ -422,23 +415,37 @@ impl Cluster {
             .collect()
     }
 
-    pub fn from_seed(
+    pub async fn from_seed(
         seed: &ServerAddr,
         auth: &ServerAuth,
         tls: Option<&TlsConfig>,
     ) -> Result<Self> {
-        let mut con = seed.get_connection(auth, tls)?;
-        Ok(Self::new(Self::exec_slots(&mut con)?))
+        // This includes connection setup, authentication, and the query. Dropping
+        // the async future cancels discovery during shutdown.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut con = client(seed, auth, tls)?
+                .get_multiplexed_async_connection()
+                .await
+                .context("Failed to connect for cluster discovery")?;
+            let value = redis::cmd("CLUSTER")
+                .arg("SLOTS")
+                .query_async(&mut con)
+                .await
+                .context("Failed to execute CLUSTER SLOTS")?;
+            Self::from_slots(value)
+        })
+        .await
+        .context("Cluster discovery timed out after 10 seconds")?
     }
 
-    pub fn from_seeds(
+    pub async fn from_seeds(
         seeds: &[ServerAddr],
         auth: &ServerAuth,
         tls: Option<&TlsConfig>,
     ) -> Result<Self> {
         let mut last_error = None;
         for seed in seeds {
-            match Self::from_seed(seed, auth, tls) {
+            match Self::from_seed(seed, auth, tls).await {
                 Ok(cluster) => return Ok(cluster),
                 Err(error) => last_error = Some((seed, error)),
             }
@@ -456,13 +463,10 @@ impl Cluster {
         })
     }
 
-    fn exec_slots(con: &mut Connection) -> Result<HashSet<ClusterNode>> {
-        let mut primaries = HashSet::new();
-
-        let value = redis::cmd("CLUSTER")
-            .arg("SLOTS")
-            .query(con)
-            .map_err(|e| anyhow!("Failed to execute CLUSTER SLOTS: {e}"))?;
+    pub(crate) fn from_slots(value: Value) -> Result<Self> {
+        let mut primaries: HashSet<ClusterNode> = HashSet::new();
+        let mut identities = HashMap::new();
+        let mut addresses = HashMap::new();
 
         let Value::Array(items) = value else {
             bail!("CLUSTER SLOTS returned a non-array response");
@@ -479,6 +483,11 @@ impl Cluster {
                     item.len()
                 );
             }
+            if !matches!((&item[0], &item[1]), (Value::Int(start), Value::Int(end))
+                if (0..=16383).contains(start) && (*start..=16383).contains(end))
+            {
+                bail!("Invalid CLUSTER SLOTS range at entry {slot_index}");
+            }
 
             let entries = Self::parse_nodes(&item[2..]).with_context(|| {
                 format!("Invalid CLUSTER SLOTS entry {slot_index}")
@@ -489,12 +498,30 @@ impl Cluster {
                      primary node"
                 );
             };
+            for (index, (host, port, id)) in entries.iter().enumerate() {
+                let address = ServerAddr::from_tcp_addr(host, *port);
+                let identity = (address.clone(), index == 0);
+                if identities
+                    .insert(id.clone(), identity.clone())
+                    .is_some_and(|old| old != identity)
+                    || addresses
+                        .insert(address, id.clone())
+                        .is_some_and(|old| old != *id)
+                {
+                    bail!(
+                        "CLUSTER SLOTS returned conflicting identities or roles for node {id}"
+                    );
+                }
+            }
             let mut primary: ClusterNode = primary.into();
 
             for replica in replicas {
                 primary.add_replica(replica.into());
             }
 
+            if let Some(previous) = primaries.take(&primary) {
+                primary.replicas.extend(previous.replicas);
+            }
             primaries.insert(primary);
         }
 
@@ -502,7 +529,7 @@ impl Cluster {
             bail!("CLUSTER SLOTS returned no primary nodes");
         }
 
-        Ok(primaries)
+        Ok(Self::new(primaries))
     }
 
     pub fn get_nodes(&self) -> Vec<ClusterNode> {
@@ -511,50 +538,6 @@ impl Cluster {
 }
 
 impl Monitor {
-    pub fn from_config_entry(name: &str, entry: &Entry) -> Result<Vec<Self>> {
-        let addresses = entry.get_addresses().with_context(|| {
-            format!("Invalid configuration for instance '{name}'")
-        })?;
-        let tls = entry
-            .get_tls_config()
-            .with_context(|| {
-                format!("Failed to configure TLS for instance '{name}'")
-            })?
-            .map(Arc::new);
-
-        if entry.cluster {
-            let c = Cluster::from_seeds(
-                &addresses,
-                &entry.get_auth(),
-                tls.as_deref(),
-            )
-            .with_context(|| {
-                format!(
-                    "Failed to discover the cluster for configured instance \
-                     '{name}'"
-                )
-            })?;
-            Ok(c.get_nodes()
-                .into_iter()
-                .map(|primary| {
-                    Self::new(
-                        Some(name),
-                        primary.addr,
-                        tls.clone(),
-                        entry.get_auth(),
-                    )
-                })
-                .collect())
-        } else {
-            Ok(addresses
-                .into_iter()
-                .map(|addr| {
-                    Self::new(Some(name), addr, tls.clone(), entry.get_auth())
-                })
-                .collect())
-        }
-    }
-
     pub fn new(
         name: Option<&str>,
         address: ServerAddr,

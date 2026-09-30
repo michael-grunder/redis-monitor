@@ -153,6 +153,13 @@ accept-most and reject-most cases.
 
 ## 6. Refresh cluster membership while running
 
+**Implemented on 2026-09-30.** Membership now refreshes by default every 30
+seconds, configurable with `--cluster-refresh`, using asynchronous discovery
+and draining reconciliation. `--replicas` applies to named clusters as well.
+The original proposal below is retained for context; startup CLI seeds still
+must each be reachable, while periodic discovery uses candidate fallback. See
+the [current behavior](../README.md#connections-and-named-instances).
+
 **Current gap.** Discovery creates a fixed list of monitors at startup.
 `run_monitor` reconnects to its original address, but there is no supervisor
 reconciling that list with later cluster membership or role changes. Named

@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Refresh cluster membership every 30 seconds, configurable with
+  `--cluster-refresh SECONDS`, for CLI and named clusters. Preserve unchanged
+  connections, reconcile node/role/address changes, and retain the last topology
+  if discovery fails. Drain retiring monitors before starting additions so slow
+  output cannot accumulate generations of blocked tasks.
 - Add `--threads N` to set the number of worker threads that read, filter, and
   format records (default: available CPUs, at most 16).
 - Expose allocation-free MONITOR record parsing as `redis_monitor::monitor`
@@ -34,6 +39,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- Use cancellable asynchronous cluster discovery with a 10-second timeout per
+  candidate, trying known members before original seeds during refresh. Apply
+  `--replicas` to named clusters too, and use the multi-source plain format for
+  clusters even when initially monitoring one node.
 - Format records in each source's task on a multi-threaded runtime instead of
   on the single output thread, which now only writes finished bytes. Throughput
   with many sources now scales with cores: 8 fast sources went from 3.3 to 30.7
@@ -98,6 +107,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Tests/CI
 
+- Cover cluster refresh failures, promotion, address changes, repeated remaps,
+  seed fallback/deduplication, named cluster settings, malformed topology, and
+  cancellation during initial and periodic discovery. Add a finite multi-source
+  release replay workload in `benches/cluster_refresh.py`.
 - Add byte-for-byte golden tests of every output kind and several plain formats
   over an adversarial record corpus, including one-byte-at-a-time input.
 - Add parser tests for every client form, numeric bounds, error offsets,

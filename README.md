@@ -60,6 +60,7 @@ redis-monitor host1:6379 host2:6379
 # Discover cluster primaries, and optionally include replicas
 redis-monitor --cluster 6379
 redis-monitor --cluster --replicas 6379
+redis-monitor --cluster --cluster-refresh 10 6379
 
 # Match command names (case-insensitive substrings), or exclude them
 redis-monitor --filter get --filter set
@@ -137,8 +138,35 @@ and TLS settings, without inheriting the CLI connection options.
 A named entry with `cluster = true` tries its seeds until discovery succeeds
 and monitors primaries. The CLI `--cluster` mode instead treats every positional
 argument as a direct seed address, bypassing named entries, and every seed must
-be reachable. `--replicas` applies only to that CLI cluster mode. Discovery runs
-at startup; it is not periodically refreshed.
+be reachable at startup. Seeds discovering the same cluster share one set of
+monitor connections. `--replicas` includes replicas for both CLI and named
+clusters.
+
+Cluster membership refreshes every 30 seconds by default. Set
+`--cluster-refresh SECONDS` to a positive interval (fractional seconds are
+accepted). Each cluster waits that interval after the previous refresh finishes;
+refreshes never overlap for the same cluster. Standalone instances and stdin do
+not perform discovery. Cluster plain output uses the multi-source default even
+when discovery initially finds only one node, so later additions have a visible
+server address.
+
+Discovery uses separate asynchronous connections with the cluster's credentials
+and TLS settings. It tries known members, including replicas, then configured
+seeds, with a 10-second timeout per candidate. Failed or malformed refreshes
+report a diagnostic and retain the previous topology. Shutdown cancels discovery,
+including initial discovery.
+
+Unchanged node IDs and addresses keep their existing connections; slot movement
+alone does not reconnect them. New primaries are added, removed nodes are
+stopped, and address changes replace the affected connections. With `--replicas`,
+a role change keeps the connection if that node is still selected. Retiring
+connections drain pending output before additions start; slow output can delay
+reconciliation, and further refreshes retain only the latest desired topology.
+This prevents accumulating blocked generations of connections. Monitoring does
+not recover records missed before a new connection is established, and there is
+still no global timestamp ordering or exactly-once guarantee across topology
+changes. Discovery follows nodes reported by `CLUSTER SLOTS`; primaries without
+assigned slots are not included.
 
 Use CLI `--format` to control plain output. Per-entry `format` and `color`
 settings are currently accepted but do not affect output; `--no-color` also has
@@ -434,6 +462,11 @@ Normal tests use local fixtures and temporary loopback listeners; they do not
 require a running Redis server. Manual benchmarks and the live-server comparison
 are separate opt-in checks. See [AGENTS.md](AGENTS.md) for contribution and
 performance requirements, and [CHANGELOG.md](CHANGELOG.md) for unreleased changes.
+
+The finite multi-source replay in `benches/cluster_refresh.py` checks output
+counts while exercising periodic discovery, filtering, JSON/plain output, and
+slow consumers. See [cluster refresh measurements](specs/CLUSTER_REFRESH_MEASUREMENTS.md)
+for portable release comparisons and reproduction commands.
 
 `tests/golden_output.rs` replays an adversarial corpus
 (`tests/fixtures/golden/input.log`) through every output kind and several plain
