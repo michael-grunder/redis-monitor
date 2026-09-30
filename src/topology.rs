@@ -1,6 +1,10 @@
 //! Cold-path cluster discovery and connection reconciliation. Record processing
 //! stays in the existing source tasks; unchanged nodes retain those tasks.
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use tokio::{sync::watch, task::JoinSet};
@@ -27,26 +31,23 @@ struct Target {
 
 impl ClusterGroup {
     fn targets(&self) -> HashMap<ServerAddr, Target> {
-        let mut targets = HashMap::new();
-        for primary in self.cluster.get_nodes() {
-            let nodes = std::iter::once(&primary)
-                .chain(primary.replicas.iter().filter(|_| self.replicas));
-            for node in nodes {
-                targets.insert(
-                    node.addr.clone(),
-                    Target {
-                        id: node.id.clone(),
-                        monitor: Monitor::new(
-                            Some(self.name.as_deref().unwrap_or(&node.id)),
-                            node.addr.clone(),
-                            self.tls.clone(),
-                            self.auth.clone(),
-                        ),
-                    },
-                );
-            }
-        }
-        targets
+        self.cluster
+            .nodes()
+            .iter()
+            .filter(|node| node.primary || self.replicas)
+            .map(|node| {
+                let target = Target {
+                    id: node.id.clone(),
+                    monitor: Monitor::new(
+                        Some(self.name.as_deref().unwrap_or(&node.id)),
+                        node.addr.clone(),
+                        self.tls.clone(),
+                        self.auth.clone(),
+                    ),
+                };
+                (node.addr.clone(), target)
+            })
+            .collect()
     }
 
     pub fn monitors(&self) -> Vec<Monitor> {
@@ -56,30 +57,28 @@ impl ClusterGroup {
     /// CLI arguments may name multiple seeds of the same cluster, or distinct
     /// clusters. Merge overlapping discoveries so one node gets one monitor.
     pub fn overlaps(&self, other: &Self) -> bool {
-        let ids = |cluster: &Cluster| {
-            cluster
-                .get_nodes()
-                .into_iter()
-                .flat_map(|node| {
-                    std::iter::once(node.id)
-                        .chain(node.replicas.into_iter().map(|r| r.id))
-                })
-                .collect::<std::collections::HashSet<_>>()
-        };
-        !ids(&self.cluster).is_disjoint(&ids(&other.cluster))
+        let ids: HashSet<&str> =
+            self.cluster.nodes().iter().map(|n| n.id.as_str()).collect();
+        other
+            .cluster
+            .nodes()
+            .iter()
+            .any(|node| ids.contains(node.id.as_str()))
     }
 
     async fn refresh(&self) -> Result<Cluster> {
         // Prefer the last known members, so losing an original seed does not
         // prevent future refreshes. Try replicas too, even in primary-only mode.
-        let mut candidates = Vec::new();
-        for primary in self.cluster.get_nodes() {
-            candidates.push(primary.addr);
-            candidates.extend(primary.replicas.into_iter().map(|n| n.addr));
-        }
-        candidates.extend(self.seeds.iter().cloned());
-        let mut seen = std::collections::HashSet::new();
-        candidates.retain(|address| seen.insert(address.clone()));
+        let mut seen = HashSet::new();
+        let candidates: Vec<ServerAddr> = self
+            .cluster
+            .nodes()
+            .iter()
+            .map(|node| &node.addr)
+            .chain(&self.seeds)
+            .filter(|address| seen.insert(*address))
+            .cloned()
+            .collect();
         Cluster::from_seeds(&candidates, &self.auth, self.tls.as_deref()).await
     }
 }
@@ -516,7 +515,7 @@ mod tests {
         let (cluster, ()) = tokio::join!(group.refresh(), async {
             member.query().await.send(reply(&[("a", port)])).unwrap();
         });
-        assert_eq!(cluster.unwrap().get_nodes()[0].addr, member.address());
+        assert_eq!(cluster.unwrap().nodes()[0].addr, member.address());
     }
 
     #[tokio::test]
@@ -535,7 +534,7 @@ mod tests {
                     .unwrap();
                 healthy.query().await.send(reply(&[("b", port)])).unwrap();
             });
-        assert_eq!(cluster.unwrap().get_nodes()[0].addr, healthy.address());
+        assert_eq!(cluster.unwrap().nodes()[0].addr, healthy.address());
     }
 
     #[tokio::test]

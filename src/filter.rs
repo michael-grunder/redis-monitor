@@ -1,8 +1,11 @@
-use std::{borrow::Cow, collections::BTreeMap, fmt, str::FromStr};
+use std::{collections::BTreeMap, fmt, str::FromStr};
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use anyhow::{Context, Result};
-use redis_monitor::{commands, monitor};
+use redis_monitor::{
+    commands,
+    monitor::{self, Args},
+};
 use regex::bytes::Regex;
 
 #[derive(Debug, Clone)]
@@ -189,52 +192,23 @@ impl Filter {
         &self,
         values: impl IntoIterator<Item = &'a [u8]>,
     ) -> bool {
-        // Preserve the simple loop for existing filters without selectors.
-        if self.positioned.is_empty() {
-            let mut included = !self.has_includes;
-            for value in values {
-                if self.unscoped.excludes(value) {
-                    return false;
-                }
-                if !included {
-                    included = self.unscoped.includes(value);
-                }
-                if included && !self.has_excludes {
-                    return true;
-                }
-            }
-            return included;
-        }
         let mut included = !self.has_includes;
         let mut positioned = self.positioned.iter().peekable();
         for (index, value) in values.into_iter().enumerate() {
-            if self.unscoped.excludes(value) {
+            if !self.unscoped.admit(value, &mut included) {
                 return false;
             }
-            if !included {
-                included = self.unscoped.includes(value);
-            }
-            if positioned
-                .peek()
-                .is_some_and(|group| group.position == index)
+            if let Some(group) =
+                positioned.next_if(|group| group.position == index)
+                && !group.matchers.admit(value, &mut included)
             {
-                // peek established that this group exists at the current index.
-                let group =
-                    positioned.next().expect("positioned matcher present");
-                if group.matchers.excludes(value) {
-                    return false;
-                }
-                if !included {
-                    included = group.matchers.includes(value);
-                }
+                return false;
             }
             if included && !self.has_excludes {
                 return true;
             }
-            if positioned.peek().is_none()
-                && self.unscoped.include.is_empty()
-                && self.unscoped.exclude.is_empty()
-            {
+            // Later values can neither match nor veto.
+            if positioned.peek().is_none() && self.unscoped.is_empty() {
                 return included;
             }
         }
@@ -242,12 +216,38 @@ impl Filter {
     }
 
     #[inline]
+    /// Match the command name alone: position 0 of the arguments. This is
+    /// the per-record path for unindexed `--filter` patterns, so it avoids
+    /// the general iterator.
     pub fn matches(&self, command: &[u8]) -> bool {
-        self.is_empty() || self.matches_values(std::iter::once(command))
+        if self.is_empty() {
+            return true;
+        }
+        let mut included = !self.has_includes;
+        let first = self.positioned.first().filter(|group| group.position == 0);
+        self.unscoped.admit(command, &mut included)
+            && first.is_none_or(|group| {
+                group.matchers.admit(command, &mut included)
+            })
+            && included
     }
 }
 
 impl Matchers {
+    const fn is_empty(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
+    }
+
+    /// Record whether `value` is included; returns false if it is excluded.
+    #[inline]
+    fn admit(&self, value: &[u8], included: &mut bool) -> bool {
+        if self.excludes(value) {
+            return false;
+        }
+        *included = *included || self.includes(value);
+        true
+    }
+
     fn includes(&self, value: &[u8]) -> bool {
         self.include.iter().any(|matcher| matcher.is_match(value))
     }
@@ -405,7 +405,7 @@ impl LineFilter {
         &self,
         commands: Option<&commands::Lookup>,
         line: &'a [u8],
-        args: &mut Vec<Cow<'a, [u8]>>,
+        args: &mut Args<'a>,
     ) -> bool {
         if self.empty {
             return true;
@@ -450,9 +450,9 @@ impl LineFilter {
         let Ok(record) = monitor::Record::parse(line) else {
             return false;
         };
-        if record.decode_args(args).is_err() {
+        let Ok(args) = args.decode(&record) else {
             return false;
-        }
+        };
         let cmd = record.cmd;
         if positional_args
             && !self.names.matches_values(
@@ -595,6 +595,28 @@ mod tests {
             b"other",
             b"foo"
         ]));
+    }
+
+    #[test]
+    fn command_matching_agrees_with_the_general_matcher() {
+        let values: [&[u8]; 4] = [b"GET", b"get", b"SET", b""];
+        for patterns in [
+            &["GET"][..],
+            &["!GET"],
+            &["[0]/^G/", "!SET"],
+            &["/E/", "[1]x"],
+            &["[1]x"],
+            &["![0]get", "set"],
+        ] {
+            let filter = filter(patterns);
+            for value in values {
+                assert_eq!(
+                    filter.matches(value),
+                    filter.matches_values([value]),
+                    "{patterns:?} {value:?}"
+                );
+            }
+        }
     }
 
     #[test]

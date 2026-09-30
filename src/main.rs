@@ -17,7 +17,7 @@ use redis_monitor::commands::{self, Categories, Flags};
 use tokio::{sync::watch, task::JoinSet};
 
 use crate::{
-    config::{Map, ServerAuth},
+    config::{ConnectionArgs, Map, ServerAuth},
     connection::{Cluster, Monitor, ServerAddr, TlsConfig},
     filter::{Filter, FilterPattern, LineFilter},
     output::{Formatter, OutputKind},
@@ -56,7 +56,8 @@ mod topology;
   Plain default: "%t [%d %ca] %l". --source prefixes "[address name] ".
   Structured --format selects native fields, e.g. "%t %C %a".
   Separate fields with spaces or commas; literals and duplicates are errors.
-  Without --format, each output uses its direct default serializer.
+  Without --format, JSON, PHP, and CSV use "%t %d %ca %C %a"; RESP sends
+  the command and its arguments as one array.
 
 Examples:
   # Monitor localhost:6379 by default
@@ -118,11 +119,8 @@ struct Options {
     #[arg(long, help = "Only show commands for a specific database")]
     db: Option<u64>,
 
-    #[arg(short, long, help = "Redis user")]
-    user: Option<String>,
-
-    #[arg(short, long, short_alias = 'a', help = "Redis password")]
-    pass: Option<String>,
+    #[command(flatten)]
+    connection: ConnectionArgs,
 
     #[clap(long, action = clap::ArgAction::Append,
            help = "Filter command names, or [N] arguments (command is 0); /regex/, =literal, !exclude")]
@@ -147,21 +145,6 @@ struct Options {
         help = "How to serialize the output. Values: plain, json, php, csv, resp"
     )]
     output: OutputKind,
-
-    #[arg(long, help = "Connect using TLS")]
-    tls: bool,
-
-    #[arg(long, help = "Disable TLS certificate verification")]
-    insecure: bool,
-
-    #[arg(long, help = "Path to CA cert for TLS")]
-    tls_ca: Option<PathBuf>,
-
-    #[arg(long, help = "Path to client cert for TLS")]
-    tls_cert: Option<PathBuf>,
-
-    #[arg(long, help = "Path to client private key for TLS")]
-    tls_key: Option<PathBuf>,
 
     #[arg(short, long, help = "Display the version and exit")]
     version: bool,
@@ -264,23 +247,6 @@ impl Options {
         })
     }
 
-    fn get_tls_config(&self) -> Result<Option<Arc<TlsConfig>>> {
-        if self.tls {
-            Ok(Some(Arc::new(TlsConfig::new(
-                self.insecure,
-                self.tls_ca.as_deref(),
-                self.tls_cert.as_deref(),
-                self.tls_key.as_deref(),
-            )?)))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn get_server_auth(&self) -> ServerAuth {
-        ServerAuth::from_user_pass(self.user.as_deref(), self.pass.as_deref())
-    }
-
     fn line_filter(&self) -> Result<LineFilter> {
         let names = Filter::for_command(self.filter.clone())?;
         let flags = Self::parse_flags(self.flags.iter().map(String::as_str))?;
@@ -377,13 +343,10 @@ async fn process_instances(
             let addresses = entry.get_addresses().with_context(|| {
                 format!("Invalid configuration for instance '{instance}'")
             })?;
-            let tls = entry
-                .get_tls_config()
-                .with_context(|| {
-                    format!("Failed to configure TLS for instance '{instance}'")
-                })?
-                .map(Arc::new);
-            let auth = entry.get_auth();
+            let tls = entry.connection.tls_config().with_context(|| {
+                format!("Failed to configure TLS for instance '{instance}'")
+            })?;
+            let auth = entry.connection.auth();
             if entry.cluster {
                 // Selecting the same named cluster twice should not duplicate
                 // its discovery loop or its MONITOR connections.
@@ -533,8 +496,8 @@ async fn run_wire(opt: Options, shutdown: watch::Sender<bool>) -> Result<()> {
         opt.instances.clone()
     };
 
-    let tls = opt.get_tls_config()?;
-    let auth = opt.get_server_auth();
+    let tls = opt.connection.tls_config()?;
+    let auth = opt.connection.auth();
     let opt = Options { instances, ..opt };
 
     let mut stopping = shutdown.subscribe();
@@ -662,6 +625,8 @@ mod tests {
 
     use redis_monitor::commands::Command;
 
+    use redis_monitor::monitor::Args;
+
     use super::*;
     fn empty_filter() -> LineFilter {
         LineFilter::new(
@@ -704,24 +669,24 @@ mod tests {
         assert!(filter.matches(
             None,
             br#"1.0 [3 127.0.0.1:1] "GET" "k""#,
-            &mut Vec::new()
+            &mut Args::default()
         ));
         assert!(!filter.matches(
             None,
             br#"1.0 [0 127.0.0.1:1] "GET" "k""#,
-            &mut Vec::new()
+            &mut Args::default()
         ));
         assert!(!filter.matches(
             None,
             br#"1.0 [30 127.0.0.1:1] "GET" "k""#,
-            &mut Vec::new()
+            &mut Args::default()
         ));
-        assert!(!filter.matches(None, b"1.0 ", &mut Vec::new()));
-        assert!(!filter.matches(None, b"OK", &mut Vec::new()));
+        assert!(!filter.matches(None, b"1.0 ", &mut Args::default()));
+        assert!(!filter.matches(None, b"OK", &mut Args::default()));
         assert!(!filter.matches(
             None,
             br#"1.0 [99999999999999999999 127.0.0.1:1] "GET""#,
-            &mut Vec::new()
+            &mut Args::default()
         ));
     }
 
@@ -734,12 +699,12 @@ mod tests {
         assert!(filter.matches(
             None,
             br#"1.0 [2 127.0.0.1:1] "GET""#,
-            &mut Vec::new()
+            &mut Args::default()
         ));
         assert!(!filter.matches(
             None,
             br#"1.0 [1 127.0.0.1:1] "GET""#,
-            &mut Vec::new()
+            &mut Args::default()
         ));
     }
 
@@ -835,7 +800,7 @@ mod tests {
             (br#"broken "GET" "user:1""#, false),
         ] {
             assert_eq!(
-                filter.matches(Some(&lookup), line, &mut Vec::new()),
+                filter.matches(Some(&lookup), line, &mut Args::default()),
                 expected,
                 "{line:?}"
             );
@@ -856,17 +821,17 @@ mod tests {
         assert!(filter.matches(
             Some(&lookup),
             br#"1.0 [2 127.0.0.1:1] "SET" "user:1" "v""#,
-            &mut Vec::new()
+            &mut Args::default()
         ));
         assert!(!filter.matches(
             Some(&lookup),
             br#"1.0 [0 127.0.0.1:1] "SET" "user:1" "v""#,
-            &mut Vec::new()
+            &mut Args::default()
         ));
         assert!(!filter.matches(
             Some(&lookup),
             br#"1.0 [2 127.0.0.1:1] "GET" "user:1""#,
-            &mut Vec::new()
+            &mut Args::default()
         ));
     }
 
@@ -885,7 +850,11 @@ mod tests {
                 line.push('"');
             }
             assert_eq!(
-                filter.matches(Some(&lookup), line.as_bytes(), &mut Vec::new()),
+                filter.matches(
+                    Some(&lookup),
+                    line.as_bytes(),
+                    &mut Args::default()
+                ),
                 case.keys.contains(&b"a".as_slice()),
                 "{line}"
             );
@@ -894,13 +863,13 @@ mod tests {
         assert!(filter.matches(
             Some(&lookup),
             br#"1.0 [0 127.0.0.1:1] "GET" "user:\xff\x00""#,
-            &mut Vec::new()
+            &mut Args::default()
         ));
         let filter = key_filter(&["/^$/"]);
         assert!(filter.matches(
             Some(&lookup),
             br#"1.0 [0 127.0.0.1:1] "GET" """#,
-            &mut Vec::new()
+            &mut Args::default()
         ));
     }
 
@@ -909,12 +878,12 @@ mod tests {
         let lookup = key_fixture::lookup();
         let filter = key_filter(&["!private"]);
         let ping = br#"1.0 [0 127.0.0.1:1] "PING""#;
-        assert!(filter.matches(Some(&lookup), ping, &mut Vec::new()));
-        assert!(!filter.matches(None, ping, &mut Vec::new()));
+        assert!(filter.matches(Some(&lookup), ping, &mut Args::default()));
+        assert!(!filter.matches(None, ping, &mut Args::default()));
         assert!(!filter.matches(
             Some(&lookup),
             br#"1.0 [0 127.0.0.1:1] "UNKNOWN" "public""#,
-            &mut Vec::new()
+            &mut Args::default()
         ));
         let redis::Value::Array(mut rows) = key_fixture::reply() else {
             unreachable!()
@@ -930,7 +899,7 @@ mod tests {
         assert!(!filter.matches(
             Some(&lookup),
             br#"1.0 [0 127.0.0.1:1] "GET" "public""#,
-            &mut Vec::new()
+            &mut Args::default()
         ));
     }
 
@@ -991,7 +960,7 @@ mod tests {
                 .unwrap(),
             ),
         ] {
-            let mut args = Vec::new();
+            let mut args = Args::default();
             let mut samples = Vec::new();
             for _ in 0..7 {
                 let start = Instant::now();
@@ -1030,13 +999,13 @@ mod tests {
             ("[0]", br#"1.0 [0 127.0.0.1:1] "PING""#, false),
             ("![0]", br#"1.0 [0 127.0.0.1:1] "PING""#, true),
         ] {
-            assert_eq!(key_filter(&[pattern]).matches(Some(&lookup), line, &mut Vec::new()), expected, "{pattern}: {line:?}");
+            assert_eq!(key_filter(&[pattern]).matches(Some(&lookup), line, &mut Args::default()), expected, "{pattern}: {line:?}");
         }
         let filter = key_filter(&["[0]zero", "![1]one"]);
         assert!(!filter.matches(
             Some(&lookup),
             br#"1.0 [0 127.0.0.1:1] "MGET" "zero" "one""#,
-            &mut Vec::new()
+            &mut Args::default()
         ));
     }
 
@@ -1086,7 +1055,7 @@ mod tests {
             let filter = compile(&[pattern]);
             assert!(!filter.needs_cmds());
             assert_eq!(
-                filter.matches(None, line, &mut Vec::new()),
+                filter.matches(None, line, &mut Args::default()),
                 expected,
                 "{pattern}: {line:?}"
             );
@@ -1095,17 +1064,17 @@ mod tests {
         assert!(compile(&["GET", "[2]bar"]).matches(
             None,
             set,
-            &mut Vec::new()
+            &mut Args::default()
         ));
         assert!(!compile(&["SET", "![2]bar"]).matches(
             None,
             set,
-            &mut Vec::new()
+            &mut Args::default()
         ));
         assert!(!compile(&["!SET", "[2]bar"]).matches(
             None,
             set,
-            &mut Vec::new()
+            &mut Args::default()
         ));
     }
 
@@ -1121,13 +1090,12 @@ mod tests {
         ])
         .unwrap();
         let filter = opt.line_filter().unwrap();
-        let mut args = Vec::new();
-        assert!(filter.matches(
-            Some(&lookup),
-            br#"1.0 [0 127.0.0.1:1] "MSET" "zero" "z" "one" "o""#,
-            &mut args
-        ));
-        assert_eq!(args.len(), 4);
+        let mut args = Args::default();
+        let line = br#"1.0 [0 127.0.0.1:1] "MSET" "zero" "z" "one" "o""#;
+        assert!(filter.matches(Some(&lookup), line, &mut args));
+        // The filter's decode is cached for the formatter.
+        let record = redis_monitor::monitor::Record::parse(line).unwrap();
+        assert_eq!(args.decode(&record).unwrap().len(), 4);
         assert!(!filter.matches(
             Some(&lookup),
             br#"1.0 [0 127.0.0.1:1] "MSET" "zero" "z" "two" "o""#,

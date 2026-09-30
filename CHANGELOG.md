@@ -45,6 +45,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- Make default JSON, PHP, and CSV output the field selection
+  `%t %d %ca %C %a`, and default plain output the format `%t [%d %ca] %l`,
+  instead of separate serializers. Output is byte-for-byte unchanged. Write
+  JSON object framing directly and command names and TCP addresses without
+  UTF-8 validation or escaping: short-record JSON is about 5% faster and
+  selected JSON fields about 12% faster.
+- Write PHP serialization directly instead of through `serde_php`, about 40%
+  faster for short records; remove the `serde_php` and `serde_bytes`
+  dependencies.
+- Decode each record's arguments once when both a positional or key filter and
+  structured output need them (`redis_monitor::monitor::Args`). With
+  `--filter '[1]...' -o json`, large records are about 33% faster.
+- Write the plain `--source` prefix without the formatting machinery, about 18%
+  faster.
+- Pipeline `AUTH` and `MONITOR` in one round trip when connecting.
+- Share one connection-settings definition between CLI options and config file
+  entries, flatten cluster topology into a sorted node list, and replace the
+  connection stream enum with a boxed trait object.
+
 - Replace `--output json-source` with `--output json --source`. Default plain
   output now omits server identity regardless of connection count; use `--source`
   or an explicit server-token template to include it. Explicit structured
@@ -117,6 +136,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Tests/CI
 
+- Cover filtered structured records keeping their own decoded arguments,
+  memoized argument decoding, pipelined and failing handshakes, oversized
+  handshake replies, config file parsing, and command-name filter agreement.
+
 - Cover source metadata and selected fields in all formats, binary values,
   malformed formats/records, default-serializer equivalence, and multi-source
   merging under backpressure. Retain release formatter and multi-server replay
@@ -153,6 +176,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Documentation
 
+- Document default output field selections, shared config connection keys,
+  the pipelined handshake, the `Args` API, and new measurements.
+
 - Add `FEATURE_IDEAS.md` with six code-grounded feature proposals, scoped first
   versions, implementation pointers, and validation considerations.
 - Document the parallel pipeline, `--threads`, flushing, invalid-record
@@ -175,6 +201,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   improvements.
 
 ### Fixed
+
+- Bound MONITOR handshake replies to 4 KiB; a server sending an endless line
+  previously grew the reply buffer without limit.
+- Accept config file paths that are not valid UTF-8.
 
 - Render `%%` as a single `%` in `--format`; previously it printed `%%`.
 - Stop appending a trailing space to `%l` for commands without arguments.

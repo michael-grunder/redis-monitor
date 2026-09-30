@@ -1,20 +1,19 @@
 use std::{
     collections::HashMap,
-    convert::AsRef,
     env,
-    iter::IntoIterator,
-    option::Option,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use config::{Config, File, FileFormat};
 use serde::Deserialize;
 
 use crate::connection::{ServerAddr, TlsConfig};
 
-const DEFAULT_CFGFILE_NAMES: &[&str] = &[".redis-monitor"];
-const DEFAULT_CFGFILE_EXT: &[&str] = &["", "toml"];
+/// Config files searched, in order, in the current then home directory.
+const DEFAULT_CFGFILE_NAMES: &[&str] =
+    &[".redis-monitor", ".redis-monitor.toml"];
 
 #[derive(Debug)]
 pub struct Map(HashMap<String, Entry>);
@@ -25,12 +24,54 @@ pub struct ServerAuth {
     pub pass: Option<String>,
 }
 
-impl<'a> IntoIterator for &'a Map {
-    type Item = <&'a HashMap<String, Entry> as IntoIterator>::Item;
-    type IntoIter = <&'a HashMap<String, Entry> as IntoIterator>::IntoIter;
+/// Credentials and TLS settings, shared by the CLI and config file entries.
+#[derive(Debug, Default, Deserialize, clap::Args)]
+pub struct ConnectionArgs {
+    #[arg(short, long, help = "Redis user")]
+    user: Option<String>,
 
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
+    #[arg(short, long, short_alias = 'a', help = "Redis password")]
+    pass: Option<String>,
+
+    #[arg(long, help = "Connect using TLS")]
+    #[serde(default)]
+    tls: bool,
+
+    #[arg(long, help = "Disable TLS certificate verification")]
+    #[serde(default)]
+    insecure: bool,
+
+    #[arg(long, help = "Path to CA cert for TLS")]
+    tls_ca: Option<PathBuf>,
+
+    #[arg(long, help = "Path to client cert for TLS")]
+    tls_cert: Option<PathBuf>,
+
+    #[arg(long, help = "Path to client private key for TLS")]
+    tls_key: Option<PathBuf>,
+}
+
+impl ConnectionArgs {
+    pub fn auth(&self) -> ServerAuth {
+        ServerAuth::from_user_pass(self.user.as_deref(), self.pass.as_deref())
+    }
+
+    /// Load TLS files when TLS is enabled.
+    ///
+    /// # Errors
+    /// Returns an error for unreadable or invalid TLS settings.
+    pub fn tls_config(&self) -> Result<Option<Arc<TlsConfig>>> {
+        self.tls
+            .then(|| {
+                TlsConfig::new(
+                    self.insecure,
+                    self.tls_ca.as_deref(),
+                    self.tls_cert.as_deref(),
+                    self.tls_key.as_deref(),
+                )
+                .map(Arc::new)
+            })
+            .transpose()
     }
 }
 
@@ -41,104 +82,55 @@ pub struct Entry {
     host: Option<String>,
     port: Option<u16>,
 
-    user: Option<String>,
-    pass: Option<String>,
-
-    tls: Option<bool>,
-    insecure: Option<bool>,
-    tls_ca: Option<PathBuf>,
-    tls_cert: Option<PathBuf>,
-    tls_key: Option<PathBuf>,
+    #[serde(flatten)]
+    pub connection: ConnectionArgs,
 
     #[serde(default)]
     pub cluster: bool,
-    // Accepted for compatibility; per-entry `format` and `color` settings do
-    // not affect output, and unknown keys such as `color` are ignored.
-    pub format: Option<String>,
+    // Unknown keys, including the formerly accepted per-entry `format` and
+    // `color` settings, are ignored.
 }
 
 impl ServerAuth {
     pub fn from_user_pass(user: Option<&str>, pass: Option<&str>) -> Self {
         Self {
-            user: user.map(std::borrow::ToOwned::to_owned),
-            pass: pass.map(std::borrow::ToOwned::to_owned),
+            user: user.map(str::to_owned),
+            pass: pass.map(str::to_owned),
         }
     }
 }
 
 impl Map {
     fn find() -> Result<Option<PathBuf>> {
-        let mut search_paths = vec![env::current_dir()
-            .context("Failed to determine the current directory while looking for a config file")?];
-        if let Some(home) = env::var_os("HOME") {
-            search_paths.push(home.into());
-        }
-
-        for path in &search_paths {
-            for file in DEFAULT_CFGFILE_NAMES {
-                for ext in DEFAULT_CFGFILE_EXT {
-                    let filename = if ext.is_empty() {
-                        (*file).to_string()
-                    } else {
-                        format!("{file}.{ext}")
-                    };
-
-                    let f = PathBuf::from(filename);
-                    let check: PathBuf = [path, &f].iter().collect();
-
-                    if check.exists() {
-                        return Ok(Some(check));
-                    }
-                }
-            }
-        }
-
-        Ok(None)
+        let mut dirs = vec![env::current_dir().context(
+            "Failed to determine the current directory while looking for a config file",
+        )?];
+        dirs.extend(env::var_os("HOME").map(PathBuf::from));
+        Ok(dirs
+            .iter()
+            .flat_map(|dir| DEFAULT_CFGFILE_NAMES.iter().map(|n| dir.join(n)))
+            .find(|path| path.exists()))
     }
 
-    fn from_toml_file<P: AsRef<str>>(
-        path: P,
-    ) -> Result<HashMap<String, Entry>> {
-        let s = Config::builder()
-            .add_source(File::new(path.as_ref(), FileFormat::Toml))
-            .build()
-            .map_err(|e| {
-                anyhow!("Failed to read config file {}: {e}", path.as_ref())
-            })?;
-
-        let s = s.try_deserialize().map_err(|e| {
-            anyhow!("Failed to deserialize config file {}: {e}", path.as_ref())
-        })?;
-
-        Ok(s)
-    }
-
-    fn from_default_toml_file() -> Result<Option<HashMap<String, Entry>>> {
-        let Some(file) = Self::find()? else {
-            return Ok(None);
-        };
-        let path = file.to_str().ok_or_else(|| {
-            anyhow!("Invalid UTF-8 in config file path: {}", file.display())
-        })?;
-
-        Self::from_toml_file(path).map(Some)
-    }
-
+    /// Load `path`, or the first default config file found, or nothing.
+    ///
+    /// # Errors
+    /// Returns an error for unreadable or invalid config files.
     pub fn load(path: Option<&Path>) -> Result<Self> {
-        let cfg = match path {
-            Some(p) => {
-                let path_str = p.to_str().ok_or_else(|| {
-                    anyhow!(
-                        "Invalid UTF-8 in config file path: {}",
-                        p.display()
-                    )
-                })?;
-                Some(Self::from_toml_file(path_str)?)
-            }
-            None => Self::from_default_toml_file()?,
+        let Some(path) = path
+            .map(Path::to_path_buf)
+            .map_or_else(Self::find, |p| Ok(Some(p)))?
+        else {
+            return Ok(Self(HashMap::new()));
         };
-
-        Ok(Self(cfg.unwrap_or_default()))
+        let entries = Config::builder()
+            .add_source(File::from(path.clone()).format(FileFormat::Toml))
+            .build()
+            .and_then(Config::try_deserialize)
+            .with_context(|| {
+                format!("Failed to load config file {}", path.display())
+            })?;
+        Ok(Self(entries))
     }
 
     pub fn get<'a>(&'a self, name: &str) -> Option<&'a Entry> {
@@ -147,51 +139,90 @@ impl Map {
 }
 
 impl Entry {
-    fn host_port(&self) -> Option<(String, u16)> {
-        match (&self.host, &self.port) {
-            (Some(host), Some(port)) => Some((host.to_owned(), *port)),
-            _ => None,
-        }
-    }
-
-    pub fn get_auth(&self) -> ServerAuth {
-        ServerAuth::from_user_pass(self.user.as_deref(), self.pass.as_deref())
-    }
-
     pub fn get_addresses(&self) -> Result<Vec<ServerAddr>> {
-        if let Some((host, port)) = self.host_port() {
-            Ok(vec![ServerAddr::from_tcp_addr(host, port)])
-        } else if self.host.is_some() || self.port.is_some() {
-            bail!("'host' and 'port' must be specified together")
-        } else if let Some(addresses) = &self.addresses {
-            if addresses.is_empty() {
+        match (&self.host, self.port, &self.addresses, &self.path) {
+            (Some(host), Some(port), ..) => {
+                Ok(vec![ServerAddr::from_tcp_addr(host, port)])
+            }
+            (Some(_), None, ..) | (None, Some(_), ..) => {
+                bail!("'host' and 'port' must be specified together")
+            }
+            (None, None, Some(addresses), _) if addresses.is_empty() => {
                 bail!("'addresses' must contain at least one Redis address")
             }
-            Ok(addresses.to_owned())
-        } else if let Some(path) = &self.path {
-            if path.is_empty() {
+            (None, None, Some(addresses), _) => Ok(addresses.clone()),
+            (None, None, None, Some(path)) if path.is_empty() => {
                 bail!("'path' must not be empty")
             }
-            Ok(vec![ServerAddr::from_path(path)])
-        } else {
-            bail!(
+            (None, None, None, Some(path)) => {
+                Ok(vec![ServerAddr::from_path(path)])
+            }
+            (None, None, None, None) => bail!(
                 "missing Redis address; specify 'host' with 'port', \
                  'addresses', or 'path'"
-            )
+            ),
         }
     }
+}
 
-    pub fn get_tls_config(&self) -> Result<Option<TlsConfig>> {
-        if self.tls.unwrap_or(false) {
-            let tls = TlsConfig::new(
-                self.insecure.unwrap_or(false),
-                self.tls_ca.as_deref(),
-                self.tls_cert.as_deref(),
-                self.tls_key.as_deref(),
-            )?;
-            Ok(Some(tls))
-        } else {
-            Ok(None)
+#[cfg(test)]
+mod tests {
+    use super::Map;
+
+    #[test]
+    fn entries_share_connection_settings_and_validate_addresses() {
+        let dir = std::env::temp_dir()
+            .join(format!("redis-monitor-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Extensionless, like the default `.redis-monitor`.
+        let path = dir.join(".redis-monitor");
+        std::fs::write(
+            &path,
+            r#"
+            [tls]
+            host = "cache"
+            port = 6380
+            user = "u"
+            pass = "p"
+            tls = true
+            insecure = true
+            [plain]
+            addresses = ["a:1", "[::1]:2"]
+            [partial]
+            host = "x"
+            [empty]
+            addresses = []
+            [none]
+            cluster = true
+            "#,
+        )
+        .unwrap();
+        let map = Map::load(Some(&path)).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+
+        let tls = map.get("tls").unwrap();
+        assert_eq!(tls.get_addresses().unwrap()[0].to_string(), "cache:6380");
+        assert_eq!(tls.connection.auth().user.as_deref(), Some("u"));
+        assert!(tls.connection.tls_config().unwrap().is_some());
+        let plain = map.get("plain").unwrap();
+        assert_eq!(plain.get_addresses().unwrap().len(), 2);
+        assert!(plain.connection.tls_config().unwrap().is_none());
+        for (name, error) in [
+            ("partial", "together"),
+            ("empty", "at least one"),
+            ("none", "missing Redis address"),
+        ] {
+            let message = map
+                .get(name)
+                .unwrap()
+                .get_addresses()
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains(error), "{name}: {message}");
         }
+        assert!(
+            Map::load(Some("/nonexistent/redis-monitor.toml".as_ref()))
+                .is_err()
+        );
     }
 }

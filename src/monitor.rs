@@ -471,6 +471,39 @@ pub fn write_uint(w: &mut impl Write, n: impl Into<u64>) -> io::Result<()> {
     w.write_all(lexical_core::write(n.into(), &mut buf))
 }
 
+/// Decoded arguments: borrowed when unescaped, owned when decoding changed
+/// them.
+pub type Decoded<'a> = [Cow<'a, [u8]>];
+
+/// Decoded arguments, reusable across records that borrow the same buffer.
+/// Decoding is memoized per record, so a filter and a formatter that both need
+/// a record's arguments decode them once.
+#[derive(Debug, Default)]
+pub struct Args<'a> {
+    values: Vec<Cow<'a, [u8]>>,
+    /// The escaped text `values` hold, compared by identity.
+    decoded: Option<&'a [u8]>,
+}
+
+impl<'a> Args<'a> {
+    /// The record's decoded arguments, decoding them unless they already
+    /// are. Unescaped arguments are borrowed.
+    ///
+    /// # Errors
+    /// Returns an error for unterminated or unseparated arguments.
+    pub fn decode(&mut self, record: &Record<'a>) -> Result<&Decoded<'a>> {
+        if !self
+            .decoded
+            .is_some_and(|text| std::ptr::eq(text, record.args))
+        {
+            self.decoded = None;
+            decode_args(record.args, &mut self.values)?;
+            self.decoded = Some(record.args);
+        }
+        Ok(&self.values)
+    }
+}
+
 /// Decode escaped, quoted MONITOR arguments into `args`.
 ///
 /// Redis escapes quotes inside arguments, but some producers do not, so a
@@ -755,6 +788,24 @@ mod tests {
             line.extend(repr(value));
         }
         assert_eq!(args(&line), values);
+    }
+
+    #[test]
+    fn args_are_decoded_once_per_record() {
+        let buffer = br#"1.0 [0 lua] "SET" "k" "v"
+1.0 [0 lua] "SET" "k" "v""#;
+        let mut lines = buffer.split(|&b| b == b'\n');
+        let first = Record::parse(lines.next().unwrap()).unwrap();
+        let second = Record::parse(lines.next().unwrap()).unwrap();
+        let mut args = super::Args::default();
+        let decoded = args.decode(&first).unwrap().as_ptr();
+        // Same record: the cached values are returned as-is.
+        assert_eq!(args.decode(&first).unwrap().as_ptr(), decoded);
+        // Equal text elsewhere in the buffer is a different record.
+        assert_eq!(args.decode(&second).unwrap(), [&b"k"[..], b"v"]);
+        let bad = Record::parse(br#"1.0 [0 lua] "SET" "k"#).unwrap();
+        assert!(args.decode(&bad).is_err());
+        assert!(args.decode(&bad).is_err(), "failures are not cached");
     }
 
     #[test]

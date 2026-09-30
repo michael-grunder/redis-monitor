@@ -5,6 +5,11 @@ Measured 2026-09-30, baseline `b014f06` versus the `--source`/structured
 CPUs; Rust 1.98.1. Both binaries use portable `RUSTFLAGS=''` release builds
 (opt-level 3, thin LTO, one codegen unit, panic abort). No dependencies added.
 
+> **Superseded:** default JSON, PHP, and CSV output now use the field
+> selection `%t %d %ca %C %a`, which after optimization is faster than the
+> dedicated serializers measured here. See the README's "Unified structured
+> output" measurements.
+
 ## Default versus selected fields
 
 Default serializers do not compile or traverse a field/interpolation plan.

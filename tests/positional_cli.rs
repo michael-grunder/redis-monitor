@@ -65,3 +65,42 @@ fn invalid_selectors_fail_in_both_cli_options() {
         }
     }
 }
+
+/// Arguments decoded for filtering are reused when formatting; each record
+/// must still print its own, including identical and escaped ones.
+#[test]
+fn filtered_structured_records_keep_their_own_arguments() {
+    let input = b"1.0 [0 lua] \"SET\" \"k1\" \"a\\\"b\"\n\
+                  1.0 [0 lua] \"SET\" \"skip\" \"x\"\n\
+                  1.0 [0 lua] \"SET\" \"k1\" \"a\\\"b\"\n\
+                  1.0 [0 lua] \"SET\" \"k2\" \"\\x00\"\n";
+    for format in ["json", "resp", "csv", "php"] {
+        let unfiltered = run(&[], format, input);
+        let filtered = run(&["![1]skip"], format, input);
+        assert!(filtered.status.success(), "{format}: {:?}", filtered.stderr);
+        let expected: Vec<u8> = unfiltered
+            .stdout
+            .split_inclusive(|&b| b == b'\n')
+            .filter(|line| !line.windows(4).any(|w| w == b"skip"))
+            .flatten()
+            .copied()
+            .collect();
+        let expected = if format == "resp" {
+            // RESP arrays span lines; remove the skipped array exactly.
+            let skipped = b"*3\r\n$3\r\nSET\r\n$4\r\nskip\r\n$1\r\nx\r\n";
+            let at = unfiltered
+                .stdout
+                .windows(skipped.len())
+                .position(|w| w == skipped)
+                .unwrap();
+            [
+                &unfiltered.stdout[..at],
+                &unfiltered.stdout[at + skipped.len()..],
+            ]
+            .concat()
+        } else {
+            expected
+        };
+        assert_eq!(filtered.stdout, expected, "{format}");
+    }
+}

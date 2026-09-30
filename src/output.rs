@@ -12,17 +12,12 @@ use std::{
 };
 
 use anyhow::{Error, Result, anyhow};
-use lexical_core::FormattedSize;
-use serde::{Serialize, Serializer};
+use redis_monitor::monitor::{Args, Client, Decoded, Record, write_uint};
 
 mod fields;
 use fields::Fields;
-use serde_bytes::Bytes as SerBytes;
-use serde_php as php;
 
-use redis_monitor::monitor::{Client, MAX_TCP_ADDR_LEN, Record, write_uint};
-
-use crate::connection::{GetHost, ServerAddr};
+use crate::connection::ServerAddr;
 
 /// Longest excerpt of an invalid record included in its error message.
 const INVALID_EXCERPT: usize = 256;
@@ -93,7 +88,7 @@ impl Source {
             name,
             ip,
             addr: server.to_string(),
-            host: server.get_host().to_owned(),
+            host: server.host().to_owned(),
             port,
         }
     }
@@ -148,71 +143,62 @@ impl FromStr for OutputKind {
 /// reused within a scan but never retained indefinitely. Defaults allocate none.
 #[derive(Default)]
 pub struct Scratch<'a> {
-    pub args: Vec<Cow<'a, [u8]>>,
+    /// Decoded arguments, shared with filters so each record decodes once.
+    pub args: Args<'a>,
     value: Vec<u8>,
 }
 
-/// Default serializers never construct or walk an interpolation plan.
+/// The plain default; `--source` prefixes each record with its source.
+const DEFAULT_PLAIN: &str = "%t [%d %ca] %l";
+/// The JSON, PHP, and CSV default fields.
+const DEFAULT_FIELDS: &str = "%t %d %ca %C %a";
+
 #[derive(Debug)]
 pub enum Formatter {
-    PlainDefault {
-        source: bool,
-    },
     Plain {
         format: PlainFormat,
         source: bool,
     },
-    Json {
-        source: bool,
-    },
-    Csv {
-        source: bool,
-    },
+    /// Default RESP: one array holding the command and its arguments.
     Resp {
         source: bool,
     },
-    Php {
-        source: bool,
-    },
-    Selected(Fields),
+    /// JSON, PHP, CSV, and RESP with selected fields.
+    Fields(Fields),
+    /// Copies each line unchanged, so pipeline tests can use any bytes.
     #[cfg(test)]
     Raw,
 }
 
 impl Formatter {
+    /// Compile the output configuration. `format` selects plain
+    /// interpolation or structured fields; `source` adds the source identity.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid structured field selection.
     pub fn new(
         kind: OutputKind,
         format: Option<&str>,
         source: bool,
     ) -> Result<Self> {
-        if let Some(format) = format {
-            return Ok(if kind == OutputKind::Plain {
-                Self::Plain {
-                    format: PlainFormat::new(format),
-                    source,
-                }
-            } else {
-                Self::Selected(Fields::new(kind, format, source)?)
-            });
-        }
-        Ok(match kind {
-            OutputKind::Plain => Self::PlainDefault { source },
-            OutputKind::Json => Self::Json { source },
-            OutputKind::Csv => Self::Csv { source },
-            OutputKind::Resp => Self::Resp { source },
-            OutputKind::Php => Self::Php { source },
+        Ok(match (kind, format) {
+            (OutputKind::Plain, format) => Self::Plain {
+                format: PlainFormat::new(format.unwrap_or(DEFAULT_PLAIN)),
+                source,
+            },
+            (OutputKind::Resp, None) => Self::Resp { source },
+            (kind, format) => Self::Fields(Fields::new(
+                kind,
+                format.unwrap_or(DEFAULT_FIELDS),
+                source,
+            )?),
         })
     }
 
+    /// Bytes written once before the first record.
     pub fn header(&self) -> Option<&[u8]> {
         match self {
-            Self::Csv { source: false } => {
-                Some(b"timestamp,db,addr,cmd,args\n")
-            }
-            Self::Csv { source: true } => {
-                Some(b"source_address,source_name,timestamp,db,addr,cmd,args\n")
-            }
-            Self::Selected(fields) if fields.kind == OutputKind::Csv => {
+            Self::Fields(fields) if fields.kind == OutputKind::Csv => {
                 Some(&fields.header)
             }
             _ => None,
@@ -220,6 +206,9 @@ impl Formatter {
     }
 
     /// Append a complete record, leaving `out` unchanged on invalid input.
+    ///
+    /// # Errors
+    /// Returns an error for records that are not valid MONITOR records.
     pub fn format<'a>(
         &self,
         out: &mut Vec<u8>,
@@ -229,16 +218,6 @@ impl Formatter {
     ) -> Result<(), FormatError> {
         let start = out.len();
         let result = match self {
-            Self::PlainDefault { source: include } => {
-                let record = Record::parse(line)
-                    .map_err(|e| FormatError::new(line, e))?;
-                if *include {
-                    write_plain_source(out, source)
-                } else {
-                    Ok(())
-                }
-                .and_then(|()| write_default_plain(out, &record))
-            }
             Self::Plain {
                 format,
                 source: include,
@@ -246,60 +225,35 @@ impl Formatter {
                 let record = Record::parse(line)
                     .map_err(|e| FormatError::new(line, e))?;
                 if *include {
-                    write_plain_source(out, source)
-                } else {
-                    Ok(())
+                    write_plain_source(out, source);
                 }
-                .and_then(|()| format.write(out, source, &record))
-            }
-            Self::Json { source: include } => {
-                let record = parse_structured(line, &mut scratch.args)?;
-                let mut structured =
-                    Structured::new(&record, TextArgs(&scratch.args));
-                if *include {
-                    structured.source = Some(source.structured());
-                }
-                serde_json::to_writer(&mut *out, &structured)
-                    .map_err(io::Error::from)
-            }
-            Self::Php { source: include } => {
-                let record = parse_structured(line, &mut scratch.args)?;
-                let mut structured =
-                    Structured::new(&record, ByteArgs(&scratch.args));
-                if *include {
-                    structured.source = Some(source.structured());
-                }
-                php::to_writer(&mut *out, &structured).map_err(io::Error::other)
-            }
-            Self::Csv { source: include } => {
-                let record = parse_structured(line, &mut scratch.args)?;
-                if *include {
-                    write_csv_source(out, source);
-                }
-                write_csv(out, &record, &scratch.args)
+                format.write(out, source, &record)
             }
             Self::Resp { source: include } => {
-                let record = parse_structured(line, &mut scratch.args)?;
+                let (record, args) = parse_structured(line, &mut scratch.args)?;
                 if *include {
-                    write_resp_source(out, source)
+                    write_resp_source(out, &source.structured())
                 } else {
                     Ok(())
                 }
-                .and_then(|()| write_resp(out, &record, &scratch.args))
+                .and_then(|()| write_resp(out, &record, args))
             }
-            Self::Selected(fields) => {
-                let record = parse_structured(line, &mut scratch.args)?;
-                fields.write(out, source, &record, scratch)
+            Self::Fields(fields) => {
+                let (record, args) = parse_structured(line, &mut scratch.args)?;
+                fields.write(out, source, &record, args, &mut scratch.value)
             }
             #[cfg(test)]
             Self::Raw => out.write_all(line),
         };
+        // Serializing into a `Vec` cannot fail in practice, but never leave a
+        // partial record behind if it does.
         if let Err(error) = result {
             out.truncate(start);
             return Err(FormatError::new(line, error));
         }
+        // RESP arrays are self-delimiting; other formats are line-based.
         let resp = matches!(self, Self::Resp { .. })
-            || matches!(self, Self::Selected(fields) if fields.kind == OutputKind::Resp);
+            || matches!(self, Self::Fields(f) if f.kind == OutputKind::Resp);
         if !resp {
             out.push(b'\n');
         }
@@ -307,56 +261,22 @@ impl Formatter {
     }
 }
 
-fn write_plain_source(out: &mut Vec<u8>, source: &Source) -> io::Result<()> {
+/// `[address name] `, with `-` for unknown parts.
+fn write_plain_source(out: &mut Vec<u8>, source: &Source) {
     let source = source.structured();
-    write!(
-        out,
-        "[{} {}] ",
-        source.address.unwrap_or("-"),
-        source.name.unwrap_or("-")
-    )
-}
-
-fn write_default_plain(
-    out: &mut Vec<u8>,
-    record: &Record<'_>,
-) -> io::Result<()> {
-    record.write_timestamp(out)?;
-    out.push(b' ');
-    if let Some(tail) = record.default_tail {
-        return out.write_all(tail);
-    }
     out.push(b'[');
-    write_uint(out, record.db)?;
+    out.extend_from_slice(source.address.unwrap_or("-").as_bytes());
     out.push(b' ');
-    record.client.write_addr(out)?;
+    out.extend_from_slice(source.name.unwrap_or("-").as_bytes());
     out.extend_from_slice(b"] ");
-    write_full_line(out, record)
-}
-
-fn write_full_line(out: &mut Vec<u8>, record: &Record<'_>) -> io::Result<()> {
-    out.push(b'"');
-    out.extend_from_slice(record.cmd);
-    out.push(b'"');
-    if !record.args.is_empty() {
-        out.push(b' ');
-        out.write_all(record.args)?;
-    }
-    Ok(())
-}
-
-fn write_csv_source(out: &mut Vec<u8>, source: &Source) {
-    let source = source.structured();
-    csv_field(out, source.address.unwrap_or("").as_bytes());
-    out.push(b',');
-    csv_field(out, source.name.unwrap_or("").as_bytes());
-    out.push(b',');
 }
 
 /// Opt-in RESP envelope: [[address, name], command-or-selected-fields].
-fn write_resp_source(out: &mut Vec<u8>, source: &Source) -> io::Result<()> {
+fn write_resp_source(
+    out: &mut Vec<u8>,
+    source: &StructuredSource<'_>,
+) -> io::Result<()> {
     out.extend_from_slice(b"*2\r\n*2\r\n");
-    let source = source.structured();
     resp_optional(out, source.address)?;
     resp_optional(out, source.name)
 }
@@ -369,16 +289,17 @@ fn resp_optional(out: &mut Vec<u8>, value: Option<&str>) -> io::Result<()> {
     }
 }
 
-/// Parse a record and decode all of its arguments, as structured output needs.
-fn parse_structured<'a>(
+/// Parse a record and decode all of its arguments, as structured output
+/// needs. Arguments a filter already decoded are reused.
+fn parse_structured<'a, 's>(
     line: &'a [u8],
-    args: &mut Vec<Cow<'a, [u8]>>,
-) -> Result<Record<'a>, FormatError> {
+    args: &'s mut Args<'a>,
+) -> Result<(Record<'a>, &'s Decoded<'a>), FormatError> {
     let record = Record::parse(line).map_err(|e| FormatError::new(line, e))?;
-    record
-        .decode_args(args)
+    let args = args
+        .decode(&record)
         .map_err(|e| FormatError::new(line, e))?;
-    Ok(record)
+    Ok((record, args))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -506,7 +427,15 @@ impl FormatToken {
             Self::Database => write_uint(w, record.db)?,
             Self::Command => w.write_all(record.cmd)?,
             Self::Arguments => w.write_all(record.args)?,
-            Self::FullLine => write_full_line(w, record)?,
+            Self::FullLine => {
+                w.push(b'"');
+                w.extend_from_slice(record.cmd);
+                w.push(b'"');
+                if !record.args.is_empty() {
+                    w.push(b' ');
+                    w.extend_from_slice(record.args);
+                }
+            }
         }
         Ok(())
     }
@@ -574,77 +503,10 @@ fn compile_format(fmt: &str) -> Vec<FormatToken> {
     tokens
 }
 
-/// The fields shared by JSON and PHP output. `A` selects how arguments are
-/// represented.
-#[derive(Serialize)]
-struct Structured<'r, A> {
-    timestamp: f64,
-    db: u64,
-    addr: Addr<'r>,
-    cmd: &'r str,
-    args: A,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    source: Option<StructuredSource<'r>>,
-}
-
 /// Source strings are prepared once at connection setup and borrowed here.
-#[derive(Serialize)]
 struct StructuredSource<'s> {
     address: Option<&'s str>,
     name: Option<&'s str>,
-}
-
-impl<'r, A> Structured<'r, A> {
-    fn new(record: &'r Record<'r>, args: A) -> Self {
-        Self {
-            timestamp: record.timestamp(),
-            db: record.db,
-            addr: Addr(&record.client),
-            cmd: record.cmd_str(),
-            args,
-            source: None,
-        }
-    }
-}
-
-/// The client address as text, rendered on the stack.
-fn addr_text<'b>(
-    client: &'b Client<'_>,
-    buf: &'b mut [u8; MAX_TCP_ADDR_LEN],
-) -> &'b str {
-    match client {
-        Client::Unix(path) => path,
-        Client::Lua => "lua",
-        Client::Unknown => "-",
-        tcp @ Client::Tcp { .. } => tcp.render_tcp(buf).unwrap_or("-"),
-    }
-}
-
-/// Serializes a client address without allocating.
-struct Addr<'r>(&'r Client<'r>);
-
-impl Serialize for Addr<'_> {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(addr_text(self.0, &mut [0; MAX_TCP_ADDR_LEN]))
-    }
-}
-
-/// Arguments as strings, replacing invalid UTF-8.
-struct TextArgs<'r>(&'r [Cow<'r, [u8]>]);
-
-impl Serialize for TextArgs<'_> {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.collect_seq(self.0.iter().map(|arg| String::from_utf8_lossy(arg)))
-    }
-}
-
-/// Arguments as byte strings, without copying them.
-struct ByteArgs<'r>(&'r [Cow<'r, [u8]>]);
-
-impl Serialize for ByteArgs<'_> {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.collect_seq(self.0.iter().map(|arg| SerBytes::new(arg)))
-    }
 }
 
 fn resp_bulk(out: &mut Vec<u8>, bytes: &[u8]) -> io::Result<()> {
@@ -666,30 +528,6 @@ fn write_resp(
     out.write_all(b"\r\n")?;
     resp_bulk(out, record.cmd)?;
     args.iter().try_for_each(|arg| resp_bulk(out, arg))
-}
-
-/// `timestamp,db,addr,cmd` followed by one column per argument.
-fn write_csv(
-    out: &mut Vec<u8>,
-    record: &Record<'_>,
-    args: &[Cow<'_, [u8]>],
-) -> io::Result<()> {
-    write!(out, "{}", record.timestamp())?;
-    out.push(b',');
-    let mut db = [0; u64::FORMATTED_SIZE_DECIMAL];
-    csv_field(out, lexical_core::write(record.db, &mut db));
-    out.push(b',');
-    csv_field(
-        out,
-        addr_text(&record.client, &mut [0; MAX_TCP_ADDR_LEN]).as_bytes(),
-    );
-    out.push(b',');
-    csv_field(out, record.cmd);
-    for arg in args {
-        out.push(b',');
-        csv_field(out, arg);
-    }
-    Ok(())
 }
 
 /// Write one RFC 4180 field, quoting it only when it contains a delimiter,

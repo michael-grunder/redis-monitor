@@ -90,7 +90,9 @@ supply a client certificate and private key. Without `--tls-ca`, TLS uses the
 system trust store. `--insecure` disables server certificate verification but
 still presents a configured client certificate. TLS files and the trust store
 are loaded and validated once at startup, and the same settings apply to
-MONITOR, cluster discovery, and `COMMAND` metadata connections.
+MONITOR, cluster discovery, and `COMMAND` metadata connections. `AUTH` and
+`MONITOR` are pipelined in one round trip; handshake replies longer than 4 KiB
+are rejected.
 
 Named instances are TOML tables loaded from `--config-file PATH`, or the first
 file found in this order:
@@ -168,9 +170,11 @@ still no global timestamp ordering or exactly-once guarantee across topology
 changes. Discovery follows nodes reported by `CLUSTER SLOTS`; primaries without
 assigned slots are not included.
 
-Use CLI `--format` to control plain output or select structured fields. Per-entry `format` and `color`
-settings are currently accepted but do not affect output; `--no-color` also has
-no effect because the current writers emit no color.
+Use CLI `--format` to control plain output or select structured fields. Config
+entries accept the same connection keys as the CLI options (`user`, `pass`,
+`tls`, `insecure`, `tls_ca`, `tls_cert`, `tls_key`); other unknown keys, such as
+the formerly documented per-entry `format` and `color`, are ignored.
+`--no-color` has no effect because the current writers emit no color.
 
 ### Reading from stdin
 
@@ -208,8 +212,9 @@ Structured outputs decode MONITOR argument escapes and preserve quoted content,
 including JSON-like values, serialized PHP values, and literal backslash
 sequences. JSON replaces invalid UTF-8 argument bytes with the Unicode replacement
 character; PHP, CSV, and RESP preserve decoded argument bytes.
-Omitting `--format` uses a dedicated serializer for the selected output kind;
-no default interpolation or field-selection plan runs per record.
+Omitting `--format` selects the default fields `%t %d %ca %C %a` for JSON,
+PHP, and CSV, and `%t [%d %ca] %l` for plain output; default RESP output is the
+command array described above. Field selections are compiled once at startup.
 
 Use `--source` to retain server identity when combining streams:
 
@@ -471,6 +476,11 @@ record.decode_args(&mut args)?;
 // record.cmd == b"SET"; args == [b"k", b"a\"b"]
 ```
 
+`Args` memoizes decoding per record: `args.decode(&record)` decodes once and
+returns the cached values for later calls with the same record, so a filter and
+a formatter can share the work. It recognizes a record by the identity of its
+escaped argument text, not its contents.
+
 Decoding runs in linear time. Redis escapes quotes inside arguments, but some
 producers do not, so a quote only closes an argument when it is followed by
 optional whitespace and then another argument or the end of the record.
@@ -571,6 +581,37 @@ checkout. Use optimized builds and explicitly override the repository's native
 CPU flags for portable comparisons. The earlier
 [performance opportunities report](specs/PERFORMANCE_OPPORTUNITIES.md) includes
 a status review of its original recommendations.
+
+### Unified structured output
+
+Measured on the same host with portable release builds, comparing `e82c319`
+("before") with this change ("after"). Stdin replay, mean of 15 `hyperfine`
+runs after two warmups, milliseconds. `short` and `mixed` are the files
+described below; `large` is 20,000 `SET` records with 4 KB JSON-like values
+containing escaped quotes (93 MB).
+
+| Workload | Before | After |
+| --- | ---: | ---: |
+| short, plain default | 314.8 | 306.3 |
+| short, plain `--source` | 412.6 | 336.1 |
+| short, `--filter get` | 134.0 | 134.0 |
+| short, JSON | 943.1 | 896.9 |
+| large, JSON | 338.2 | 340.7 |
+| large, JSON, `--filter '[1]/./'` | 515.8 | 347.7 |
+| short, JSON, `--filter '[1]/./'` | 1395.9 | 1271.3 |
+| short, PHP | 2196.2 | 1343.0 |
+| mixed, PHP `--source` | 487.0 | 287.7 |
+| short, CSV | 1121.7 | 1118.8 |
+| short, RESP | 480.9 | 480.4 |
+| short, RESP `-f '%t %d %C %a'` | 832.3 | 778.3 |
+
+Large-record JSON varied between about 6% faster and 1% slower across runs;
+treat it as unchanged. With eight fake MONITOR sources for six seconds,
+throughput was 46.0 versus 46.5 million records/s (plain), 16.1 versus 15.8
+(JSON, within single-run noise), 7.1 versus 11.6 (PHP), and 10.8 versus 12.0
+(JSON with `--filter '[1]/./'`). The formatter microbenchmark
+(`benchmark_json`) measured 333 versus 319 ns for a short default JSON record,
+and 362 versus 318 ns with `--format '%t %d %ca %C %a'`.
 
 ### Parallel formatting and parser rewrite
 

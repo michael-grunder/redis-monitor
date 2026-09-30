@@ -1,13 +1,11 @@
 use std::string::ToString;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     convert::AsRef,
     fs,
-    hash::{Hash, Hasher},
-    io::{Cursor, Write},
+    io::Cursor,
     net::{IpAddr, Ipv6Addr},
     path::{Path, PathBuf},
-    pin::Pin,
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -26,19 +24,25 @@ use rustls::{
 };
 use serde::{Deserialize, Deserializer, de};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{
+        AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
+        BufReader,
+    },
     net::{TcpStream, UnixStream},
 };
 use tokio_rustls::{TlsConnector, client::TlsStream as ClientTlsStream};
 
 use crate::ServerAuth;
 
-#[derive(Debug)]
-pub enum Stream {
-    Tcp(TcpStream),
-    Tls(Box<ClientTlsStream<TcpStream>>),
-    Unix(UnixStream),
-}
+/// A MONITOR connection: TCP, TLS over TCP, or a Unix socket. Dispatch is
+/// dynamic, but each read moves up to 64 KiB, so the call cost is negligible.
+pub trait Connection: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> Connection for T {}
+pub type Stream = Box<dyn Connection>;
+
+/// Longest handshake reply accepted, so a misbehaving server cannot grow the
+/// reply buffer without bound.
+const MAX_REPLY: u64 = 4096;
 
 /// TLS settings, validated and compiled once at startup.
 pub struct TlsConfig {
@@ -69,76 +73,26 @@ pub struct Monitor {
     pub auth: ServerAuth,
 }
 
-#[derive(Debug, Eq, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ServerAddr {
-    /// Host, port, and the host parsed as an IP address when it is one.
+    /// Host, port, and the host parsed as an IP address when it is one. The
+    /// IP is derived from the host by `from_tcp_addr`, the only constructor,
+    /// so derived equality and hashing agree with comparing host and port.
     Tcp(String, u16, Option<IpAddr>),
     Unix(String),
 }
 
-pub trait GetHost {
-    fn get_host(&self) -> &str;
-}
-
-#[derive(Debug, Eq, Clone)]
+/// A cluster member as reported by `CLUSTER SLOTS`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterNode {
     pub id: String,
     pub addr: ServerAddr,
-    pub replicas: HashSet<Self>,
+    pub primary: bool,
 }
 
+/// Cluster members, each with a unique ID and address, sorted by ID.
 #[derive(Debug)]
-pub struct Cluster(HashSet<ClusterNode>);
-
-impl AsyncRead for Stream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            Self::Tcp(s) => Pin::new(s).poll_read(cx, buf),
-            Self::Tls(s) => Pin::new(s).poll_read(cx, buf),
-            Self::Unix(s) => Pin::new(s).poll_read(cx, buf),
-        }
-    }
-}
-
-impl AsyncWrite for Stream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        match self.get_mut() {
-            Self::Tcp(s) => Pin::new(s).poll_write(cx, buf),
-            Self::Tls(s) => Pin::new(s).poll_write(cx, buf),
-            Self::Unix(s) => Pin::new(s).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            Self::Tcp(s) => Pin::new(s).poll_flush(cx),
-            Self::Tls(s) => Pin::new(s).poll_flush(cx),
-            Self::Unix(s) => Pin::new(s).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            Self::Tcp(s) => Pin::new(s).poll_shutdown(cx),
-            Self::Tls(s) => Pin::new(s).poll_shutdown(cx),
-            Self::Unix(s) => Pin::new(s).poll_shutdown(cx),
-        }
-    }
-}
+pub struct Cluster(Vec<ClusterNode>);
 
 impl<'de> Deserialize<'de> for ServerAddr {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -147,51 +101,6 @@ impl<'de> Deserialize<'de> for ServerAddr {
     {
         let s = String::deserialize(deserializer)?;
         FromStr::from_str(&s).map_err(de::Error::custom)
-    }
-}
-
-impl PartialEq for ServerAddr {
-    fn eq(&self, other: &Self) -> bool {
-        match self {
-            Self::Tcp(host, port, _) => match other {
-                Self::Tcp(other_host, other_port, _) => {
-                    host == other_host && port == other_port
-                }
-                Self::Unix(_) => false,
-            },
-            Self::Unix(path) => match other {
-                Self::Unix(other_path) => path == other_path,
-                Self::Tcp(..) => false,
-            },
-        }
-    }
-}
-
-impl PartialEq for ClusterNode {
-    fn eq(&self, other: &Self) -> bool {
-        self.addr == other.addr
-    }
-}
-
-impl Hash for ServerAddr {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            Self::Tcp(host, port, _) => {
-                0u8.hash(state);
-                host.hash(state);
-                port.hash(state);
-            }
-            Self::Unix(path) => {
-                1u8.hash(state);
-                path.hash(state);
-            }
-        }
-    }
-}
-
-impl Hash for ClusterNode {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.addr.hash(state);
     }
 }
 
@@ -208,16 +117,15 @@ impl std::fmt::Display for ServerAddr {
     }
 }
 
-impl GetHost for ServerAddr {
-    fn get_host(&self) -> &str {
+impl ServerAddr {
+    /// The host, or the socket path.
+    pub fn host(&self) -> &str {
         match self {
             Self::Tcp(host, ..) => host,
             Self::Unix(path) => path,
         }
     }
-}
 
-impl ServerAddr {
     pub fn from_tcp_addr<T: AsRef<str>>(host: T, port: u16) -> Self {
         let host = host.as_ref();
         Self::Tcp(host.to_string(), port, host.parse().ok())
@@ -328,93 +236,34 @@ impl std::str::FromStr for ServerAddr {
     }
 }
 
-impl ClusterNode {
-    pub fn new(host: &str, port: u16, id: &str) -> Self {
-        Self {
-            id: id.to_string(),
-            addr: ServerAddr::from_tcp_addr(host, port),
-            replicas: HashSet::new(),
-        }
+/// A `CLUSTER SLOTS` node entry: `[host, port, id, ...]`.
+fn parse_slot_node(node: &Value) -> Result<(ServerAddr, String)> {
+    let Value::Array(fields) = node else {
+        bail!("node is not an array");
+    };
+    let [
+        Value::BulkString(host),
+        Value::Int(port),
+        Value::BulkString(id),
+        ..,
+    ] = fields.as_slice()
+    else {
+        bail!("node lacks host, port, and ID fields");
+    };
+    let port = u16::try_from(*port)
+        .ok()
+        .filter(|&port| port != 0)
+        .ok_or_else(|| anyhow!("node has an invalid port: {port}"))?;
+    if host.is_empty() || id.is_empty() {
+        bail!("node has an empty host or ID");
     }
-
-    pub fn add_replica(&mut self, node: Self) {
-        self.replicas.insert(node);
-    }
-}
-
-impl<S1, S2> From<&(S1, u16, S2)> for ClusterNode
-where
-    S1: AsRef<str>,
-    S2: AsRef<str>,
-{
-    fn from(input: &(S1, u16, S2)) -> Self {
-        Self::new(input.0.as_ref(), input.1, input.2.as_ref())
-    }
+    Ok((
+        ServerAddr::from_tcp_addr(String::from_utf8_lossy(host), port),
+        String::from_utf8_lossy(id).into_owned(),
+    ))
 }
 
 impl Cluster {
-    const fn new(primaries: HashSet<ClusterNode>) -> Self {
-        Self(primaries)
-    }
-
-    fn parse_slot_bulk(
-        host: &Value,
-        port: &Value,
-        id: &Value,
-    ) -> Result<(String, u16, String)> {
-        match (host, port, id) {
-            (
-                Value::BulkString(host),
-                Value::Int(port),
-                Value::BulkString(id),
-            ) => {
-                let port = u16::try_from(*port).map_err(|_| {
-                    anyhow!(
-                        "Redis Cluster returned an out-of-range node port: \
-                         {port}"
-                    )
-                })?;
-                if host.is_empty() || id.is_empty() || port == 0 {
-                    bail!(
-                        "Redis Cluster returned an empty host/ID or zero port"
-                    );
-                }
-                Ok((
-                    String::from_utf8_lossy(host).to_string(),
-                    port,
-                    String::from_utf8_lossy(id).to_string(),
-                ))
-            }
-            _ => bail!(
-                "Redis Cluster returned a node with invalid host, port, or ID \
-                 fields"
-            ),
-        }
-    }
-
-    fn parse_nodes(nodes: &[Value]) -> Result<Vec<(String, u16, String)>> {
-        nodes
-            .iter()
-            .enumerate()
-            .map(|(index, node)| {
-                let Value::Array(node) = node else {
-                    bail!("Redis Cluster node {index} is not an array");
-                };
-                let [host, port, id, ..] = node.as_slice() else {
-                    bail!(
-                        "Redis Cluster node {index} has {} fields; expected at \
-                         least 3",
-                        node.len()
-                    );
-                };
-
-                Self::parse_slot_bulk(host, port, id).with_context(|| {
-                    format!("Invalid Redis Cluster node {index}")
-                })
-            })
-            .collect()
-    }
-
     pub async fn from_seed(
         seed: &ServerAddr,
         auth: &ServerAuth,
@@ -463,77 +312,63 @@ impl Cluster {
         })
     }
 
+    /// Parse `CLUSTER SLOTS`. Each slot range lists its primary, then its
+    /// replicas. Nodes must keep one address and role across ranges.
     pub(crate) fn from_slots(value: Value) -> Result<Self> {
-        let mut primaries: HashSet<ClusterNode> = HashSet::new();
-        let mut identities = HashMap::new();
-        let mut addresses = HashMap::new();
-
-        let Value::Array(items) = value else {
+        let Value::Array(ranges) = value else {
             bail!("CLUSTER SLOTS returned a non-array response");
         };
-
-        for (slot_index, item) in items.into_iter().enumerate() {
-            let Value::Array(item) = item else {
-                bail!("CLUSTER SLOTS entry {slot_index} is not an array");
+        let mut nodes: HashMap<String, ClusterNode> = HashMap::new();
+        let mut owners: HashMap<ServerAddr, String> = HashMap::new();
+        for (index, range) in ranges.iter().enumerate() {
+            let context = || format!("Invalid CLUSTER SLOTS entry {index}");
+            let Value::Array(fields) = range else {
+                bail!("CLUSTER SLOTS entry {index} is not an array");
             };
-            if item.len() < 3 {
-                bail!(
-                    "CLUSTER SLOTS entry {slot_index} has {} fields; expected \
-                     at least 3",
-                    item.len()
-                );
-            }
-            if !matches!((&item[0], &item[1]), (Value::Int(start), Value::Int(end))
-                if (0..=16383).contains(start) && (*start..=16383).contains(end))
-            {
-                bail!("Invalid CLUSTER SLOTS range at entry {slot_index}");
-            }
-
-            let entries = Self::parse_nodes(&item[2..]).with_context(|| {
-                format!("Invalid CLUSTER SLOTS entry {slot_index}")
-            })?;
-            let Some((primary, replicas)) = entries.split_first() else {
-                bail!(
-                    "CLUSTER SLOTS entry {slot_index} does not contain a \
-                     primary node"
-                );
+            let [Value::Int(start), Value::Int(end), members @ ..] =
+                fields.as_slice()
+            else {
+                bail!("CLUSTER SLOTS entry {index} lacks a slot range");
             };
-            for (index, (host, port, id)) in entries.iter().enumerate() {
-                let address = ServerAddr::from_tcp_addr(host, *port);
-                let identity = (address.clone(), index == 0);
-                if identities
-                    .insert(id.clone(), identity.clone())
-                    .is_some_and(|old| old != identity)
-                    || addresses
-                        .insert(address, id.clone())
-                        .is_some_and(|old| old != *id)
-                {
+            if !(0..=16383).contains(start) || !(*start..=16383).contains(end) {
+                bail!("Invalid CLUSTER SLOTS range at entry {index}");
+            }
+            if members.is_empty() {
+                bail!("CLUSTER SLOTS entry {index} has no primary node");
+            }
+            for (position, member) in members.iter().enumerate() {
+                let (addr, id) =
+                    parse_slot_node(member).with_context(context)?;
+                let node = ClusterNode {
+                    id,
+                    addr,
+                    primary: position == 0,
+                };
+                let owner = owners
+                    .entry(node.addr.clone())
+                    .or_insert_with(|| node.id.clone());
+                let known = nodes
+                    .entry(node.id.clone())
+                    .or_insert_with(|| node.clone());
+                if *owner != node.id || *known != node {
                     bail!(
-                        "CLUSTER SLOTS returned conflicting identities or roles for node {id}"
+                        "CLUSTER SLOTS returned conflicting identities or roles \
+                         for node {}",
+                        node.id
                     );
                 }
             }
-            let mut primary: ClusterNode = primary.into();
-
-            for replica in replicas {
-                primary.add_replica(replica.into());
-            }
-
-            if let Some(previous) = primaries.take(&primary) {
-                primary.replicas.extend(previous.replicas);
-            }
-            primaries.insert(primary);
         }
-
-        if primaries.is_empty() {
-            bail!("CLUSTER SLOTS returned no primary nodes");
+        if nodes.is_empty() {
+            bail!("CLUSTER SLOTS returned no nodes");
         }
-
-        Ok(Self::new(primaries))
+        let mut nodes: Vec<_> = nodes.into_values().collect();
+        nodes.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        Ok(Self(nodes))
     }
 
-    pub fn get_nodes(&self) -> Vec<ClusterNode> {
-        self.0.iter().cloned().collect()
+    pub fn nodes(&self) -> &[ClusterNode] {
+        &self.0
     }
 }
 
@@ -552,97 +387,73 @@ impl Monitor {
         }
     }
 
-    fn to_resp<S: AsRef<str>>(args: &[S]) -> Vec<u8> {
-        assert!(!args.is_empty(), "Empty RESP commands are invalid");
-
-        let mut out = vec![];
-        write!(&mut out, "*{}\r\n", args.len()).unwrap();
-
-        for arg in args {
-            let s = arg.as_ref();
-            write!(&mut out, "${}\r\n", s.len()).unwrap();
-            out.extend_from_slice(s.as_bytes());
-            out.extend_from_slice(b"\r\n");
-        }
-
-        out
-    }
-
-    async fn send_resp(resp: &[u8], s: &mut Stream) -> Result<()> {
-        s.write_all(resp).await?;
-        s.flush().await?;
-
-        Ok(())
-    }
-
-    async fn read_line_reply(reader: &mut BufReader<Stream>) -> Result<String> {
-        let mut line = String::new();
-
-        reader.read_line(&mut line).await?;
-        let line = line.trim_end();
-
-        match line.chars().next() {
-            Some('+') => Ok(line[1..].to_string()),
-            Some('-') => Err(anyhow!("Server Error: {}", &line[1..])),
-            Some(c) => Err(anyhow!("Got reply-type byte '{c}': {line}")),
-            _ => Err(anyhow!("Received empty line from server")),
-        }
-    }
-
-    async fn try_auth(
-        auth: &ServerAuth,
-        s: &mut BufReader<Stream>,
-    ) -> Result<()> {
-        let resp = match (&auth.user, &auth.pass) {
-            (Some(user), Some(pass)) => {
-                Self::to_resp(&["AUTH", user.as_str(), pass.as_str()])
-            }
-            (None, Some(pass)) => Self::to_resp(&["AUTH", pass.as_str()]),
-            _ => return Ok(()),
-        };
-
-        Self::send_resp(&resp, s.get_mut()).await?;
-        Self::read_line_reply(s).await?;
-
-        Ok(())
-    }
-
-    async fn try_monitor(s: &mut BufReader<Stream>) -> Result<()> {
-        let resp = Self::to_resp(&["MONITOR"]);
-
-        Self::send_resp(&resp, s.get_mut()).await?;
-        Self::read_line_reply(s).await?;
-
-        Ok(())
-    }
-
-    /// Connect, authenticate, and enter MONITOR mode. Returns the stream and
-    /// any bytes that arrived after the MONITOR reply: a busy server often
-    /// sends its first records in the same segment as `+OK`.
+    /// Connect, authenticate, and enter MONITOR mode. AUTH and MONITOR are
+    /// pipelined in one round trip. Returns the stream and any bytes that
+    /// arrived after the MONITOR reply: a busy server often sends its first
+    /// records in the same segment as `+OK`.
     pub async fn connect(&self) -> Result<(Stream, BytesMut)> {
-        let stream = match &self.address {
+        let mut stream: Stream = match &self.address {
             ServerAddr::Tcp(host, port, _) => {
                 let stream = TcpStream::connect((host.as_str(), *port)).await?;
-
-                if let Some(tls) = &self.tls {
-                    let stream = tls.initialize_tls(stream, host).await?;
-                    Stream::Tls(Box::new(stream))
-                } else {
-                    Stream::Tcp(stream)
+                match &self.tls {
+                    Some(tls) => {
+                        Box::new(tls.initialize_tls(stream, host).await?)
+                    }
+                    None => Box::new(stream),
                 }
             }
             ServerAddr::Unix(path) => {
-                let stream = UnixStream::connect(path).await?;
-                Stream::Unix(stream)
+                Box::new(UnixStream::connect(path).await?)
             }
         };
 
-        let mut reader = BufReader::new(stream);
-        Self::try_auth(&self.auth, &mut reader).await?;
-        Self::try_monitor(&mut reader).await?;
+        let mut commands: Vec<&[&str]> = Vec::new();
+        let auth = match (&self.auth.user, &self.auth.pass) {
+            (Some(user), Some(pass)) => vec!["AUTH", user, pass],
+            (None, Some(pass)) => vec!["AUTH", pass],
+            _ => Vec::new(),
+        };
+        if !auth.is_empty() {
+            commands.push(&auth);
+        }
+        commands.push(&["MONITOR"]);
+        let mut request = Vec::new();
+        for args in &commands {
+            request.extend(format!("*{}\r\n", args.len()).bytes());
+            for arg in *args {
+                request.extend(format!("${}\r\n{arg}\r\n", arg.len()).bytes());
+            }
+        }
+        stream.write_all(&request).await?;
+        stream.flush().await?;
 
+        let mut reader = BufReader::new(stream);
+        for _ in &commands {
+            read_reply(&mut reader).await?;
+        }
         let pending = BytesMut::from(reader.buffer());
         Ok((reader.into_inner(), pending))
+    }
+}
+
+/// Read one simple-string reply such as `+OK`, failing on an error reply.
+async fn read_reply(reader: &mut BufReader<Stream>) -> Result<()> {
+    let mut line = Vec::new();
+    (&mut *reader)
+        .take(MAX_REPLY)
+        .read_until(b'\n', &mut line)
+        .await?;
+    if !line.ends_with(b"\n") {
+        bail!("Connection closed or reply too long during the handshake");
+    }
+    let line = String::from_utf8_lossy(&line);
+    let line = line.trim_end();
+    match line.strip_prefix('+') {
+        Some(_) => Ok(()),
+        None => match line.strip_prefix('-') {
+            Some(error) => bail!("Server error: {error}"),
+            None => bail!("Unexpected handshake reply: {line}"),
+        },
     }
 }
 
@@ -894,6 +705,66 @@ mod tests {
             ServerAddr::from_tcp_addr("127.0.0.1", 6379).to_string(),
             "127.0.0.1:6379"
         );
+    }
+
+    /// Serve one connection: record the request bytes received before
+    /// `reply` is sent, then send it and keep the socket open.
+    async fn handshake(
+        auth: crate::ServerAuth,
+        reply: Vec<u8>,
+    ) -> (anyhow::Result<()>, Vec<u8>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 256];
+            let len = socket.read(&mut request).await.unwrap();
+            request.truncate(len);
+            socket.write_all(&reply).await.unwrap();
+            (socket, request)
+        });
+        let monitor = super::Monitor::new(
+            None,
+            ServerAddr::from_tcp_addr("127.0.0.1", port),
+            None,
+            auth,
+        );
+        let result = monitor.connect().await.map(drop);
+        let (_socket, request) = server.await.unwrap();
+        (result, request)
+    }
+
+    #[tokio::test]
+    async fn auth_and_monitor_are_pipelined_in_one_request() {
+        let auth = crate::ServerAuth::from_user_pass(Some("u"), Some("p"));
+        let (result, request) =
+            handshake(auth, b"+OK\r\n+OK\r\n".to_vec()).await;
+        result.unwrap();
+        assert_eq!(
+            request,
+            b"*3\r\n$4\r\nAUTH\r\n$1\r\nu\r\n$1\r\np\r\n\
+              *1\r\n$7\r\nMONITOR\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn handshake_errors_and_oversized_replies_are_rejected() {
+        let auth = crate::ServerAuth::from_user_pass(None, Some("bad"));
+        let (result, _) = handshake(
+            auth,
+            b"-WRONGPASS invalid\r\n-NOAUTH required\r\n".to_vec(),
+        )
+        .await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("WRONGPASS"), "{error}");
+
+        let endless = vec![b'+'; 10_000];
+        let (result, _) =
+            handshake(crate::ServerAuth::default(), endless).await;
+        assert!(result.unwrap_err().to_string().contains("too long"));
     }
 
     #[tokio::test]
