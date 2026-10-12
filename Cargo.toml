@@ -10,7 +10,7 @@ bitflags = "2.13.2"
 bytes = "1.12.1"
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 chrono-tz = { version = "0.10.4", default-features = false, features = ["std"] }
-croner = { version = "4.0.0", default-features = false, features = ["chrono"] }
+croner = { version = "4.0.1", default-features = false, features = ["chrono"] }
 clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
 clap_complete = "4.6.11"
 config = { version = "0.15.27", features = ["toml"] }
@@ -32,8 +32,8 @@ rustls = "0.23.45"
 rustls-native-certs = "0.8.4"
 rustls-pemfile = "2.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-tokio = { version = "1.53.1", features = ["full"] }
+serde_json = "1.0.154"
+tokio = { version = "1.53.2", features = ["full"] }
 tokio-rustls = "0.26.6"
 
 [dev-dependencies]
